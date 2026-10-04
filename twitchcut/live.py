@@ -214,7 +214,17 @@ class LiveJob(Job):
         self.progress("transcribe", 0.0, f"Распознаю речь {fmt_time(a)}–{fmt_time(b)}")
         if self._tr is None:
             self._tr = Transcriber(self.cfg)
-        words, segs = self._tr.transcribe_range(part, 0.0, b - a)
+        # кусками по 10 минут: видеокарта и процессор распознают разные куски одновременно
+        # (на встроенной видеокарте одна она медленнее, чем вместе с процессором)
+        t_tr = time.time()
+        parts_dir = self.dir / "transcript_parts" / f"live_{int(a):06d}"
+
+        def tr_progress(stage: str, frac: float, msg: str = "") -> None:
+            self.progress("transcribe", frac, msg.replace("всего стрима", f"{fmt_time(a)}–{fmt_time(b)}"))
+
+        res = self._tr.transcribe_full(part, b - a, parts_dir, tr_progress)
+        words, segs = res["words"], res["segments"]
+        log.info("Речь %s–%s распознана за %.0f с", fmt_time(a), fmt_time(b), time.time() - t_tr)
         for w in words:
             w["s"] = round(w["s"] + a, 2)
             w["e"] = round(w["e"] + a, 2)

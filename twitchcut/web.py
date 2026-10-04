@@ -473,8 +473,8 @@ def make_handler(mgr: Manager):
                             break
                         self.wfile.write(chunk)
                         left -= len(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass  # браузер сам оборвал загрузку (перемотка видео, закрыта вкладка) — это нормально
 
         # -------------------------------------------------------- routes
         def do_GET(self):
@@ -621,7 +621,14 @@ def serve(host: str = "127.0.0.1", port: int = 8765, config_path: Path | None = 
     mgr = Manager(config_path)
     from . import tiktok
     tiktok.start_background()  # просмотры выложенных роликов обновляются сами
-    httpd = ThreadingHTTPServer((host, port), make_handler(mgr))
+    class _Server(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            import sys as _sys
+            if isinstance(_sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                return  # браузер оборвал соединение — не засоряем консоль
+            super().handle_error(request, client_address)
+
+    httpd = _Server((host, port), make_handler(mgr))
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '') else host}:{port}"
     log.info("TwitchCut запущен: %s  (Ctrl+C — остановить)", url)
     try:

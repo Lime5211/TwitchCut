@@ -479,11 +479,42 @@ class Job:
         fresh = [{**w, "s": round(w["s"] + base - sub_shift, 2), "e": round(w["e"] + base - sub_shift, 2)} for w in ws]
         return [w for w in words if w["e"] <= c["start"] or w["s"] >= c["end"]] + fresh
 
+    def _retimed_words(self, c: dict, words: list[dict], src: Path, offset: float) -> list[dict]:
+        """Точный тайминг слов для субтитров. Основное распознавание (whisper.cpp на видеокарте) ставит
+        время слов внутри фразы приблизительно — субтитры то торопятся, то догоняют. Здесь звук самого
+        клипа ещё раз распознаётся на процессоре (faster-whisper находит, где в звуке каждое слово),
+        и точное время переносится на слова субтитров; текст остаётся прежним."""
+        from .sync import retime_words
+        dur = c["end"] - c["start"]
+        t0 = time.time()
+        try:
+            tr = getattr(self, "_tr", None) or getattr(self, "_sub_tr", None)
+            if tr is None:
+                tr = Transcriber(self.cfg)
+                self._sub_tr = tr
+            fresh, _ = tr._cpu_range(src, offset, offset + dur)
+        except Exception as e:
+            log.warning("Уточнение тайминга субтитров недоступно: %s", e)
+            self.cfg["render"]["subtitle_retime"] = False  # не пытаемся на каждом клипе
+            return words
+        base = c["start"] - offset
+        fresh = [{**w, "s": w["s"] + base, "e": w["e"] + base} for w in fresh]
+        new, rep = retime_words(words, fresh, c["start"], c["end"])
+        if rep["applied"]:
+            log.info("Субтитры клипа %s: тайминг уточнён (совпало %d из %d слов, типичный сдвиг %+.2f с, "
+                     "до %.2f с) за %.0f с", c.get("cand"), rep["matched"], rep["n"], rep["shift"],
+                     rep.get("spread", 0), time.time() - t0)
+            return new
+        log.info("Субтитры клипа %s: тайминг не уточнён (совпало %d из %d слов)", c.get("cand"), rep["matched"], rep["n"])
+        return words
+
     def _render_one(self, c: dict, words: list[dict], src: Path, offset: float, out: Path,
                     prof: ProfanityFilter, speed: float, trim: bool) -> tuple[dict, list]:
         from .render import find_pauses
         dur = c["end"] - c["start"]
         words = self._synced_words(c, slice_words(words, c["start"] - 15, c["end"] + 15), src, offset)
+        if self.cfg["render"].get("subtitle_retime", True):
+            words = self._retimed_words(c, words, src, offset)
         words_rel = []
         for w in slice_words(words, c["start"], c["end"]):
             mid = (w["s"] + w["e"]) / 2

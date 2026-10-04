@@ -65,3 +65,67 @@ def measure_shift(ref: Path, ref_start: float, seg: Path, seg_start: float, dur:
             best, best_i = sc, i
     found = lo + best_i * HOP / SR
     return round(found - ref_start, 3), round(max(0.0, best), 3)
+
+
+# ------------------------------------------------------------ тайминг слов
+def _norm(w: str) -> str:
+    import re
+    t = re.sub(r"[^\w]+", "", w.lower().replace("ё", "е"))
+    return t[:5]
+
+
+def retime_words(orig: list[dict], fresh: list[dict], lo: float, hi: float) -> tuple[list[dict], dict]:
+    """Переносит точные таймкоды из fresh (повторное распознавание звука клипа) на слова orig
+    (их текст не трогаем). Совпадения ищутся по последовательности слов; слова без пары
+    растягиваются между соседними совпавшими. Слова вне [lo, hi] не меняются.
+    Возвращает (слова, отчёт)."""
+    import difflib
+    idx = [i for i, w in enumerate(orig) if lo <= (w["s"] + w["e"]) / 2 <= hi]
+    rep = {"n": len(idx), "matched": 0, "shift": 0.0, "applied": False}
+    if len(idx) < 3 or len(fresh) < 3:
+        return orig, rep
+    a = [_norm(orig[i]["w"]) for i in idx]
+    b = [_norm(w["w"]) for w in fresh]
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    pairs = {}
+    for blk in sm.get_matching_blocks():
+        for k in range(blk.size):
+            if a[blk.a + k]:
+                pairs[blk.a + k] = blk.b + k
+    rep["matched"] = len(pairs)
+    if len(pairs) < max(3, 0.45 * len(idx)):
+        return orig, rep  # текст слишком разный — не рискуем
+    new = [dict(w) for w in orig]
+    times: dict[int, tuple[float, float]] = {k: (fresh[j]["s"], fresh[j]["e"]) for k, j in pairs.items()}
+    anchors = sorted(times)
+    shifts = []
+    for k in range(len(idx)):
+        o = orig[idx[k]]
+        if k in times:
+            s, e = times[k]
+        else:
+            prev = max((x for x in anchors if x < k), default=None)
+            nxt = min((x for x in anchors if x > k), default=None)
+            if prev is None or nxt is None:
+                # край клипа без опоры — сдвигаем так же, как ближайшее совпавшее слово
+                ref = prev if prev is not None else nxt
+                d = times[ref][0] - orig[idx[ref]]["s"]
+                s, e = o["s"] + d, o["e"] + d
+            else:
+                # равномерно между соседними совпавшими словами
+                t0, t1 = times[prev][1], times[nxt][0]
+                n = nxt - prev
+                s = t0 + (t1 - t0) * (k - prev - 1) / max(1, n - 1) if n > 1 else t0
+                e = max(s + 0.08, t0 + (t1 - t0) * (k - prev) / max(1, n - 1)) if n > 1 else t1
+        shifts.append(s - o["s"])
+        new[idx[k]] = {**o, "s": round(s, 2), "e": round(max(e, s + 0.05), 2)}
+    # порядок и отсутствие наложений
+    prev_s = -1e9
+    for i in idx:
+        if new[i]["s"] < prev_s:
+            new[i]["s"] = prev_s
+        new[i]["e"] = max(new[i]["e"], new[i]["s"] + 0.05)
+        prev_s = new[i]["s"]
+    rep.update(applied=True, shift=round(float(np.median(shifts)), 3),
+               spread=round(float(np.percentile(np.abs(shifts), 90)), 3))
+    return new, rep
