@@ -23,7 +23,7 @@ from .scan import merge_candidates, scan_stream
 from .signals import audio_loudness, find_candidates
 from .transcribe import Transcriber
 from .twitch_api import vod_status
-from .util import TwitchCutError, fmt_time, log, read_json, write_json
+from .util import Cancelled, TwitchCutError, fmt_time, log, read_json, write_json
 
 
 class Stopped(Exception):
@@ -152,6 +152,11 @@ class LiveJob(Job):
             self.update(status="done", live=False, stage="render", stage_progress=1.0,
                         message=f"Эфир закончился. Клипов: {len(clips)}")
 
+    def progress(self, stage: str, frac: float, msg: str = "") -> None:
+        super().progress(stage, frac, msg)
+        if self.stop_event.is_set():
+            raise Stopped()  # «Остановить наблюдение» — прерываем на ближайшем шаге, а не после всего куска
+
     def _check_stop(self) -> None:
         if self.stop_event.is_set():
             raise Stopped()
@@ -220,9 +225,14 @@ class LiveJob(Job):
         parts_dir = self.dir / "transcript_parts" / f"live_{int(a):06d}"
 
         def tr_progress(stage: str, frac: float, msg: str = "") -> None:
-            self.progress("transcribe", frac, msg.replace("всего стрима", f"{fmt_time(a)}–{fmt_time(b)}"))
+            # вызывается и из потока видеокарты — здесь не прерываем, остановку ловит само распознавание
+            Job.progress(self, "transcribe", frac, msg.replace("всего стрима", f"{fmt_time(a)}–{fmt_time(b)}"))
 
-        res = self._tr.transcribe_full(part, b - a, parts_dir, tr_progress)
+        self._tr.cancel = self.stop_event
+        try:
+            res = self._tr.transcribe_full(part, b - a, parts_dir, tr_progress)
+        except Cancelled:
+            raise Stopped()
         words, segs = res["words"], res["segments"]
         log.info("Речь %s–%s распознана за %.0f с", fmt_time(a), fmt_time(b), time.time() - t_tr)
         for w in words:

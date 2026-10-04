@@ -352,9 +352,12 @@ class Job:
                     cuts.append([round(a, 2), round(b, 2)])
             if sum(b - a for a, b in cuts) > 0.6 * (e - s):
                 cuts = []  # подозрительно много — не доверяем
+            spans = [[round(max(s, c["start"] + a), 2), round(min(e, c["start"] + b), 2)]
+                     for a, b in (r.get("rel_screen") or [])]
+            spans = [x for x in spans if x[1] - x[0] >= 1.0]
             picked.append({**r, "cand": c["id"], "source": c.get("source", "signals"), "topic": c.get("topic", ""),
                            "start": s, "end": e, "final_score": round(final, 1), "extra": not strong,
-                           "content_cuts": cuts})
+                           "content_cuts": cuts, "screen_spans": spans})
         picked.sort(key=lambda x: (x["extra"], -x["final_score"]))
         chosen: list[dict] = []
         for p in picked:
@@ -532,11 +535,56 @@ class Job:
             # слова внутри вырезанного не нужны в субтитрах
             words_rel = [w for w in words_rel if not any(a <= (w["s"] + w["e"]) / 2 <= b for a, b in cuts)]
         hook = c.get("hook", "") if self.cfg["render"].get("hook_title") else ""
+        hint = {"visual": c.get("visual"),
+                "spans": [(a - c["start"], b - c["start"]) for a, b in (c.get("screen_spans") or [])]}
         info = render_clip(src, offset, dur, words_rel, hook, out, self.cfg, prof,
-                           zooms=self.reaction_peaks(c["start"], c["end"]), keep=keep, speed=speed)
+                           zooms=self.reaction_peaks(c["start"], c["end"]), keep=keep, speed=speed, layout_hint=hint)
         info["content_cut_sec"] = round(sum(b - a for a, b in cuts), 1)
         info["pauses_removed"] = round(max(0.0, info.get("pauses_removed", 0) - info["content_cut_sec"]), 1)
         return info, words_rel
+
+    def shorten_clip(self, n: int, target: float, speed: float, trim: bool, layout: str | None = None) -> dict:
+        """«Ужать до N с»: Claude оставляет только самое сильное (новые границы + вырезки), затем клип
+        перемонтируется. Прежние границы сохраняются, чтобы можно было вернуть."""
+        from .llm import shorten_plan
+        p = self.dir / "clips.json"
+        clips = read_json(p) or []
+        c = next((x for x in clips if x.get("n") == n), None)
+        if not c:
+            raise TwitchCutError("Клип не найден")
+        meta = read_json(self.dir / "meta.json") or {}
+        if meta:
+            self._apply_streamer(meta)
+        tr = read_json(self.dir / "transcript.json") or {"words": []}
+        plan = shorten_plan(c, tr["words"], target, self.cfg, self.dir)
+        st = float(c["start"])
+        new_cuts = [[round(st + a, 2), round(st + b, 2)] for a, b in plan["cuts"]]
+        for x in clips:
+            if x.get("n") == n:
+                x.setdefault("original", {"start": x["start"], "end": x["end"],
+                                          "content_cuts": x.get("content_cuts") or []})
+                x.update(start=round(st + plan["start"], 2), end=round(st + plan["end"], 2), content_cuts=new_cuts,
+                         shorten_target=int(target), shorten_note=plan["note"])
+                x["duration"] = round(x["end"] - x["start"], 1)
+                x["stream_time"] = fmt_time(x["start"])
+        write_json(p, clips)
+        log.info("Клип %s ужат: %.0f–%.0f с от начала, вырезок %d (цель %d с)", n, plan["start"], plan["end"],
+                 len(new_cuts), target)
+        return self.rerender_clip(n, speed, trim, layout)
+
+    def restore_clip(self, n: int, speed: float, trim: bool, layout: str | None = None) -> dict:
+        """Вернуть границы клипа, какие были до «ужать»."""
+        p = self.dir / "clips.json"
+        clips = read_json(p) or []
+        for x in clips:
+            if x.get("n") == n and x.get("original"):
+                x.update(x.pop("original"))
+                x.pop("shorten_target", None)
+                x.pop("shorten_note", None)
+                x["duration"] = round(x["end"] - x["start"], 1)
+                x["stream_time"] = fmt_time(x["start"])
+        write_json(p, clips)
+        return self.rerender_clip(n, speed, trim, layout)
 
     def rerender_clip(self, n: int, speed: float, trim: bool, layout: str | None = None) -> dict:
         """Перемонтировать один готовый клип: другое ускорение и/или вырезание пауз."""
@@ -636,6 +684,7 @@ class Job:
                 "candidate": c["cand"], "quality": self.source.last_quality or info.get("src_quality", ""), **info,
                 "text": " ".join(w["w"] for w in words_rel)[:600],
                 "trim_pauses": trim, "content_cuts": c.get("content_cuts") or [], "created": time.time(), "v": int(time.time()), "extra": c.get("extra", False),
+                "visual": c.get("visual"), "screen_spans": c.get("screen_spans") or [],
             })
             if partial_path:
                 write_json(partial_path, clips)

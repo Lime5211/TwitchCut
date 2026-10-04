@@ -143,6 +143,11 @@ class Manager:
             status = st.get("status")
             if status in ("running", "queued", "awaiting_llm") and st.get("ref"):
                 resume.append((st.get("updated", 0), d.name, st))
+            elif status == "live" and st.get("live_stopped"):
+                # наблюдение остановили, а программу перезапустили до конца шага — задача завершена
+                clips = read_json(d / "clips.json") or []
+                st.update(status="done", live=False, message=f"Наблюдение остановлено. Клипов: {len(clips)}")
+                write_json(jp, st)
             elif status == "live" and st.get("streamer") not in streams_watch:
                 clips = read_json(d / "clips.json") or []
                 st.update(status="done", live=False, live_stopped=True,
@@ -158,7 +163,8 @@ class Manager:
                 log.warning("Не удалось продолжить %s: %s", jid, e)
 
     # --------------------------------------------------------- one clip
-    def rerender_clip(self, job_id: str, n: int, speed: float, trim: bool, layout: str | None = None) -> None:
+    def rerender_clip(self, job_id: str, n: int, speed: float, trim: bool, layout: str | None = None,
+                      action: str = "render", target: float | None = None) -> None:
         key = f"{job_id}/{n}"
         if key in self.rendering:
             raise TwitchCutError("Этот клип уже перемонтируется")
@@ -173,8 +179,13 @@ class Manager:
                 cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
                 job = Job(st["ref"], cfg, options=st.get("options") or {})
                 with heavy(f"перемонтаж клипа {n}"):
-                    self.rendering[key]["status"] = "rendering"
-                    job.rerender_clip(n, speed, trim, layout)
+                    self.rendering[key]["status"] = "shortening" if action == "shorten" else "rendering"
+                    if action == "shorten":
+                        job.shorten_clip(n, float(target or 30), speed, trim, layout)
+                    elif action == "restore":
+                        job.restore_clip(n, speed, trim, layout)
+                    else:
+                        job.rerender_clip(n, speed, trim, layout)
             except Exception as e:
                 log.error("Перемонтаж клипа %s: %s", key, e)
                 self.render_errors[key] = str(e)
@@ -588,11 +599,17 @@ def make_handler(mgr: Manager):
                 if m:
                     streamers.delete(m.group(1))
                     return self._json({"ok": True})
-                m = re.match(r"^/api/jobs/([\w.-]+)/clips/(\d+)/render$", path)
+                m = re.match(r"^/api/jobs/([\w.-]+)/clips/(\d+)/(render|shorten|restore)$", path)
                 if m:
                     sp = float(data.get("speed") or 1.0)
                     lay = data.get("layout") if data.get("layout") in ("auto", "split", "cam", "crop", "blur") else None
-                    mgr.rerender_clip(m.group(1), int(m.group(2)), sp, bool(data.get("trim", True)), lay)
+                    tgt = None
+                    if m.group(3) == "shorten":
+                        tgt = float(data.get("seconds") or 0)
+                        if not 5 <= tgt <= 600:
+                            raise TwitchCutError("Укажите длину от 5 до 600 секунд")
+                    mgr.rerender_clip(m.group(1), int(m.group(2)), sp, bool(data.get("trim", True)), lay,
+                                      action=m.group(3), target=tgt)
                     return self._json({"ok": True})
                 m = re.match(r"^/api/jobs/([\w.-]+)/stop$", path)
                 if m:

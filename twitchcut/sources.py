@@ -76,9 +76,11 @@ def parse_master_playlist(text: str) -> list[dict]:
 
 
 def _parse_media_playlist(text: str, url: str) -> tuple[list, Optional[str]]:
-    """[(время начала, длительность, абсолютный url)], url init-сегмента (для fMP4)."""
+    """[(время начала, длительность, абсолютный url, url init-сегмента или None)], первый init-сегмент.
+    В записях Twitch init-сегмент (#EXT-X-MAP) может повторяться посреди плейлиста — запоминаем его для
+    каждого сегмента отдельно."""
     from urllib.parse import urljoin
-    segs, t, dur, init = [], 0.0, None, None
+    segs, t, dur, init, first = [], 0.0, None, None, None
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("#EXTINF:"):
@@ -90,21 +92,22 @@ def _parse_media_playlist(text: str, url: str) -> tuple[list, Optional[str]]:
             m = re.search(r'URI="([^"]+)"', line)
             if m:
                 init = urljoin(url, m.group(1))
+                first = first or init
         elif line and not line.startswith("#") and dur is not None:
-            segs.append((t, dur, urljoin(url, line)))
+            segs.append((t, dur, urljoin(url, line), init))
             t += dur
             dur = None
-    return segs, init
+    return segs, first
 
 
 def hls_fetch(url: str, a: float, b: float, base: Path, headers: dict | None = None,
               progress=None) -> tuple[Path, float]:
-    """Скачивает сегменты HLS, покрывающие [a, b], в один «сырой» файл (без перепаковки).
-    Возвращает (файл, время записи, с которого он начинается).
+    """Скачивает сегменты HLS, покрывающие [a, b], в один файл. Возвращает (файл, время записи, с которого
+    он начинается).
 
     Плейлист разбираем сами: так время каждого сегмента известно точно, а растущая запись идущего эфира
     (плейлист без #EXT-X-ENDLIST) не превращается в «прямую трансляцию», которую ffmpeg читал бы
-    в реальном времени и не с того места."""
+    в реальном времени и не с того места. Сегменты качаются параллельно и сразу пишутся на диск."""
     from concurrent.futures import ThreadPoolExecutor
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0", **(headers or {})})
@@ -118,7 +121,7 @@ def hls_fetch(url: str, a: float, b: float, base: Path, headers: dict | None = N
         r = s.get(purl, timeout=30)
         r.raise_for_status()
         text = r.text
-    segs, init = _parse_media_playlist(text, purl)
+    segs, _ = _parse_media_playlist(text, purl)
     need = [sg for sg in segs if sg[0] + sg[1] > max(0.0, a) and sg[0] < b]
     if not need:
         raise TwitchCutError("в плейлисте нет сегментов для этого времени")
@@ -154,16 +157,38 @@ def hls_fetch(url: str, a: float, b: float, base: Path, headers: dict | None = N
                 pass
         return data
 
+    # группы подряд идущих сегментов с одним и тем же init-сегментом
+    groups: list[list] = []
+    for sg in need:
+        if groups and groups[-1][0][3] == sg[3]:
+            groups[-1].append(sg)
+        else:
+            groups.append([sg])
+    ext = ".mp4" if need[0][3] else ".ts"
+    files: list[Path] = []
     with ThreadPoolExecutor(max_workers=8) as ex:
-        parts = list(ex.map(get_counted, [sg[2] for sg in need]))
-    ext = ".mp4" if init else ".ts"
-    tmp = base.with_name(base.name + ".part" + ext)
-    with open(tmp, "wb") as fh:
-        if init:
-            fh.write(get(init))
-        for p in parts:
-            fh.write(p)
-    return tmp, need[0][0]
+        results = ex.map(get_counted, [sg[2] for sg in need])
+        for gi, grp in enumerate(groups):
+            f = base.with_name(f"{base.name}.part{gi if len(groups) > 1 else ''}{ext}")
+            with open(f, "wb") as fh:
+                if grp[0][3]:
+                    fh.write(get(grp[0][3]))
+                for _ in grp:
+                    fh.write(next(results))
+            files.append(f)
+    if len(files) == 1:
+        return files[0], need[0][0]
+    # init-сегмент меняется посреди записи — склеиваем куски без перекодирования
+    lst = base.with_name(base.name + ".parts.txt")
+    lst.write_text("".join(f"file '{p.resolve().as_posix()}'\n" for p in files), encoding="utf-8")
+    out = base.with_name(base.name + ".part.joined" + ext)
+    try:
+        run([ffmpeg_bin(), "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(out)])
+    finally:
+        lst.unlink(missing_ok=True)
+        for p in files:
+            p.unlink(missing_ok=True)
+    return out, need[0][0]
 
 
 def hls_download(url: str, a: float, b: float, base: Path, headers: dict | None = None) -> tuple[Path, float]:
@@ -318,6 +343,12 @@ class Source:
                  "-ar", "16000", "-c:a", "aac", "-b:a", "64k", str(out)])
             return out
 
+        if self.kind == "twitch":
+            try:
+                return self._fetch_twitch_audio(job_dir, progress)
+            except Exception as e:
+                log.warning("Звук записи напрямую по плейлисту не скачался (%s) — пробую через yt-dlp", e)
+
         yt_dlp = _yt_dlp()
 
         def hook(d):
@@ -348,6 +379,40 @@ class Source:
         if not files:
             raise TwitchCutError("yt-dlp не сохранил аудиофайл")
         return files[0]
+
+    def _fetch_twitch_audio(self, job_dir: Path, progress: ProgressFn = noop_progress) -> Path:
+        """Звук всей записи Twitch: сегменты «только звук» по плейлисту, параллельно. Тем же способом
+        качаются куски эфира и видео клипов, поэтому время везде одно. yt-dlp не справляется с записями,
+        где init-сегмент повторяется посреди плейлиста («Initialization fragment found after media fragments»)."""
+        if self._variants is None:
+            self._variants = twitch_vod_variants(self.vod_id)
+        vs = sorted(self._variants, key=lambda v: (v["codec"] != "audio", v["bandwidth"] or 1e12))
+        if not vs:
+            raise TwitchCutError("нет вариантов плейлиста")
+        v = vs[0]
+        t0 = time.time()
+
+        def prog(done: int, total: int) -> None:
+            progress("audio", min(0.99, done / max(1, total)), f"Скачиваю звук стрима: {100 * done / max(1, total):.0f}%")
+
+        raw, start = hls_fetch(v["url"], 0.0, 1e9, job_dir / "audio_dl", v.get("headers") or {}, prog)
+        out = job_dir / "audio_src.m4a"
+        tmp = job_dir / "audio_src.tmp.m4a"
+        try:
+            if start > 0.5:
+                raise TwitchCutError(f"запись начинается не с нуля ({start:.1f} с)")
+            try:  # без перекодирования — быстро
+                run([ffmpeg_bin(), "-y", "-v", "error", "-i", str(raw), "-vn", "-map", "0:a:0", "-c:a", "copy",
+                     "-movflags", "+faststart", str(tmp)])
+            except TwitchCutError:
+                run([ffmpeg_bin(), "-y", "-v", "error", "-i", str(raw), "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+                     "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(tmp)])
+            tmp.replace(out)
+        finally:
+            raw.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
+        log.info("Звук записи скачан напрямую (%s) за %.0f с", v.get("name") or v["codec"], time.time() - t0)
+        return out
 
     # -------------------------------------------------------------- segment
     def _best_video_format(self, max_height: int) -> dict:

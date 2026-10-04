@@ -76,7 +76,8 @@ def _detect_faces(frames: list[tuple[float, np.ndarray]]) -> list[list[tuple]]:
     return out
 
 
-def _track_camera(times: list[float], faces: list[list[tuple]], crop_w_frac: float) -> list[tuple[float, float]]:
+def _track_camera(times: list[float], faces: list[list[tuple]], crop_w_frac: float,
+                  dead_frac: float = 0.18) -> list[tuple[float, float]]:
     """Плавная «виртуальная камера» по главному лицу: держит его в кадре, но не дёргается от
     каждого движения (мёртвая зона). Возвращает опорные точки (t, центр x в долях кадра)."""
     pts: list[tuple[float, float]] = []
@@ -92,7 +93,7 @@ def _track_camera(times: list[float], faces: list[list[tuple]], crop_w_frac: flo
         pts.append((t, main[0]))
     if not pts:
         return []
-    dead = crop_w_frac * 0.18
+    dead = crop_w_frac * dead_frac
     cam = pts[0][1]
     keys = [(0.0, cam)]
     for t, x in pts:
@@ -444,7 +445,7 @@ def _screen_motion(frames: list, cam_rel: list[float]) -> list[dict]:
 
 
 def _cam_modes(times: list[float], frames: list, faces: list, cam_rel: list[float], cam_face: tuple,
-               words: list[dict] | None, dur: float, cfg: dict) -> tuple[list[str], dict]:
+               words: list[dict] | None, dur: float, cfg: dict, hint: dict | None = None) -> tuple[list[str], dict]:
     """Режим для каждого кадра, когда у стримера есть вебка. Лицо стримера видно ВСЕГДА:
     split — вебка сверху + экран снизу (на экране что-то происходит и стример это комментирует);
     cam   — вебка на весь кадр (экран стоит/пустой, а стример долго рассказывает)."""
@@ -462,6 +463,17 @@ def _cam_modes(times: list[float], frames: list, faces: list, cam_rel: list[floa
     info = {"screen_active": round(sum(active) / max(1, n), 2)}
     if not r.get("dynamic_layout", True):
         return ["split"] * n, info
+    visual = (hint or {}).get("visual")
+    spans = (hint or {}).get("spans") or []
+    info["visual"] = visual
+    # Claude по смыслу сказанного решил, нужен ли экран: это надёжнее, чем одно движение на экране
+    if visual == "talk":
+        return ["cam" if (on_cam[i] or not any(on_cam)) else "split" for i in range(n)], info
+    if visual == "screen":
+        return ["split"] * n, info
+    if visual == "mixed" and spans:
+        return [("split" if any(a - 1.0 <= times[i] <= b + 1.0 for a, b in spans)
+                 else ("cam" if (on_cam[i] or not any(on_cam)) else "split")) for i in range(n)], info
     if n and sum(active) <= 0.15 * n:
         # экран весь клип стоит (OBS, пустой рабочий стол, статичная страница) — только вебка
         return ["cam" if (on_cam[i] or not any(on_cam)) else "split" for i in range(n)], info
@@ -509,7 +521,8 @@ def _screen_focus(mot: list[dict], sw: int, gw: int) -> int:
     return int(np.clip(k / w * sw, 0, sw - gw)) // 2 * 2
 
 
-def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[dict] | None = None) -> dict:
+def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[dict] | None = None,
+                  hint: dict | None = None) -> dict:
     """Раскладка кадра — по каждому ключевому кадру клипа, поэтому внутри одного клипа она может меняться.
     Если у стримера есть вебка — его лицо в клипе видно всегда: «вебка + экран», пока на экране что-то
     происходит, и «только вебка», когда экран стоит, а стример долго рассказывает.
@@ -568,8 +581,14 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         cx, cy, fw = cam_face
         if not box:
             box = _default_cam_box(cx, cy, fw, sw, sh)
-        top = top_height(box, sw, sh, cfg)
-        cam_rel = _fit_aspect(box, cam_face, sw, sh, W / top)
+        if r.get("cam_center", True):
+            # лицо — по центру зоны вебки и крупно (как в «кадре по лицу»), камера следит за лицом
+            top = cam_height(cfg)
+            cam_rel = _split_cam_crop(box, cam_face, sw, sh, W / top, float(r.get("cam_zoom", 1.0)))
+        else:
+            # вебка целиком, зона подстраивается под её пропорции
+            top = top_height(box, sw, sh, cfg)
+            cam_rel = _fit_aspect(box, cam_face, sw, sh, W / top)
         x, y, w, h = cam_rel
         res["cam"] = [int(x * sw), int(y * sh), int(w * sw) // 2 * 2, int(h * sh) // 2 * 2]
         res["top_h"] = top
@@ -579,6 +598,8 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         res.update(_cam_params(sw, sh, cx, cy, fw, box))
         cam_faces = [[f for f in fs if abs(f[0] - cx) < 0.08 and abs(f[1] - cy) < 0.1] for fs in faces]
         res["cam_track"] = _track_camera(times, cam_faces, res["camcrop"][2] / sw) or [(0.0, cx)]
+        # отдельное, более чуткое слежение для зоны вебки в «вебка + экран»: лицо держим ровно по центру
+        res["split_track"] = _track_camera(times, cam_faces, res["cam"][2] / sw, dead_frac=0.07) or [(0.0, cx)]
 
     # --- лицо крупно (вебка на весь экран, IRL): кадр по лицу со слежением
     big_faces = [[f for f in fs if f[2] >= 0.06 and not (cam_face and abs(f[0] - cam_face[0]) < 0.05
@@ -598,7 +619,7 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
             # стример переключил сцену на вебку во весь экран: маленькой вебки в кадре нет, есть его крупное лицо
             modes = ["crop" if bf else "split" for bf in big_faces]
         else:
-            modes, act = _cam_modes(times, frames, faces, cam_rel, cam_face, words, dur, cfg)
+            modes, act = _cam_modes(times, frames, faces, cam_rel, cam_face, words, dur, cfg, hint)
             res.update(act)
         gw = int(min(sw, sh * W / (H - res["top_h"]))) // 2 * 2
         try:
@@ -624,6 +645,24 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
     res["segments"] = segs
     res["layout"] = max(segs, key=lambda x: x["t1"] - x["t0"])["layout"]
     return res
+
+
+def _split_cam_crop(box: list[float], face: tuple, sw: int, sh: int, aspect: float, zoom: float = 1.0) -> list[float]:
+    """Кадр вебки для «вебка + экран»: лицо по центру по горизонтали и чуть выше центра по вертикали,
+    кадр не выходит за картинку вебки. Самый крупный план, при котором лицо остаётся по центру;
+    zoom > 1 — ещё крупнее."""
+    bx, by, bw, bh = box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh
+    fx, fy, fwp = face[0] * sw, face[1] * sh, face[2] * sw
+    fx = float(np.clip(fx, bx + 1, bx + bw - 1))
+    fy = float(np.clip(fy, by + 1, by + bh - 1))
+    hw = min(fx - bx, bx + bw - fx)              # сколько места слева/справа от лица внутри вебки
+    ch = min(bh, (fy - by) / 0.42, (by + bh - fy) / 0.58, 2 * hw / aspect)
+    ch = max(ch, min(bh, bw / aspect, 2.6 * fwp))  # не приближаем сверх меры, если лицо у самого края
+    ch = min(ch / max(1.0, zoom), bh, bw / aspect)
+    cw = ch * aspect
+    x = float(np.clip(fx - cw / 2, bx, bx + bw - cw))
+    y = float(np.clip(fy - ch * 0.42, by, by + bh - ch))
+    return [x / sw, y / sh, cw / sw, ch / sh]
 
 
 def _fit_aspect(box: list[float], face: tuple, sw: int, sh: int, aspect: float) -> list[float]:
@@ -700,8 +739,9 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
         gx = int(np.clip(li.get("screen_x", (sw - gw) // 2), 0, sw - gw))
         xc = str(x)
         lim = li.get("cam_lim")
-        if lim and lim[1] - lim[0] > cw + 8 and li.get("cam_track"):
-            xc = "'" + _crop_x_expr(li["cam_track"], sw, cw, lo=lim[0], hi=lim[1] - cw, t_shift=t_shift) + "'"
+        track = li.get("split_track") or li.get("cam_track")
+        if lim and lim[1] - lim[0] > cw + 8 and track:
+            xc = "'" + _crop_x_expr(track, sw, cw, lo=lim[0], hi=lim[1] - cw, t_shift=t_shift) + "'"
         return (f"{inp}split=2[{tag}a][{tag}b];"
                 f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{top}[{tag}t];"
                 f"[{tag}b]crop={gw}:{sh}:{gx}:0,scale={W}:{bot_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{bot_h}[{tag}d];"
@@ -1024,7 +1064,7 @@ def find_pauses(src: Path, offset: float, dur: float, words: list[dict], categor
 def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hook: str,
                 out: Path, cfg: dict, prof: ProfanityFilter | None, layout_info: dict | None = None,
                 zooms: list[float] | None = None, keep: list[tuple[float, float]] | None = None,
-                speed: float = 1.0) -> dict:
+                speed: float = 1.0, layout_hint: dict | None = None) -> dict:
     """Рендерит клип. words_rel — слова со временем от начала клипа (исходная шкала).
     keep — какие интервалы оставить (вырезание пауз), speed — ускорение (1.0–2.0)."""
     r = cfg["render"]
@@ -1035,7 +1075,7 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     D = tl.final_dur
 
     fps = out_fps(src, cfg)
-    li = dict(layout_info or detect_layout(src, offset, dur, cfg, words_rel))
+    li = dict(layout_info or detect_layout(src, offset, dur, cfg, words_rel, layout_hint))
     layout = li["layout"]
     if li.get("top_h"):
         # зона вебки подогнана под пропорции этой вебки — субтитры и склейки считаем от неё
@@ -1043,7 +1083,7 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
         r = cfg["render"]
     sw, sh = li["src_w"], li["src_h"]
     # движение камеры — в шкале после вырезания пауз
-    for k in ("track", "cam_track"):
+    for k in ("track", "cam_track", "split_track"):
         if li.get(k):
             li[k] = [(tl.cut(t), x) for t, x in li[k]]
     if layout == "cam" and not li.get("camcrop") and li.get("face_cx"):

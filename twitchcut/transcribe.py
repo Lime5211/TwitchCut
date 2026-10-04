@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .util import ROOT_DIR, ProgressFn, TwitchCutError, ffmpeg_bin, log, noop_progress, read_json, write_json
+from .util import ROOT_DIR, Cancelled, ProgressFn, TwitchCutError, ffmpeg_bin, log, noop_progress, read_json, write_json
 
 SR = 16000
 WCPP_DIR = ROOT_DIR / "tools" / "whispercpp"
@@ -143,6 +143,7 @@ class WhisperCpp:
             raise TwitchCutError("whisper.cpp не установлен — запустите setup_gpu.bat")
         self.vad = wcpp_vad_model()
         self.gpu = None
+        self.cancel: threading.Event | None = None
 
     def transcribe_range(self, audio_path: Path, s: float, e: float, threads: int = 4) -> tuple[list, list]:
         tmp = Path(tempfile.mkdtemp(prefix="tc_wcpp_"))
@@ -160,8 +161,23 @@ class WhisperCpp:
             if self.vad:
                 cmd += ["--vad", "-vm", str(self.vad)]
             t0 = time.time()
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(self.exe.parent), **_NOHIDE)
-            err = (p.stderr or b"").decode("utf-8", "replace")
+            # Popen + опрос: если пользователь остановил задачу, процесс распознавания прерывается сразу
+            ef = open(tmp / "stderr.txt", "wb")
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=ef, cwd=str(self.exe.parent), **_NOHIDE)
+                while True:
+                    try:
+                        proc.wait(timeout=1.0)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if self.cancel is not None and self.cancel.is_set():
+                            proc.kill()
+                            proc.wait()
+                            raise Cancelled("Распознавание остановлено")
+            finally:
+                ef.close()
+            p = subprocess.CompletedProcess(cmd, proc.returncode)
+            err = (tmp / "stderr.txt").read_text(encoding="utf-8", errors="replace")
             if self.gpu is None:
                 m = re.search(r"ggml_vulkan: \d+ = (.+?)\s+(?:\(|\|)", err)
                 self.gpu = m.group(1).strip() if m else ("" if "no GPU found" in err else None)
@@ -239,6 +255,7 @@ class Transcriber:
         self.device = None
         self.gpu: WhisperCpp | None = None
         self.hybrid = False
+        self.cancel: threading.Event | None = None  # остановка задачи пользователем
         backend = self.cfg.get("backend", "auto")
         if backend in ("auto", "whispercpp"):
             try:
@@ -302,14 +319,22 @@ class Transcriber:
             vad_filter=True, vad_parameters={"min_silence_duration_ms": 400},
             condition_on_previous_text=False,
         )
-        return list(segments)
+        out = []
+        for sg in segments:  # генератор: между фразами проверяем, не остановили ли задачу
+            if self.cancel is not None and self.cancel.is_set():
+                raise Cancelled("Распознавание остановлено")
+            out.append(sg)
+        return out
 
     def transcribe_range(self, audio_path: Path, s: float, e: float, engine: str = "auto") -> tuple[list, list]:
         """Распознаёт отрезок [s, e] стрима. Возвращает (слова, сегменты) в абсолютном времени.
         engine: auto (видеокарта, если есть) | gpu | cpu."""
         if self.gpu and engine in ("auto", "gpu"):
             try:
+                self.gpu.cancel = self.cancel
                 return self.gpu.transcribe_range(audio_path, s, e, self._gpu_threads())
+            except Cancelled:
+                raise
             except Exception as ex:
                 log.warning("Распознавание на видеокарте не удалось (%s) — дальше на процессоре", ex)
                 _status_update(error=str(ex)[:300])
@@ -413,12 +438,16 @@ class Transcriber:
 
             def worker(engine: str) -> None:
                 while True:
+                    if self.cancel is not None and self.cancel.is_set():
+                        return
                     try:
                         s = q.get_nowait()
                     except queue.Empty:
                         return
                     try:
                         do(s, engine)
+                    except Cancelled:
+                        return
                     except Exception as ex:
                         q.put(s)  # кусок доделает другой
                         dead[engine] = ex
@@ -430,6 +459,8 @@ class Transcriber:
             gpu_t.start()
             worker("cpu")
             gpu_t.join()
+            if self.cancel is not None and self.cancel.is_set():
+                raise Cancelled("Распознавание остановлено")
             if not q.empty():
                 if "cpu" in dead and "gpu" in dead:
                     raise dead["cpu"]
@@ -439,6 +470,8 @@ class Transcriber:
             log.info("Распознавание: видеокарта %.0f мин, процессор %.0f мин", st["by"]["gpu"] / 60, st["by"]["cpu"] / 60)
         else:
             for s in todo:
+                if self.cancel is not None and self.cancel.is_set():
+                    raise Cancelled("Распознавание остановлено")
                 do(s, "auto")
 
         words: list[dict] = []

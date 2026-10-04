@@ -48,6 +48,10 @@ class TwitchCutError(RuntimeError):
     """Понятная пользователю ошибка (выводится без трейсбека)."""
 
 
+class Cancelled(TwitchCutError):
+    """Пользователь остановил задачу — прерываем долгий шаг (распознавание речи и т.п.)."""
+
+
 _io_lock = threading.RLock()
 
 

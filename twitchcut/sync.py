@@ -92,6 +92,11 @@ def retime_words(orig: list[dict], fresh: list[dict], lo: float, hi: float) -> t
         for k in range(blk.size):
             if a[blk.a + k]:
                 pairs[blk.a + k] = blk.b + k
+    # совпадения «не с тем повтором» (одна и та же фраза дважды) дают огромный сдвиг — отбрасываем их
+    if pairs:
+        diffs = {k: fresh[j]["s"] - orig[idx[k]]["s"] for k, j in pairs.items()}
+        med = float(np.median(list(diffs.values())))
+        pairs = {k: j for k, j in pairs.items() if abs(diffs[k] - med) <= 1.5}
     rep["matched"] = len(pairs)
     if len(pairs) < max(3, 0.45 * len(idx)):
         return orig, rep  # текст слишком разный — не рискуем

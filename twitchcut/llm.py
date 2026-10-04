@@ -83,7 +83,7 @@ SYSTEM_PROMPT = """Ты — продюсер популярного TikTok-ак�
 - Поиски чего-то, «щас найду», загрузка, тишина, чтение доната не по теме посреди момента — всегда в cuts.
 - Если ядро не досказано (стример отвлёкся навсегда, обрыв стрима, тема брошена) — это НЕ клип: score ≤ 40, keep=false.
 
-Длина — следствие, а не цель: шутка 10–30 с, реакция 15–45 с, мнение 25–70 с, история или новость 40–120 с, больше 2 минут — только если интерес держится до конца. После вырезок клип должен быть настолько коротким, насколько возможно без потери смысла, но не короче.
+Длина — следствие, а не цель: шутка 10–30 с, реакция 15–45 с, мнение 20–60 с, история или новость 30–75 с, больше 90 с — только если КАЖДЫЕ несколько секунд появляется что-то новое (автор часто пишет «на минуте уже можно было остановиться», «не на 100 с, а 30–40 с самых интересных моментов»). После вырезок клип должен быть настолько коротким, насколько возможно без потери смысла, но не короче. Как только прозвучала развязка и короткая реакция — конец, без «послесловия» и повторного пересказа.
 Проверка: пройди мысленно по клипу и спроси на каждых ~5 секундах «будет ли тут свайп?». Если да — вырежи кусок или сдвинь начало.
 
 ГРАНИЦЫ (start, end — секунды ОТ НАЧАЛА ОКНА кандидата, по таймкодам [сек] транскрипта)
@@ -97,6 +97,12 @@ SYSTEM_PROMPT = """Ты — продюсер популярного TikTok-ак�
 - cuts — список отрезков [от, до] (секунды от начала окна, как start/end), которые нужно ВЫРЕЗАТЬ: затянутая подводка, чтение доната/сообщения не по теме, «так, чат, подождите», поиск в браузере или игре без комментариев по делу, повтор той же мысли второй раз, отвлечения на постороннее, долгое «эээ… короче…», уточнения, без которых смысл не теряется.
 - Режь только целыми фразами (по таймкодам строк транскрипта), чтобы склейка была незаметна и речь после склейки звучала связно. Не режь крючок, ядро, развязку, реакцию и то, без чего непонятно.
 - Не бойся резать: обычно 0–6 вырезок; каждая не короче ~1.5 с. Если вырезать нечего — [].
+
+ВИЗУАЛ (visual) — что показать в кадре; лицо стримера видно всегда:
+- "talk" — стример рассказывает, рассуждает, отвечает чату; что на экране, для смысла не важно → весь клип только вебка;
+- "screen" — смысл в том, что на экране: реакция на видео/стрим/новость, игра, переписка, статья, картинка → вебка + экран;
+- "mixed" — экран нужен только местами (например, сначала показывает ролик, потом долго обсуждает): screen_spans — отрезки [от, до] (секунды от начала окна), когда экран нужен; в остальное время — только вебка.
+Если сомневаешься — "mixed": первые секунды с экраном, пока зритель понимает, о чём речь.
 
 ЧТО АВТОР УЖЕ ОТКЛОНЯЛ (обобщённо)
 - клип кончается до развязки или стрим оборвался, а продолжения нет;
@@ -135,6 +141,9 @@ TOOL = {
                         "end": {"type": "number"},
                         "cuts": {"type": "array", "items": {"type": "array", "items": {"type": "number"},
                                                            "minItems": 2, "maxItems": 2}},
+                        "visual": {"type": "string", "enum": ["talk", "screen", "mixed"]},
+                        "screen_spans": {"type": "array", "items": {"type": "array", "items": {"type": "number"},
+                                                                   "minItems": 2, "maxItems": 2}},
                         "titles": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2},
                         "hashtags": {"type": "array", "items": {"type": "string"}},
                         "reason": {"type": "string"},
@@ -150,7 +159,7 @@ TOOL = {
 JSON_INSTRUCTION = """
 
 ФОРМАТ ОТВЕТА: строго один JSON-объект без пояснений и без markdown:
-{"clips":[{"id":"c01","keep":true,"score":72,"category":"story","start":31.5,"end":78.0,"cuts":[[44.0,51.5]],"titles":["...","..."],"hashtags":["..."],"reason":"..."}]}
+{"clips":[{"id":"c01","keep":true,"score":72,"category":"story","start":31.5,"end":78.0,"cuts":[[44.0,51.5]],"visual":"mixed","screen_spans":[[31.5,40.0]],"titles":["...","..."],"hashtags":["..."],"reason":"..."}]}
 category — одно из: """ + ", ".join(CATEGORIES) + ". Верни запись для КАЖДОГО кандидата."
 
 
@@ -313,6 +322,8 @@ def normalize_result(data: dict, cands: list[dict]) -> dict[str, dict]:
                 "rel_start": float(r.get("start", 0)),
                 "rel_end": float(r.get("end", 0)),
                 "rel_cuts": _norm_cuts(r.get("cuts")),
+                "visual": r.get("visual") if r.get("visual") in ("talk", "screen", "mixed") else None,
+                "rel_screen": _norm_cuts(r.get("screen_spans")),
                 "titles": titles[:2],
                 "title": titles[0] if titles else "",
                 "hook": "",
@@ -587,3 +598,72 @@ def _fill_missing(res: dict, cands: list[dict], words: list[dict], cfg: dict) ->
             v["score"] = min(v["score"], 45)
             res[k] = v
     return res
+
+
+# ------------------------------------------------------------- «ужать» клип
+SHORTEN_SYSTEM = """Ты — монтажёр коротких роликов для TikTok. Тебе дан транскрипт уже смонтированного клипа со стрима
+(таймкоды [сек] — от начала клипа). Задача — УЖАТЬ клип примерно до {target} секунд итоговой длины, оставив только
+самое сильное: крючок в начале, минимально нужный контекст, ядро (панчлайн, поворот, вывод) и короткую реакцию.
+
+Как ужимать:
+- сдвинь start на самую цепляющую фразу, если начало можно понять без предыдущего;
+- сдвинь end сразу после развязки и короткой реакции;
+- внутри вырежи (cuts) всё, без чего смысл сохраняется: подводки, повторы, уточнения, отвлечения, поиски, чтение чата не по теме;
+- режь только целыми фразами по таймкодам строк, чтобы склейки звучали связно;
+- НЕ вырезай развязку/панчлайн и то, без чего непонятно, о чём речь.
+Итоговая длина = (end − start) − сумма длин cuts. Она должна быть близка к {target} с (допустимо ±20%).
+Если без потери смысла короче не получается — верни минимально возможную длину и объясни в note.
+{extra}"""
+
+SHORTEN_TOOL = {
+    "name": "submit_edit",
+    "description": "Новые границы и вырезки клипа",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "start": {"type": "number"},
+            "end": {"type": "number"},
+            "cuts": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}},
+            "note": {"type": "string"},
+        },
+        "required": ["start", "end", "cuts"],
+    },
+}
+
+SHORTEN_JSON = """
+
+ФОРМАТ ОТВЕТА: строго один JSON-объект без пояснений и без markdown:
+{"start":3.2,"end":41.0,"cuts":[[12.5,19.0]],"note":"..."}"""
+
+
+def shorten_plan(clip: dict, words: list[dict], target: float, cfg: dict, workdir: Path,
+                 usage: dict | None = None) -> dict:
+    """Просит Claude ужать клип до ~target секунд. Возвращает {start, end, cuts, note} в секундах от начала клипа."""
+    st, en = float(clip["start"]), float(clip["end"])
+    ws = [w for w in words if st - 0.05 <= (w["s"] + w["e"]) / 2 <= en]
+    if len(ws) < 5:
+        raise TwitchCutError("У клипа слишком мало речи, чтобы ужимать его по смыслу")
+    cur_cuts = [[round(a - st, 1), round(b - st, 1)] for a, b in (clip.get("content_cuts") or [])]
+    lines = _plain_lines(ws, st)
+    extra = ""
+    if clip.get("title"):
+        extra += f"\nО чём клип: «{clip['title']}»."
+    if clip.get("reason"):
+        extra += f"\nПочему его выбрали: {clip['reason']}"
+    system = SHORTEN_SYSTEM.format(target=int(target), extra=extra)
+    user = (f"Текущая длина клипа: {en - st:.0f} с (после вырезания пауз ~{clip.get('final_duration') or en - st:.0f} с). "
+            f"Уже вырезано: {cur_cuts or 'ничего'}.\nНужно: ~{int(target)} с.\n\nТранскрипт клипа:\n" + "\n".join(lines))
+    data = llm_call(system, user, cfg, usage if usage is not None else {}, workdir, tool=SHORTEN_TOOL,
+                    json_instruction=SHORTEN_JSON)
+    if "start" not in data and isinstance(data.get("clips"), list) and data["clips"]:
+        data = data["clips"][0]
+    try:
+        s, e = float(data["start"]), float(data["end"])
+    except (KeyError, TypeError, ValueError) as ex:
+        raise TwitchCutError("Claude вернул непонятный ответ на «ужать»") from ex
+    dur = en - st
+    s, e = max(0.0, min(s, dur)), max(0.0, min(e, dur))
+    if e - s < 3:
+        raise TwitchCutError("Claude предложил слишком короткий клип")
+    cuts = [[max(s, a), min(e, b)] for a, b in _norm_cuts(data.get("cuts")) if min(e, b) - max(s, a) >= 0.8]
+    return {"start": s, "end": e, "cuts": cuts, "note": str(data.get("note") or "").strip()}

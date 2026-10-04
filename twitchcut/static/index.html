@@ -438,11 +438,7 @@ async function renderJob(){
       <canvas id="tl" class="mt"></canvas></div>`;
   const clips = st.clips || [];
   S.clips = clips;
-  const clipsKey = JSON.stringify([clips.map(c=>[c.file,c.score,c.titles,c.feedback,c.v]), st.rendering, st.render_errors]);
-  const keepOld = clipsKey === S.lastClips && document.querySelector("#clipsbox");
-  if (keepOld) h += `<div id="clipsholder"></div>`;
-  else if (clips.length){
-    h += `<div class="clips" id="clipsbox">` + clips.map(c => {
+  const cardOf = (c) => {
       const tags = (c.hashtags||[]).slice(0,5).map(t=>"#"+t.replace(/\s/g,"")).join(" ");
       const f = `/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.file)}?v=${c.v||0}`;
       const busy = (st.rendering||{})[String(c.n)];
@@ -455,7 +451,7 @@ async function renderJob(){
       <div class="vwrap">${c.missing && !busy ? `<img src="/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.thumb)}" style="width:100%;height:100%;object-fit:cover;opacity:.45" onerror="this.style.display='none'">
           <div class="busy">${icon("trash","lg")}<span>Видео удалено автоочисткой.<br>«Применить» смонтирует заново.</span></div>`
         : `<video controls preload="metadata" playsinline poster="/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.thumb)}?v=${c.v||0}" src="${f}"></video>`}
-        ${busy?`<div class="busy">${icon("loader-circle","lg spin")}<span>${busy==="waiting"?"Жду очереди…":"Перемонтирую…"}</span></div>`:""}</div>
+        ${busy?`<div class="busy">${icon("loader-circle","lg spin")}<span>${busy==="waiting"?"Жду очереди…":busy==="shortening"?"Claude ужимает клип…":"Перемонтирую…"}</span></div>`:""}</div>
       <div class="b"><div class="row" style="gap:6px"><span class="score">${icon("flame","sm")}${c.score}</span><span class="chip c">${CAT[c.category]||c.category}</span>
         <span class="chip" title="Время в стриме">${icon("clock","sm")} ${c.stream_time}</span><span class="chip" title="Длина клипа">${icon("timer","sm")} ${dur}с</span>
         ${c.quality?`<span class="chip" title="Качество исходника">${icon("video","sm")} ${esc(c.quality.split(" ")[0])}</span>`:""}
@@ -472,17 +468,57 @@ async function renderJob(){
           </select>
           <button class="btn sm ghost" id="apply-${c.n}" style="${dirty||c.missing?"":"display:none"}" onclick="applyEdit(${c.n})">${icon("refresh-cw","sm")} Применить</button>
         </div>
+        ${c.missing?"":`<div class="edit" title="Claude оставит только самое сильное: крючок, суть и развязку">
+          <span class="dim" style="font-size:12.5px">${icon("scissors","sm")} Ужать до</span>
+          <input type="number" id="short-${c.n}" min="5" max="600" step="5" value="${c.shorten_target||Math.max(15, Math.min(60, Math.round((dur||40)*0.5/5)*5))}" style="width:64px;padding:4px 6px">
+          <span class="dim" style="font-size:12.5px">с</span>
+          <button class="btn sm ghost" onclick="shortenClip(${c.n})" ${busy?"disabled":""}>Ужать</button>
+          ${c.original?`<button class="btn sm ghost" onclick="restoreClip(${c.n})" title="Вернуть границы, какие были до «ужать»" ${busy?"disabled":""}>${icon("rotate-ccw","sm")} Вернуть</button>`:""}
+        </div>${c.shorten_note?`<div class="hint" style="margin:0">${esc(c.shorten_note)}</div>`:""}`}
         ${rerr?`<div class="alert err" style="margin:0">${esc(rerr)}</div>`:""}
         ${c.missing?"":`<div class="acts"><a class="btn sm" href="${f}&download=1">${icon("download","sm")} Скачать</a></div>`}
         ${fbBlock(c)}</div></div>`;
-    }).join("") + `</div>`;
-  } else if (st.status === "done") h += `<div class="card empty mt">${icon("film")}<div>Подходящих моментов не нашлось. Снизьте <code>clips.min_score</code> в config.yaml или выберите другой стрим.</div></div>`;
-  h += `</div>`;
+    };
+  const keyOf = (c) => JSON.stringify([c.file,c.score,c.titles,c.feedback,c.v,c.missing,c.layout_choice,c.speed,c.trim_pauses,
+    (st.rendering||{})[String(c.n)]||null,(st.render_errors||{})[String(c.n)]||null]);
+  let bottom = "";
+  if (!clips.length && st.status === "done") bottom = `<div class="card empty mt">${icon("film")}<div>Подходящих моментов не нашлось. Снизьте <code>clips.min_score</code> в config.yaml или выберите другой стрим.</div></div>`;
+  // Страница задачи обновляется на месте: шапка — целиком, а карточки клипов — только изменившиеся.
+  // Так видео, которое вы смотрите, не останавливается и не начинается сначала при каждом обновлении.
   const scroll = $("main").scrollTop;
-  const old = keepOld ? document.querySelector("#clipsbox") : null;
-  $("#main").innerHTML = h;
-  if (old) $("#clipsholder").replaceWith(old);
-  S.lastClips = clipsKey;
+  let page = document.querySelector("#jobpage");
+  if (!page || page.dataset.job !== S.jobId){
+    $("#main").innerHTML = `<div class="page" id="jobpage"><div id="jobtop"></div><div class="clips" id="clipsbox"></div><div id="jobbottom"></div></div>`;
+    page = document.querySelector("#jobpage"); page.dataset.job = S.jobId;
+  }
+  const top = h.replace(/^<div class="page">/, "");
+  if (page.dataset.top !== top){ $("#jobtop").innerHTML = top; page.dataset.top = top; }
+  if (page.dataset.bottom !== bottom){ $("#jobbottom").innerHTML = bottom; page.dataset.bottom = bottom; }
+  const box = $("#clipsbox");
+  const want = new Set(clips.map(c => "clip-" + c.n));
+  [...box.children].forEach(el => { if (!want.has(el.id)) el.remove(); });
+  let prev = null;
+  for (const c of clips){
+    const key = keyOf(c);
+    let el = box.querySelector("#clip-" + c.n);
+    if (!el || el.dataset.key !== key){
+      const tpl = document.createElement("template"); tpl.innerHTML = cardOf(c).trim();
+      const card = tpl.content.firstElementChild; card.dataset.key = key;
+      if (el){
+        el.before(card);
+        // то же видео — переносим сам плеер (с позицией и воспроизведением), а не создаём новый
+        const ov = el.querySelector("video"), nv = card.querySelector("video");
+        if (ov && nv && ov.getAttribute("src") === nv.getAttribute("src")) nv.replaceWith(ov);
+        el.remove();
+      } else if (prev) prev.after(card); else box.prepend(card);
+      el = card;
+    } else if (prev ? prev.nextElementSibling !== el : box.firstElementChild !== el){
+      if (prev) prev.after(el); else box.prepend(el);
+    }
+    prev = el;
+  }
+  box.style.display = clips.length ? "" : "none";
+  S.lastClips = "";
   $("main").scrollTop = scroll;
   if (st.timeline?.score?.length) drawTimeline(st);
 }
@@ -494,6 +530,18 @@ function setSpeed(n, v, btn){ btn.parentElement.querySelectorAll("button").forEa
 function markDirty(n){ const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
   const sp = e.speed ?? (c.speed||1), tr = $("#trim-"+n).checked, lay = $("#lay-"+n).value;
   $("#apply-"+n).style.display = (Math.abs(sp-(c.speed||1))>0.01 || tr !== (c.trim_pauses!==false) || lay !== (c.layout_choice||"auto")) ? "" : "none"; }
+function editBody(n){ const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
+  return {speed: e.speed ?? (c.speed||1), trim: $("#trim-"+n).checked, layout: $("#lay-"+n).value}; }
+async function shortenClip(n){
+  const sec = parseFloat($("#short-"+n).value);
+  if (!(sec >= 5)) { toast("Укажите длину в секундах","err"); return; }
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/shorten`, {...editBody(n), seconds: sec});
+    S.lastJob=""; renderJob(); toast(`Claude ужимает клип до ~${sec} с…`); }
+  catch(err){ toast(err.message,"err"); } }
+async function restoreClip(n){
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/restore`, editBody(n));
+    S.lastJob=""; renderJob(); toast("Возвращаю прежние границы…"); }
+  catch(err){ toast(err.message,"err"); } }
 async function applyEdit(n){
   const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
   try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/render`, {speed: e.speed ?? (c.speed||1), trim: $("#trim-"+n).checked, layout: $("#lay-"+n).value});
