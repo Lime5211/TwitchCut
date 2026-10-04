@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TwitchCut</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239147ff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='6' cy='6' r='3'/%3E%3Cpath d='M8.12 8.12 12 12'/%3E%3Cpath d='M20 4 8.12 15.88'/%3E%3Ccircle cx='6' cy='18' r='3'/%3E%3Cpath d='M14.8 14.8 20 20'/%3E%3C/svg%3E">
+<script src="/static/icons.js"></script>
+<style>
+:root{
+  --bg:#0c0c0f; --side:#111116; --panel:#16161c; --panel2:#1d1d25; --hover:#23232d; --line:#272731;
+  --text:#ededf2; --muted:#9696a6; --dim:#6b6b7b;
+  --accent:#9147ff; --accent-h:#a970ff; --accent-soft:rgba(145,71,255,.14);
+  --ok:#2fd18b; --ok-soft:rgba(47,209,139,.12); --warn:#f2b445; --warn-soft:rgba(242,180,69,.12);
+  --err:#ff5c6c; --err-soft:rgba(255,92,108,.12); --hl:#ffe135;
+  --r:12px; --r-sm:8px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:14.5px/1.5 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--accent-h);text-decoration:none}
+.ic{width:18px;height:18px;flex:none;vertical-align:-4px}
+.ic.sm{width:15px;height:15px;vertical-align:-3px}
+.ic.lg{width:22px;height:22px}
+.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* layout */
+.app{display:grid;grid-template-columns:248px 1fr;height:100vh}
+aside{background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.brand{display:flex;align-items:center;gap:10px;padding:18px 18px 14px}
+.logo{width:34px;height:34px;border-radius:10px;background:var(--accent);display:grid;place-items:center;color:#fff}
+.brand b{font-size:17px;letter-spacing:.2px}
+.brand small{display:block;color:var(--dim);font-size:11.5px;margin-top:-2px}
+nav{padding:4px 10px;display:flex;flex-direction:column;gap:2px}
+nav a{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:var(--r-sm);color:var(--muted);font-weight:500}
+nav a:hover{background:var(--hover);color:var(--text)}
+nav a.on{background:var(--accent-soft);color:var(--text)}
+nav a.on .ic{color:var(--accent-h)}
+nav a .cnt{margin-left:auto;font-size:11.5px;color:var(--dim)}
+nav a .dot{margin-left:auto;width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.dot.ok{background:var(--ok)!important}.dot.bad{background:var(--err)!important}.dot.warn{background:var(--warn)!important}
+.side-h{padding:16px 20px 6px;font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--dim)}
+.recent{overflow:auto;padding:0 10px 14px;flex:1}
+.ritem{display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:var(--r-sm);cursor:pointer}
+.ritem:hover{background:var(--hover)}.ritem.on{background:var(--panel2)}
+.ritem .t{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ritem .s{font-size:11.5px;color:var(--dim);display:flex;align-items:center;gap:5px}
+.ava{width:30px;height:30px;border-radius:50%;background:var(--panel2);flex:none;object-fit:cover;display:grid;place-items:center;color:var(--dim)}
+.ava.lg{width:56px;height:56px}
+.ava.md{width:40px;height:40px}
+main{overflow:auto;min-width:0}
+.page{max-width:1180px;margin:0 auto;padding:28px 32px 60px}
+.ph{display:flex;align-items:center;gap:14px;margin-bottom:22px;flex-wrap:wrap}
+.ph h1{font-size:22px;margin:0;font-weight:650}
+.ph p{margin:2px 0 0;color:var(--muted);font-size:13.5px}
+.sp{flex:1}
+
+/* elements */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:18px}
+.card+.card,.mt{margin-top:16px}
+.card h3{margin:0 0 12px;font-size:15px;display:flex;align-items:center;gap:8px}
+label{display:block;font-size:12.5px;color:var(--muted);margin:0 0 6px;font-weight:500}
+input[type=text],input[type=number],select,textarea{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:var(--r-sm);padding:10px 12px;font:inherit;outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{min-height:110px;resize:vertical;line-height:1.45}
+.hint{font-size:12px;color:var(--dim);margin-top:5px}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:1fr 1fr}.g4{grid-template-columns:repeat(4,1fr)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--accent);color:#fff;border:0;border-radius:var(--r-sm);padding:10px 16px;font:600 14px inherit;font-family:inherit;cursor:pointer;transition:background .15s;white-space:nowrap}
+.btn:hover{background:var(--accent-h)}
+.btn.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--text);font-weight:500}
+.btn.ghost:hover{background:var(--hover)}
+.btn.danger:hover{color:var(--err);border-color:var(--err)}
+.btn.sm{padding:7px 11px;font-size:13px}
+.btn.icon{padding:8px}
+.btn:disabled{opacity:.5;cursor:default}
+.input-row{display:flex;gap:10px}
+.input-row input{flex:1}
+.check{display:flex;align-items:center;gap:9px;cursor:pointer;font-size:14px;color:var(--text);margin:0}
+.check input{width:17px;height:17px;accent-color:var(--accent)}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:3px 9px;border-radius:99px;background:var(--panel2);color:var(--muted);font-weight:500}
+.pill.running,.pill.queued{color:var(--accent-h);background:var(--accent-soft)}
+.pill.done{color:var(--ok);background:var(--ok-soft)}
+.pill.error{color:var(--err);background:var(--err-soft)}
+.pill.awaiting_llm{color:var(--warn);background:var(--warn-soft)}
+.pill.live{color:#fff;background:#e5333f}
+.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#e5333f;box-shadow:0 0 0 0 rgba(229,51,63,.6);animation:pulse 1.6s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(229,51,63,.6)}70%{box-shadow:0 0 0 8px rgba(229,51,63,0)}100%{box-shadow:0 0 0 0 rgba(229,51,63,0)}}
+.titles{display:flex;flex-direction:column;gap:4px}
+.titles .tv{display:flex;gap:8px;align-items:flex-start;background:var(--panel2);border-radius:var(--r-sm);padding:7px 9px;font-size:13.5px;cursor:pointer;border:1px solid transparent;transition:border-color .15s}
+.titles .tv:hover{border-color:var(--accent)}
+.titles .tv span{flex:1}
+.titles .tv .ic{color:var(--dim);margin-top:2px}
+.lbl-sm{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin-top:4px}
+.vwrap{position:relative}
+.busy{position:absolute;inset:0;background:rgba(12,12,15,.72);display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center;color:#fff;font-size:14px}
+.tv.tags{font-size:13px;color:var(--accent-h)}
+.edit{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.edit .check{font-size:13px;color:var(--muted)}
+.seg.sm button{padding:4px 8px;font-size:12.5px}
+select.lay{width:auto;padding:5px 8px;font-size:12.5px}
+.fb{border-top:1px solid var(--line);margin-top:6px;padding-top:10px;display:flex;flex-direction:column;gap:8px}
+.fb .row .btn{flex:1}
+.fbadge{display:flex;align-items:center;gap:6px;font-size:13px;padding:6px 9px;border-radius:var(--r-sm)}
+.fbadge.posted{background:var(--ok-soft);color:var(--ok)}.fbadge.rejected{background:var(--err-soft);color:#ffb3ba}
+.fbadge a{margin-left:auto;font-size:12px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips button{background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:99px;padding:4px 10px;font:13px inherit;font-family:inherit;cursor:pointer}
+.chips button.on{background:var(--err-soft);border-color:var(--err);color:#ffb3ba}
+.clip.rejected{opacity:.55}.clip.rejected:hover{opacity:1}
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px}
+.tile b{display:block;font-size:24px;font-weight:650}.tile span{font-size:12.5px;color:var(--muted)}
+table.t{width:100%;border-collapse:collapse;font-size:13.5px}
+table.t td,table.t th{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+table.t th{color:var(--dim);font-weight:500;font-size:12px}
+table.t input{width:110px;padding:6px 8px}
+@media (max-width:860px){.tiles{grid-template-columns:1fr 1fr}}
+.switch{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13.5px;user-select:none}
+.switch input{display:none}
+.switch i{width:36px;height:20px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);position:relative;transition:.2s;flex:none}
+.switch i:after{content:"";position:absolute;left:2px;top:2px;width:14px;height:14px;border-radius:50%;background:var(--muted);transition:.2s}
+.switch input:checked+i{background:var(--accent);border-color:var(--accent)}
+.switch input:checked+i:after{left:18px;background:#fff}
+.chip{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:2px 8px;border-radius:6px;background:var(--panel2);color:var(--muted)}
+.chip.c{color:var(--accent-h);background:var(--accent-soft)}
+.muted{color:var(--muted)}.dim{color:var(--dim)}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.alert{display:flex;gap:10px;padding:12px 14px;border-radius:var(--r-sm);font-size:13.5px;margin-top:12px}
+.alert.err{background:var(--err-soft);color:#ffb3ba}.alert.warn{background:var(--warn-soft);color:#ffd98f}.alert.info{background:var(--accent-soft);color:#d6c2ff}
+.alert pre{margin:6px 0 0;white-space:pre-wrap;font-size:12px;max-height:200px;overflow:auto;color:var(--muted)}
+.empty{text-align:center;padding:50px 20px;color:var(--muted)}
+.empty .ic{width:36px;height:36px;color:var(--dim);margin-bottom:10px}
+.seg{display:inline-flex;background:var(--panel2);border:1px solid var(--line);border-radius:var(--r-sm);padding:3px;gap:2px;flex-wrap:wrap}
+.seg button{background:none;border:0;color:var(--muted);padding:7px 12px;border-radius:6px;cursor:pointer;font:500 13px inherit;font-family:inherit;display:flex;gap:6px;align-items:center}
+.seg button.on{background:var(--accent);color:#fff}
+
+/* stepper */
+.steps{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-top:18px}
+.step{display:flex;flex-direction:column;gap:7px}
+.step .bar{height:5px;border-radius:3px;background:var(--panel2);overflow:hidden}
+.step .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .4s}
+.step.done .bar i{background:var(--ok);width:100%}
+.step .lbl{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
+.step.cur .lbl{color:var(--text)}.step.done .lbl{color:var(--muted)}
+.step.done .lbl .ic{color:var(--ok)}.step.cur .lbl .ic{color:var(--accent-h)}
+.status-line{display:flex;align-items:center;gap:8px;margin-top:14px;color:var(--muted);font-size:13.5px}
+
+/* clips */
+.clips{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;margin-top:16px}
+.clip{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column}
+.clip video{width:100%;aspect-ratio:9/16;background:#000;display:block}
+.clip .b{padding:14px;display:flex;flex-direction:column;gap:8px;flex:1}
+.clip h4{margin:0;font-size:15px;line-height:1.35}
+.score{display:inline-flex;align-items:center;gap:4px;font-weight:700;color:var(--hl);font-size:14px}
+.desc{font-size:13px;background:var(--panel2);border-radius:var(--r-sm);padding:9px 10px;white-space:pre-wrap;color:var(--muted)}
+.clip .acts{display:flex;gap:8px;margin-top:auto;padding-top:4px}
+.clip .acts .btn{flex:1}
+canvas{width:100%;height:130px;display:block}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--dim)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:0}
+
+/* streamers */
+.sgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.scard{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px;display:flex;flex-direction:column;gap:10px}
+.scard .top{display:flex;gap:12px;align-items:center}
+.scard .nm{font-weight:600;font-size:15px}
+.scard .lg{font-size:12.5px;color:var(--dim)}
+.scard .ds{font-size:13px;color:var(--muted);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:20px}
+.scard .acts{display:flex;gap:8px;margin-top:auto}
+.vods{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-top:12px}
+.vod{background:var(--panel2);border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;cursor:pointer;transition:border-color .15s}
+.vod:hover{border-color:var(--accent)}
+.vod .th{position:relative;aspect-ratio:16/9;background:#000}
+.vod .th img{width:100%;height:100%;object-fit:cover;display:block}
+.vod .th span{position:absolute;right:6px;bottom:6px;background:rgba(0,0,0,.8);font-size:11.5px;padding:1px 6px;border-radius:4px}
+.vod .in{padding:8px 10px}
+.vod .in .t{font-size:13px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.vod .in .s{font-size:11.5px;color:var(--dim);margin-top:3px}
+.vod.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+
+/* status */
+.chk{display:flex;gap:12px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line)}
+.chk:last-child{border-bottom:0}
+.chk .ic{margin-top:2px}
+.chk .ok{color:var(--ok)}.chk .bad{color:var(--err)}
+.chk b{display:block;font-weight:600}
+.chk span{font-size:13px;color:var(--muted)}
+code{background:var(--panel2);padding:1px 6px;border-radius:5px;font-size:12.5px}
+
+/* modal + toast */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;padding:6vh 16px;z-index:20;overflow:auto}
+.modal.on{display:flex}
+.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:100%;max-width:640px;padding:22px}
+.modal h2{margin:0 0 16px;font-size:18px;display:flex;align-items:center;gap:10px}
+.toast{visibility:hidden;opacity:0;position:fixed;right:20px;bottom:20px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px 14px;display:flex;gap:9px;align-items:center;z-index:30;transform:translateY(12px);transition:transform .25s,opacity .25s,visibility .25s;max-width:420px;font-size:13.5px}
+.toast.on{transform:none;opacity:1;visibility:visible}
+.toast.err .ic{color:var(--err)}.toast.ok .ic{color:var(--ok)}
+@media (max-width:860px){.app{grid-template-columns:1fr}aside{display:none}.page{padding:18px 16px}.g2,.g4{grid-template-columns:1fr}.steps{grid-template-columns:repeat(4,1fr)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand"><div class="logo" id="logo"></div><div><b>TwitchCut</b><small>стрим → клипы для TikTok</small></div></div>
+    <nav id="nav"></nav>
+    <div class="side-h">Последние задачи</div>
+    <div class="recent" id="recent"></div>
+  </aside>
+  <main id="main"></main>
+</div>
+<div class="modal" id="modal"><div class="box" id="modalbox"></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+/* ---------------------------------------------------------------- helpers */
+const CAT = {funny:"смешно",story:"история",news:"новость",info:"интересное",hot_take:"мнение",emotional:"эмоции",drama:"драма",fail:"фейл",epic:"эпик",rage:"ярость",scare:"испуг",cringe:"кринж",chat:"чат",wholesome:"мило",other:"другое"};
+const STATUS = {queued:"в очереди",running:"в работе",done:"готово",error:"ошибка",awaiting_llm:"ждёт ответа",live:"в эфире"};
+const STAGE_IC = {meta:"info",chat:"message-square",audio:"mic",signals:"activity",transcribe:"hash",scan:"search",llm:"sparkles",render:"clapperboard"};
+const SRC = {speech:"найдено по смыслу","speech+signals":"по смыслу + реакция чата",signals:"по реакции чата/звука"};
+const MODES = [
+  {k:"sonnet", llm:"claude-cli", cli:"sonnet", t:"Claude Sonnet", d:"подписка · баланс (рекомендуется)"},
+  {k:"haiku", llm:"claude-cli", cli:"haiku", t:"Claude Haiku", d:"подписка · быстрее, бережёт лимиты"},
+  {k:"opus", llm:"claude-cli", cli:"opus", t:"Claude Opus", d:"подписка · максимум, много лимитов"},
+  {k:"manual", llm:"manual", t:"Вручную", d:"копировать промпт в чат claude.ai"},
+  {k:"none", llm:"none", t:"Без Claude", d:"только чат и звук"},
+];
+const $ = s => document.querySelector(s);
+const esc = s => (s ?? "").toString().replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = s => { s = Math.max(0, Math.round(s||0)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60;
+  return (h? h+":"+String(m).padStart(2,"0") : m) + ":" + String(x).padStart(2,"0"); };
+const fdate = iso => { try { return new Date(iso).toLocaleDateString("ru-RU",{day:"numeric",month:"short"}); } catch(e){ return ""; } };
+const ava = (url, cls="") => url ? `<img class="ava ${cls}" src="${esc(url)}" alt="">` : `<div class="ava ${cls}">${icon("user","sm")}</div>`;
+async function api(path, body){
+  const r = await fetch(path, body!==undefined ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {});
+  let j = {}; try { j = await r.json(); } catch(e){}
+  if (!r.ok) throw new Error(j.error || ("Ошибка " + r.status)); return j;
+}
+let toastT;
+function toast(msg, kind="ok"){ const t=$("#toast"); t.className="toast on "+kind;
+  t.innerHTML = icon(kind==="err"?"circle-alert":"circle-check") + `<span>${esc(msg)}</span>`;
+  clearTimeout(toastT); toastT = setTimeout(()=>t.classList.remove("on"), 3500); }
+function copy(t, btn){ navigator.clipboard.writeText(t); const o=btn.innerHTML; btn.innerHTML=icon("check","sm")+" Скопировано"; setTimeout(()=>btn.innerHTML=o, 1300); }
+function openModal(html){ $("#modalbox").innerHTML = html; $("#modal").classList.add("on"); }
+function closeModal(){ $("#modal").classList.remove("on"); }
+$("#modal").addEventListener("mousedown", e => { if (e.target.id==="modal") closeModal(); });
+document.addEventListener("keydown", e => { if (e.key==="Escape") closeModal(); });
+
+/* ---------------------------------------------------------------- state */
+const S = { jobs:[], streamers:[], status:null, view:"new", jobId:null, timer:null, lastJob:"", newForm:{mode:"sonnet", streamer:"", vod:null} };
+
+function route(){
+  const h = location.hash.replace(/^#\/?/, "");
+  clearInterval(S.timer); S.lastJob = ""; S.lastClips = ""; closeModal();
+  if (h.startsWith("job/")) { S.view="job"; S.jobId=decodeURIComponent(h.slice(4)); renderJob(); S.timer=setInterval(renderJob,1500); }
+  else if (h==="streamers") { S.view="streamers"; renderStreamers(); }
+  else if (h==="status") { S.view="status"; renderStatus(); }
+  else if (h==="stats") { S.view="stats"; renderStats(); }
+  else if (h==="jobs") { S.view="jobs"; renderJobs(); }
+  else { S.view="new"; renderNew(); }
+  renderNav();
+}
+window.addEventListener("hashchange", route);
+
+function renderNav(){
+  const st = S.status, ok = st && st.ffmpeg && st.whisper && st.ytdlp && (st.llm_backend!=="claude-cli" || (st.claude?.installed && st.claude?.logged_in));
+  const items = [["new","scissors","Новая нарезка",""],["jobs","list-video","Задачи",`<span class="cnt">${S.jobs.length||""}</span>`],
+    ["streamers","users","Стримеры",`<span class="cnt">${S.streamers.length||""}</span>`],
+    ["stats","chart-column-increasing","Статистика",""],
+    ["status","activity","Статус",`<span class="dot ${st? (ok?"ok":"bad") : ""}"></span>`]];
+  $("#nav").innerHTML = items.map(([k,ic,t,x]) => `<a href="#/${k}" class="${S.view===k?'on':''}">${icon(ic)}<span>${t}</span>${x}</a>`).join("");
+  $("#recent").innerHTML = S.jobs.slice(0,12).map(j => `<div class="ritem ${S.view==='job'&&S.jobId===j.id?'on':''}" onclick="location.hash='#/job/${encodeURIComponent(j.id)}'">
+      ${ava(j.streamer_avatar)}<div style="min-width:0"><div class="t">${esc(j.title||j.id)}</div>
+      <div class="s">${statusIcon(j.status)} ${STATUS[j.status]||""}${j.clips?` · ${j.clips} клип.`:""}</div></div></div>`).join("")
+    || `<div class="dim" style="padding:6px 10px;font-size:13px">Пока пусто</div>`;
+}
+function statusIcon(s){ return s==="live"? `<span class="live-dot"></span>` : s==="done"? `<span style="color:var(--ok)">${icon("circle-check","sm")}</span>` :
+  s==="error"? `<span style="color:var(--err)">${icon("circle-alert","sm")}</span>` :
+  ["running","queued"].includes(s)? `<span style="color:var(--accent-h)">${icon("loader-circle","sm spin")}</span>` :
+  s==="awaiting_llm"? `<span style="color:var(--warn)">${icon("clock","sm")}</span>` : ""; }
+
+async function refreshLists(){
+  try { S.jobs = await api("/api/jobs"); } catch(e){}
+  try { S.streamers = await api("/api/streamers"); } catch(e){}
+  renderNav();
+}
+async function refreshStatus(force){
+  try { S.status = force ? await api("/api/status/refresh", {}) : await api("/api/status"); } catch(e){}
+  renderNav();
+}
+
+/* ---------------------------------------------------------------- new job */
+function renderNew(){
+  const f = S.newForm;
+  const sOpts = S.streamers.map(s => `<option value="${esc(s.login)}" ${f.streamer===s.login?"selected":""}>${esc(s.name)}</option>`).join("");
+  $("#main").innerHTML = `<div class="page">
+    <div class="ph"><div><h1>Новая нарезка</h1><p>Выберите стримера и запись или вставьте ссылку на VOD</p></div></div>
+    <div class="card">
+      <div class="grid g2">
+        <div><label>Стример</label>
+          <select id="f-streamer" onchange="S.newForm.streamer=this.value;S.newForm.vod=null;loadVods()">
+            <option value="">— определить по ссылке —</option>${sOpts}</select>
+          <div class="hint">${S.streamers.length? "Описание стримера подскажет Claude, что у него смешно" : `Добавьте стримеров во вкладке <a href="#/streamers">Стримеры</a>`}</div></div>
+        <div><label>Ссылка на VOD или путь к файлу</label>
+          <input type="text" id="f-src" placeholder="https://www.twitch.tv/videos/123456789" value="${esc(f.vod?.url||"")}"></div>
+      </div>
+      <div id="vods"></div>
+      <div class="mt"><label>Анализ контекста</label>
+        <div class="seg" id="f-mode">${MODES.map(m=>`<button type="button" class="${f.mode===m.k?'on':''}" title="${esc(m.d)}" onclick="S.newForm.mode='${m.k}';renderModes()">${icon(m.llm==="claude-cli"?"sparkles":m.llm==="manual"?"copy":"activity","sm")} ${m.t}</button>`).join("")}</div>
+        <div class="hint" id="f-mode-d">${esc(MODES.find(m=>m.k===f.mode).d)}</div></div>
+      <div class="mt"><label>Глубина анализа</label>
+        <div class="seg" id="f-depth">
+          <button type="button" class="${f.depth!=='fast'?'on':''}" onclick="S.newForm.depth='deep';renderDepth()">${icon("search","sm")} Глубокий — весь стрим по смыслу</button>
+          <button type="button" class="${f.depth==='fast'?'on':''}" onclick="S.newForm.depth='fast';renderDepth()">${icon("activity","sm")} Быстрый — только всплески чата</button></div>
+        <div class="hint" id="f-depth-d"></div></div>
+      <div class="grid g4 mt">
+        <div><label>Клипов</label><input type="number" id="f-n" value="8" min="1" max="30"></div>
+        <div><label>Раскладка</label><select id="f-layout"><option value="auto">Авто</option><option value="split">Вебка + игра</option><option value="cam">Только вебка</option><option value="crop">Кадр по лицу</option><option value="blur">Размытый фон</option></select></div>
+        <div style="display:flex;align-items:flex-end;padding-bottom:10px"><label class="check"><input type="checkbox" id="f-censor" checked> ${icon("volume-x","sm")} Запикивать мат</label></div>
+        <div style="display:flex;align-items:flex-end"><button class="btn" style="width:100%" onclick="createJob(this)">${icon("scissors")} Нарезать</button></div>
+      </div>
+      <details class="mt"><summary class="muted" style="cursor:pointer;font-size:13px">Дополнительно</summary>
+        <div class="grid g2 mt">
+          <div><label>Контекст только для этого стрима</label><textarea id="f-ctx" style="min-height:70px" placeholder="Например: играет с друзьями в хоррор, сегодня день рождения"></textarea></div>
+          <div><label>Файл чата (для локального видео)</label><input type="text" id="f-chat" placeholder="C:\\путь\\chat.json из TwitchDownloaderCLI"></div>
+        </div></details>
+    </div></div>`;
+  if (f.streamer) loadVods();
+  renderDepth();
+}
+function renderDepth(){
+  const deep = S.newForm.depth !== "fast";
+  document.querySelectorAll("#f-depth button").forEach((b,i)=>b.classList.toggle("on", i===(deep?0:1)));
+  $("#f-depth-d").textContent = deep ? "Распознаётся весь стрим, Claude находит истории, новости и мнения даже при тихом чате. Дольше: ~10–25 мин на час стрима."
+    : "Анализируются только места, где оживился чат или стример стал громче. Быстро, но «тихие» интересные темы пропускаются.";
+}
+function renderModes(){
+  document.querySelectorAll("#f-mode button").forEach((b,i)=>b.classList.toggle("on", MODES[i].k===S.newForm.mode));
+  $("#f-mode-d").textContent = MODES.find(m=>m.k===S.newForm.mode).d;
+}
+async function loadVods(){
+  const box = $("#vods"); const login = S.newForm.streamer;
+  if (!login){ box.innerHTML=""; return; }
+  box.innerHTML = `<div class="status-line">${icon("loader-circle","spin")} Загружаю записи стримов…</div>`;
+  try{
+    const v = await api(`/api/streamers/${login}/vods`);
+    if (S.newForm.streamer !== login) return;
+    box.innerHTML = v.length ? `<div class="mt"><label>Последние записи — нажмите, чтобы выбрать</label></div><div class="vods">${v.map((x,i)=>`
+      <div class="vod ${S.newForm.vod?.id===x.id?'sel':''}" onclick='pickVod(${i})'><div class="th">${x.thumb?`<img src="${esc(x.thumb)}" loading="lazy" alt="">`:""}<span>${fmt(x.duration)}</span></div>
+      <div class="in"><div class="t">${esc(x.title)}</div><div class="s">${fdate(x.created)}${x.game?" · "+esc(x.game):""}</div></div></div>`).join("")}</div>`
+      : `<div class="hint mt">У канала нет сохранённых записей (VOD).</div>`;
+    S.vodList = v;
+  }catch(e){ box.innerHTML = `<div class="alert warn">${icon("triangle-alert")} Не удалось получить записи: ${esc(e.message)}. Вставьте ссылку вручную.</div>`; }
+}
+function pickVod(i){ S.newForm.vod = S.vodList[i]; $("#f-src").value = S.newForm.vod.url;
+  document.querySelectorAll(".vod").forEach((el,k)=>el.classList.toggle("sel", k===i)); }
+async function createJob(btn){
+  const m = MODES.find(x=>x.k===S.newForm.mode);
+  const src = $("#f-src").value.trim();
+  if (!src) return toast("Выберите запись или вставьте ссылку", "err");
+  btn.disabled = true;
+  try{
+    const r = await api("/api/jobs", {source: src, options:{
+      max_clips:+$("#f-n").value, llm:m.llm, analysis_mode:S.newForm.depth==="fast"?"fast":"deep", cli_model:m.cli||"", layout:$("#f-layout").value,
+      censor:$("#f-censor").checked, streamer:S.newForm.streamer, streamer_context:$("#f-ctx").value, chat_file:$("#f-chat").value}});
+    S.newForm.vod = null; await refreshLists(); location.hash = "#/job/" + encodeURIComponent(r.id);
+  }catch(e){ toast(e.message, "err"); }
+  btn.disabled = false;
+}
+
+/* ---------------------------------------------------------------- jobs list */
+async function renderJobs(){
+  await refreshLists();
+  $("#main").innerHTML = `<div class="page"><div class="ph"><div><h1>Задачи</h1><p>Все обработанные и текущие стримы</p></div><span class="sp"></span>
+    <a class="btn" href="#/new">${icon("plus")} Новая нарезка</a></div>
+    ${S.jobs.length ? `<div class="card" style="padding:6px">${S.jobs.map(j=>`
+      <div class="ritem" style="padding:12px" onclick="location.hash='#/job/${encodeURIComponent(j.id)}'">${ava(j.streamer_avatar,"md")}
+        <div style="min-width:0;flex:1"><div class="t" style="font-size:14px;font-weight:600">${esc(j.title||j.id)}</div>
+        <div class="s">${esc(j.channel||"")}${j.duration?" · "+fmt(j.duration):""}${j.clips?` · ${j.clips} клипов`:""}</div></div>
+        <span class="pill ${j.status}">${STATUS[j.status]||j.status||""}</span>${icon("chevron-right","dim")}</div>`).join("")}</div>`
+      : `<div class="card empty">${icon("film")}<div>Ещё нет задач</div></div>`}</div>`;
+}
+
+/* ---------------------------------------------------------------- job view */
+async function renderJob(){
+  let st; try{ st = await api("/api/jobs/" + encodeURIComponent(S.jobId)); }catch(e){
+    $("#main").innerHTML = `<div class="page"><div class="card empty">${icon("circle-alert")}<div>Задача не найдена</div></div></div>`; clearInterval(S.timer); return; }
+  const js = JSON.stringify(st); if (js === S.lastJob) return; S.lastJob = js;
+  const active = ["queued","running","awaiting_llm","live"].includes(st.status);
+  const rendering = Object.keys(st.rendering||{}).length > 0;
+  if (rendering && !S.timer2){ S.timer2 = setInterval(()=>{ if (S.view==="job") renderJob(); }, 1500); }
+  if (!rendering && S.timer2){ clearInterval(S.timer2); S.timer2 = null; }
+  if (!active) { clearInterval(S.timer); refreshLists(); }
+  const si = st.stages.findIndex(s => s.key === st.stage);
+  const u = st.llm_usage || {};
+  const meta = [st.channel, st.duration?fmt(st.duration):"", st.chat_messages!=null?`чат: ${st.chat_messages.toLocaleString("ru-RU")} сообщ.`:"",
+    st.candidates?.length?`кандидатов: ${st.candidates.length}`:"",
+    u.backend==="claude-cli" && !u.fallback ? `Claude ${(u.model||"").replace(/^./,c=>c.toUpperCase())}: ${((u.input_tokens||0)+(u.output_tokens||0)).toLocaleString("ru-RU")} токенов` : "",
+    u.cost_usd!=null?`API: $${u.cost_usd}`:"", st.quality?`качество: ${st.quality}`:""].filter(Boolean).map(esc).join(" · ");
+  let h = `<div class="page"><div class="card">
+    <div class="row" style="align-items:flex-start">${ava(st.streamer_avatar,"lg")}
+      <div style="flex:1;min-width:220px"><div class="row"><h1 style="margin:0;font-size:20px">${esc(st.title || st.id)}</h1>
+        <span class="pill ${st.status}">${statusIcon(st.status)} ${STATUS[st.status]||st.status||""}</span></div>
+        <div class="muted" style="font-size:13px;margin-top:4px">${meta}</div></div>
+      ${st.status==="live" ? `<div class="row"><button class="btn ghost sm danger" onclick="stopLive()">${icon("x","sm")} Остановить наблюдение</button></div>` : ""}
+      ${!active ? `<div class="row">
+        <button class="btn ghost sm" onclick="rerun('scan')" title="Заново найти и оценить моменты через Claude (речь не распознаётся заново)">${icon("sparkles","sm")} Переанализировать</button>
+        <button class="btn ghost sm" onclick="rerun('render')" title="Перемонтировать с текущими настройками">${icon("clapperboard","sm")} Перемонтировать</button>
+        ${st.status==="error"?`<button class="btn sm" onclick="rerun(null)">${icon("rotate-ccw","sm")} Повторить</button>`:""}
+        <button class="btn ghost sm icon danger" title="Удалить задачу" onclick="delJob()">${icon("trash","sm")}</button></div>` : ""}
+    </div>
+    <div class="steps">${st.stages.map((s,i)=>{ const done = st.status==="done" || i<si, cur = i===si && st.status!=="done";
+      const p = cur ? Math.round((st.stage_progress||0)*100) : 0;
+      return `<div class="step ${done?'done':''} ${cur?'cur':''}"><div class="bar"><i style="width:${done?100:p}%"></i></div>
+        <div class="lbl">${icon(done?"circle-check":(cur&&active?"loader-circle":STAGE_IC[s.key]), "sm"+(cur&&active&&!done?" spin":""))}${s.title}</div></div>`}).join("")}</div>
+    ${st.message?`<div class="status-line">${icon(st.status==="error"?"circle-alert":st.status==="done"?"circle-check":"info","sm")} ${esc(st.message)}</div>`:""}
+    ${st.warning?`<div class="alert warn">${icon("triangle-alert")}<div>${esc(st.warning)}</div></div>`:""}
+    ${st.status==="error"&&st.error?`<div class="alert err">${icon("circle-alert")}<div>Ошибка<pre>${esc(st.error)}</pre></div></div>`:""}
+  </div>`;
+  if (st.status === "awaiting_llm"){
+    h += `<div class="card"><h3>${icon("copy")} Ручной режим</h3><p class="muted" style="margin-top:0">Скопируйте промпт, вставьте его в чат с Claude на claude.ai, а ответ (JSON) вставьте ниже.</p>
+      <textarea readonly id="llmprompt" style="min-height:140px">${esc(st.llm_prompt)}</textarea>
+      <div class="row mt"><button class="btn ghost" onclick="copy($('#llmprompt').value,this)">${icon("copy","sm")} Копировать промпт</button></div>
+      <label class="mt">Ответ Claude</label><textarea id="llmans" placeholder='{"clips":[...]}'></textarea>
+      <div class="row mt"><button class="btn" onclick="sendLLM()">${icon("check","sm")} Продолжить</button></div></div>`;
+  }
+  if (st.live || st.live_cycles?.length){
+    const cyc = (st.live_cycles||[]).slice().reverse();
+    h += `<div class="card"><h3>${icon("radio")} Эфир по кускам</h3>
+      <div class="hint" style="margin-top:0">Каждые ${esc(String(st.live_chunk_minutes||60))} мин эфира TwitchCut берёт новый кусок записи (с самого начала эфира), ищет моменты и сразу монтирует сильные (оценка ${esc(String(st.live_min_score||60))}+). Если сильных нет — монтирует лучший из найденных. Кусок с ошибкой автоматически повторяется.</div>
+      ${cyc.length?`<table class="t"><tr><th>Кусок эфира</th><th>Моментов</th><th>Лучшая оценка</th><th>Смонтировано</th></tr>
+      ${cyc.map(c=>`<tr><td>${fmt(c.a)}–${fmt(c.b)}</td><td>${c.candidates}</td><td>${c.best||"—"}</td><td>${c.error?`<span style="color:var(--err)" title="${esc(c.error)}">ошибка</span>`:c.chosen}</td></tr>`).join("")}</table>`
+      :`<div class="dim">Первый кусок ещё не обработан.</div>`}</div>`;
+  }
+  if (st.timeline?.score?.length) h += `<div class="card"><div class="row"><h3 style="margin:0">${icon("activity")} Интересность по ходу стрима</h3><span class="sp"></span>
+      <div class="legend"><span><i style="background:var(--ok)"></i>Claude ≥70</span><span><i style="background:var(--warn)"></i>55–69</span><span><i style="background:var(--err)"></i>&lt;55</span><span><i style="background:#fff;border:2px solid #9147ff;width:7px;height:7px"></i>найдено по смыслу</span><span><i style="background:rgba(47,209,139,.35);border-radius:2px"></i>клип</span></div></div>
+      <canvas id="tl" class="mt"></canvas></div>`;
+  const clips = st.clips || [];
+  S.clips = clips;
+  const clipsKey = JSON.stringify([clips.map(c=>[c.file,c.score,c.titles,c.feedback,c.v]), st.rendering, st.render_errors]);
+  const keepOld = clipsKey === S.lastClips && document.querySelector("#clipsbox");
+  if (keepOld) h += `<div id="clipsholder"></div>`;
+  else if (clips.length){
+    h += `<div class="clips" id="clipsbox">` + clips.map(c => {
+      const tags = (c.hashtags||[]).slice(0,5).map(t=>"#"+t.replace(/\s/g,"")).join(" ");
+      const f = `/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.file)}?v=${c.v||0}`;
+      const busy = (st.rendering||{})[String(c.n)];
+      const rerr = (st.render_errors||{})[String(c.n)];
+      const dur = c.final_duration ?? c.duration;
+      const sp = S.edits?.[c.n]?.speed ?? (c.speed || 1);
+      const dirty = Math.abs(sp-(c.speed||1))>0.01;
+      const titles = (c.titles&&c.titles.length?c.titles:[c.title]).filter(Boolean).slice(0,2);
+      return `<div class="clip ${c.feedback?.status==="rejected"?"rejected":""}" id="clip-${c.n}">
+      <div class="vwrap">${c.missing && !busy ? `<img src="/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.thumb)}" style="width:100%;height:100%;object-fit:cover;opacity:.45" onerror="this.style.display='none'">
+          <div class="busy">${icon("trash","lg")}<span>Видео удалено автоочисткой.<br>«Применить» смонтирует заново.</span></div>`
+        : `<video controls preload="metadata" playsinline poster="/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.thumb)}?v=${c.v||0}" src="${f}"></video>`}
+        ${busy?`<div class="busy">${icon("loader-circle","lg spin")}<span>${busy==="waiting"?"Жду очереди…":"Перемонтирую…"}</span></div>`:""}</div>
+      <div class="b"><div class="row" style="gap:6px"><span class="score">${icon("flame","sm")}${c.score}</span><span class="chip c">${CAT[c.category]||c.category}</span>
+        <span class="chip" title="Время в стриме">${icon("clock","sm")} ${c.stream_time}</span><span class="chip" title="Длина клипа">${icon("timer","sm")} ${dur}с</span>
+        ${c.quality?`<span class="chip" title="Качество исходника">${icon("video","sm")} ${esc(c.quality.split(" ")[0])}</span>`:""}
+        ${c.extra?`<span class="chip" title="Оценка ниже порога — добран, чтобы было столько клипов, сколько вы просили">запасной</span>`:""}
+        ${c.content_cut_sec>0?`<span class="chip" title="Claude вырезал лишнее: донат не по теме, повторы, поиск">${icon("scissors","sm")} −${c.content_cut_sec}с воды</span>`:""}</div>
+        <div class="titles">${titles.map(t=>`<div class="tv" onclick="copyTitle(this)" data-t="${esc(t)}" title="Нажмите, чтобы скопировать"><span>${esc(t)}</span>${icon("copy","sm")}</div>`).join("")}</div>
+        ${tags?`<div class="titles"><div class="tv tags" onclick="copyTitle(this)" data-t="${esc(tags)}" title="Скопировать хештеги"><span>${esc(tags)}</span>${icon("copy","sm")}</div></div>`:""}
+        <div class="edit">
+          <div class="seg sm">${[1,1.1,1.25,1.5,2].map(v=>`<button type="button" class="${Math.abs(sp-v)<0.01?'on':''}" onclick="setSpeed(${c.n},${v},this)">${v}×</button>`).join("")}</div>
+          <label class="check" title="Вырезать «мёртвые» паузы, когда стример задумался. Смех, реакции и звук игры не трогаются.">
+            <input type="checkbox" id="trim-${c.n}" ${c.trim_pauses!==false?"checked":""} onchange="markDirty(${c.n})"> без пауз${c.pauses_removed>0?` <span class="dim">(−${c.pauses_removed}с)</span>`:""}</label>
+          <select class="lay" id="lay-${c.n}" onchange="markDirty(${c.n})" title="Раскладка кадра">
+            ${[["auto","Авто"],["split","Вебка + игра"],["cam","Только вебка"],["crop","Кадр по лицу"],["blur","Весь кадр"]].map(([k,t])=>`<option value="${k}" ${(c.layout_choice||"auto")===k?"selected":""}>${t}${k==="auto"&&c.layout?" ("+[...new Set(c.layouts||[c.layout])].map(x=>({split:"вебка + игра",cam:"только вебка",crop:"по лицу",blur:"весь кадр"})[x]).join(" → ")+")":""}</option>`).join("")}
+          </select>
+          <button class="btn sm ghost" id="apply-${c.n}" style="${dirty||c.missing?"":"display:none"}" onclick="applyEdit(${c.n})">${icon("refresh-cw","sm")} Применить</button>
+        </div>
+        ${rerr?`<div class="alert err" style="margin:0">${esc(rerr)}</div>`:""}
+        ${c.missing?"":`<div class="acts"><a class="btn sm" href="${f}&download=1">${icon("download","sm")} Скачать</a></div>`}
+        ${fbBlock(c)}</div></div>`;
+    }).join("") + `</div>`;
+  } else if (st.status === "done") h += `<div class="card empty mt">${icon("film")}<div>Подходящих моментов не нашлось. Снизьте <code>clips.min_score</code> в config.yaml или выберите другой стрим.</div></div>`;
+  h += `</div>`;
+  const scroll = $("main").scrollTop;
+  const old = keepOld ? document.querySelector("#clipsbox") : null;
+  $("#main").innerHTML = h;
+  if (old) $("#clipsholder").replaceWith(old);
+  S.lastClips = clipsKey;
+  $("main").scrollTop = scroll;
+  if (st.timeline?.score?.length) drawTimeline(st);
+}
+async function rerun(from){ try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/rerun`, {from}); S.lastJob=""; clearInterval(S.timer); renderJob(); S.timer=setInterval(renderJob,1500); refreshLists(); }catch(e){ toast(e.message,"err"); } }
+async function sendLLM(){ try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/llm`, {text: $("#llmans").value}); S.lastJob=""; toast("Ответ принят"); }catch(e){ toast(e.message,"err"); } }
+S.edits = {};
+function setSpeed(n, v, btn){ btn.parentElement.querySelectorAll("button").forEach(b=>b.classList.toggle("on", b===btn));
+  (S.edits[n] = S.edits[n] || {}).speed = v; markDirty(n); }
+function markDirty(n){ const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
+  const sp = e.speed ?? (c.speed||1), tr = $("#trim-"+n).checked, lay = $("#lay-"+n).value;
+  $("#apply-"+n).style.display = (Math.abs(sp-(c.speed||1))>0.01 || tr !== (c.trim_pauses!==false) || lay !== (c.layout_choice||"auto")) ? "" : "none"; }
+async function applyEdit(n){
+  const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/render`, {speed: e.speed ?? (c.speed||1), trim: $("#trim-"+n).checked, layout: $("#lay-"+n).value});
+    delete S.edits[n]; S.lastJob=""; S.lastClips=""; renderJob(); toast("Перемонтирую клип…"); }
+  catch(err){ toast(err.message,"err"); } }
+function copyTitle(el){ navigator.clipboard.writeText(el.dataset.t); const ic = el.querySelector(".ic"); const o = ic.outerHTML;
+  ic.outerHTML = icon("check","sm"); setTimeout(()=>{ const c = el.querySelector(".ic"); if (c) c.outerHTML = o; }, 1200); toast(el.classList.contains("tags")?"Хештеги скопированы":"Название скопировано"); }
+async function stopLive(){ if (!confirm("Остановить наблюдение за эфиром? Уже готовые клипы останутся.")) return;
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/stop`, {}); S.lastJob=""; renderJob(); refreshLists(); }catch(e){ toast(e.message,"err"); } }
+async function delJob(){ if (!confirm("Удалить задачу вместе с клипами?")) return;
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/delete`, {}); await refreshLists(); location.hash="#/jobs"; toast("Задача удалена"); }catch(e){ toast(e.message,"err"); } }
+
+function drawTimeline(st){
+  const cv = $("#tl"), dpr = window.devicePixelRatio||1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W*dpr; cv.height = H*dpr; const g = cv.getContext("2d"); g.scale(dpr,dpr);
+  const sc = st.timeline.score, step = st.timeline.step, dur = sc.length*step;
+  const max = Math.max(1, ...sc), X = t => t/dur*W, Y = v => H-16-(Math.max(0,v)/max)*(H-28);
+  g.fillStyle = "rgba(47,209,139,.16)";
+  (st.clips||[]).forEach(c => g.fillRect(X(c.start), 0, Math.max(3, X(c.end)-X(c.start)), H-14));
+  const grad = g.createLinearGradient(0,0,0,H); grad.addColorStop(0,"rgba(145,71,255,.35)"); grad.addColorStop(1,"rgba(145,71,255,0)");
+  g.beginPath(); g.moveTo(0,H-16); sc.forEach((v,i)=> g.lineTo(X(i*step),Y(v))); g.lineTo(W,H-16); g.closePath(); g.fillStyle=grad; g.fill();
+  g.beginPath(); sc.forEach((v,i)=> i? g.lineTo(X(i*step),Y(v)) : g.moveTo(0,Y(v))); g.strokeStyle = "#9147ff"; g.lineWidth = 1.5; g.stroke();
+  (st.candidates||[]).forEach(c => { const s = c.score;
+    g.fillStyle = s==null ? "#6b6b7b" : s>=70 ? "#2fd18b" : s>=55 ? "#f2b445" : "#ff5c6c";
+    const sp = (c.source||"").startsWith("speech");
+    const yv = sp ? Math.max(c.signal||0, max*0.12) : c.signal;
+    g.beginPath(); g.arc(X(c.peak), Y(yv), sp?5.5:4.5, 0, 7); g.fill(); g.strokeStyle= sp ? "#ffffff" : "#16161c"; g.lineWidth= sp?2:1.5; g.stroke(); });
+  g.fillStyle = "#6b6b7b"; g.font = "11px Segoe UI, system-ui";
+  for (let i=0;i<=6;i++){ const t = dur*i/6; g.fillText(fmt(t), Math.min(W-34, X(t)), H-2); }
+}
+
+/* ---------------------------------------------------------------- streamers */
+async function renderStreamers(){
+  await refreshLists();
+  $("#main").innerHTML = `<div class="page">
+    <div class="ph"><div><h1>Стримеры</h1><p>Описание, мемы и эмоуты стримера помогают Claude понимать, что у него смешно</p></div><span class="sp"></span>
+      <button class="btn" onclick="editStreamer()">${icon("user-plus")} Добавить стримера</button></div>
+    ${S.streamers.length ? `<div class="sgrid">${S.streamers.map(s=>`
+      <div class="scard"><div class="top">${ava(s.avatar,"lg")}<div style="min-width:0"><div class="nm">${esc(s.name)}</div>
+        <a class="lg" href="https://twitch.tv/${esc(s.login)}" target="_blank">twitch.tv/${esc(s.login)} ${icon("external-link","sm")}</a></div></div>
+        ${s.live_status?.live?`<div class="row" style="gap:8px;font-size:13px"><span class="live-dot"></span><b>В эфире</b><span class="muted">${esc(s.live_status.game||"")}</span>
+          ${s.live_status.job?`<a href="#/job/${encodeURIComponent(s.live_status.job)}">открыть клипы →</a>`:""}</div>`:""}
+        ${s.live_status?.error?`<div class="dim" style="font-size:12.5px">${icon("triangle-alert","sm")} ${esc(s.live_status.error)}</div>`:""}
+        <div class="ds">${esc((s.description || s.bio || "Описание не заполнено").replace(/[*#`]+/g,""))}</div>
+        <label class="switch" title="Пока стример в эфире, TwitchCut каждые ~10 минут берёт новый кусок и сразу монтирует сильные моменты">
+          <input type="checkbox" ${s.watch?"checked":""} onchange="toggleWatch('${esc(s.login)}', this.checked)"><i></i>${icon("radio","sm")} Следить за эфиром</label>
+        <div class="row" style="gap:6px">${s.layout&&s.layout!=="auto"?`<span class="chip">${icon("video","sm")} ${({split:"вебка + игра",cam:"только вебка",crop:"по лицу",blur:"размытый фон"})[s.layout]}</span>`:""}
+          ${s.funny_emotes?`<span class="chip" title="Смешные эмоуты">${icon("sparkles","sm")} ${esc(s.funny_emotes.split(/[\s,]+/).slice(0,3).join(" "))}</span>`:""}</div>
+        <div class="acts"><button class="btn sm" style="flex:1" onclick="cutFor('${esc(s.login)}')">${icon("scissors","sm")} Нарезать</button>
+          <button class="btn ghost sm icon" title="Изменить" onclick="editStreamer('${esc(s.login)}')">${icon("pencil","sm")}</button>
+          <button class="btn ghost sm icon danger" title="Удалить" onclick="delStreamer('${esc(s.login)}')">${icon("trash","sm")}</button></div></div>`).join("")}</div>`
+      : `<div class="card empty">${icon("users")}<div>Добавьте стримеров, которых нарезаете чаще всего</div>
+         <button class="btn mt" onclick="editStreamer()">${icon("user-plus")} Добавить стримера</button></div>`}</div>`;
+}
+function cutFor(login){ S.newForm.streamer = login; S.newForm.vod = null; location.hash = "#/new"; }
+function editStreamer(login){
+  const s = S.streamers.find(x=>x.login===login) || {login:"", name:"", description:"", funny_emotes:"", hype_emotes:"", layout:"auto", cam_rect:"", max_clips:0};
+  openModal(`<h2>${icon(login?"pencil":"user-plus")} ${login?"Стример: "+esc(s.name):"Новый стример"}</h2>
+    <div class="grid g2">
+      <div><label>Канал Twitch</label><div class="input-row"><input type="text" id="s-login" value="${esc(s.login)}" placeholder="логин или ссылка" ${login?"disabled":""}>
+        ${login?"":`<button class="btn ghost icon" title="Найти на Twitch" onclick="lookup()">${icon("search")}</button>`}</div><div class="hint" id="s-look"></div></div>
+      <div><label>Имя</label><input type="text" id="s-name" value="${esc(s.name)}" placeholder="как подписывать"></div>
+    </div>
+    <div class="mt"><label>Кто это и что у него смешно</label>
+      <textarea id="s-desc" style="min-height:150px" placeholder="Во что играет, какой характер (спокойный / взрывной / ироничный).&#10;Мемы и локальные шутки канала, коронные фразы.&#10;Прозвища друзей и постоянных гостей.&#10;Что больше всего любит чат: фейлы, ярость, истории, общение с донатами…">${esc(s.description)}</textarea>
+      <div class="hint">Чем конкретнее, тем лучше Claude выбирает моменты. Этот текст передаётся при каждом анализе стримов этого канала.</div></div>
+    <div class="grid g2 mt">
+      <div><label>Смешные эмоуты канала</label><input type="text" id="s-funny" value="${esc(s.funny_emotes)}" placeholder="напр. buster1 KEKWait"></div>
+      <div><label>Эмоуты «круто / вау»</label><input type="text" id="s-hype" value="${esc(s.hype_emotes)}" placeholder="напр. busterPog"></div>
+    </div>
+    <div class="grid g2 mt">
+      <div><label>Раскладка по умолчанию</label><select id="s-layout">${[["auto","Авто"],["split","Вебка + игра"],["cam","Только вебка крупно"],["crop","Кадр по лицу"],["blur","Размытый фон"]].map(([k,t])=>`<option value="${k}" ${s.layout===k?"selected":""}>${t}</option>`).join("")}</select></div>
+      <div><label>Положение вебки</label><div class="input-row"><input type="text" id="s-cam" value="${esc(s.cam_rect)}" placeholder="авто${s.cam_auto?" (найдена)":""}">
+        ${login?`<button class="btn ghost" type="button" onclick="camPicker('${esc(s.login)}')">${icon("video","sm")} Указать</button>`:""}</div></div>
+    </div>
+    <div id="campick"></div>
+    <label class="switch mt"><input type="checkbox" id="s-watch" ${s.watch?"checked":""}><i></i>${icon("radio","sm")} Следить за эфиром и нарезать прямо во время стрима</label>
+    <div class="row mt" style="justify-content:flex-end"><button class="btn ghost" onclick="closeModal()">Отмена</button>
+      <button class="btn" onclick="saveStreamer(this)">${icon("save","sm")} Сохранить</button></div>`);
+}
+/* выбор области вебки мышкой на кадре из стрима */
+function camPicker(login){
+  const s = S.streamers.find(x=>x.login===login) || {};
+  const box = $("#campick");
+  if (box.innerHTML){ box.innerHTML=""; return; }
+  box.innerHTML = `<div class="mt"><div class="hint" style="margin:0 0 6px">Обведите мышкой картинку вебки (только саму камеру, без чата и рамок). Пунктир — где вебку нашёл TwitchCut сам.</div>
+    <div id="cp-wrap" style="position:relative;user-select:none;cursor:crosshair;border-radius:8px;overflow:hidden;background:#000">
+      <img id="cp-img" src="/api/streamers/${encodeURIComponent(login)}/snapshot?t=${Date.now()}" style="display:block;width:100%" draggable="false"
+        onerror="this.parentNode.outerHTML='<div class=&quot;alert err&quot;>Нет кадра: сначала нарежьте хотя бы одну запись этого стримера.</div>'">
+      <div id="cp-auto" style="position:absolute;border:2px dashed #ffe135;display:none;pointer-events:none"></div>
+      <div id="cp-sel" style="position:absolute;border:2px solid #9147ff;background:rgba(145,71,255,.18);display:none;pointer-events:none"></div></div>
+    <div class="row" style="margin-top:6px;gap:8px"><button class="btn ghost sm" type="button" onclick="$('#s-cam').value='';$('#cp-sel').style.display='none'">Сбросить (авто)</button></div></div>`;
+  const wrap = $("#cp-wrap"), sel = $("#cp-sel");
+  const place = (el, r) => { if(!r) return; el.style.display="block"; el.style.left=r[0]*100+"%"; el.style.top=r[1]*100+"%"; el.style.width=r[2]*100+"%"; el.style.height=r[3]*100+"%"; };
+  if (s.cam_auto?.box) place($("#cp-auto"), s.cam_auto.box);
+  const cur = ($("#s-cam").value||"").split(/[ ,;]+/).map(Number).filter(v=>!isNaN(v));
+  if (cur.length===4) place(sel, cur);
+  let p0 = null;
+  const rel = e => { const b = wrap.getBoundingClientRect(); return [Math.min(1,Math.max(0,(e.clientX-b.left)/b.width)), Math.min(1,Math.max(0,(e.clientY-b.top)/b.height))]; };
+  wrap.onmousedown = e => { p0 = rel(e); e.preventDefault(); };
+  window.onmousemove = e => { if(!p0) return; const p = rel(e); place(sel, [Math.min(p0[0],p[0]), Math.min(p0[1],p[1]), Math.abs(p[0]-p0[0]), Math.abs(p[1]-p0[1])]); };
+  window.onmouseup = e => { if(!p0) return; const p = rel(e); const r = [Math.min(p0[0],p[0]), Math.min(p0[1],p[1]), Math.abs(p[0]-p0[0]), Math.abs(p[1]-p0[1])]; p0 = null;
+    if (r[2] > 0.03 && r[3] > 0.03) $("#s-cam").value = r.map(v=>v.toFixed(3)).join(", "); };
+}
+async function lookup(){
+  const v = $("#s-login").value.trim(); if (!v) return;
+  const m = v.match(/twitch\.tv\/([A-Za-z0-9_]+)/); const login = (m?m[1]:v).replace(/^@/,"");
+  $("#s-look").innerHTML = `${icon("loader-circle","sm spin")} ищу…`;
+  try{ const c = await api("/api/channel/" + encodeURIComponent(login));
+    $("#s-look").innerHTML = `${icon("circle-check","sm")} ${esc(c.name)}${c.live?` · в эфире: ${esc(c.live_game)}`:""}`;
+    if (!$("#s-name").value) $("#s-name").value = c.name;
+  }catch(e){ $("#s-look").innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
+async function saveStreamer(btn){
+  btn.disabled = true;
+  try{
+    const r = await api("/api/streamers", {login:$("#s-login").value, name:$("#s-name").value, description:$("#s-desc").value,
+      funny_emotes:$("#s-funny").value, hype_emotes:$("#s-hype").value, layout:$("#s-layout").value, cam_rect:$("#s-cam").value, watch:$("#s-watch").checked});
+    closeModal(); toast("Сохранено: " + r.name); renderStreamers();
+  }catch(e){ toast(e.message,"err"); }
+  btn.disabled = false;
+}
+async function toggleWatch(login, on){
+  try{ await api("/api/streamers", {login, watch:on}); toast(on ? "Буду следить за эфиром — проверка раз в 2 минуты" : "Наблюдение выключено"); refreshLists(); }
+  catch(e){ toast(e.message,"err"); } }
+async function delStreamer(login){ if (!confirm("Удалить стримера из списка?")) return;
+  await api(`/api/streamers/${login}/delete`, {}); toast("Удалено"); renderStreamers(); }
+
+/* ---------------------------------------------------------------- status */
+function gpuRow(st, row){
+  const g = st.gpu_asr || {};
+  if (!g.installed) return row(false, "Распознавание речи на видеокарте (whisper.cpp)",
+    "Не установлено. Запустите <code>setup_gpu.bat</code>: речь будет распознаваться видеокартой AMD/Intel/NVIDIA (и встроенной) вместе с процессором — в 2–4 раза быстрее.");
+  const parts = [`Модель ${esc(g.model)}`];
+  if (g.gpu) parts.push(`видеокарта: ${esc(g.gpu)}${g.integrated?" (встроенная)":""}`);
+  else parts.push("видеокарта определится при первом распознавании");
+  if (g.speed) parts.push(`скорость ×${g.speed} от реального времени`);
+  if (g.cpu_speed) parts.push(`процессор ×${g.cpu_speed}`);
+  if (st.whisper_backend === "faster-whisper") parts.push("<b>выключено в config.yaml</b> (whisper.backend)");
+  if (g.error) return row(false, "Распознавание речи на видеокарте (whisper.cpp)", "Ошибка: " + esc(g.error) + ". Распознаю на процессоре.");
+  return row(true, "Распознавание речи на видеокарте (whisper.cpp)", parts.join(" · "));
+}
+async function renderStatus(){
+  $("#main").innerHTML = `<div class="page"><div class="ph"><div><h1>Статус</h1><p>Проверка компонентов</p></div></div><div class="card"><div class="status-line">${icon("loader-circle","spin")} Проверяю…</div></div></div>`;
+  await refreshStatus(true);
+  const st = S.status || {}; const c = st.claude || {};
+  const row = (ok, title, text) => `<div class="chk"><span class="${ok?'ok':'bad'}">${icon(ok?"circle-check":"circle-alert","lg")}</span><div><b>${title}</b><span>${text}</span></div></div>`;
+  $("#main").innerHTML = `<div class="page"><div class="ph"><div><h1>Статус</h1><p>Проверка компонентов</p></div><span class="sp"></span>
+    <button class="btn ghost" onclick="renderStatus()">${icon("refresh-cw","sm")} Проверить снова</button></div>
+    <div class="card">
+      ${row(c.installed, "Claude Code", c.installed ? esc(c.version) : "Не установлен. Запустите <code>setup.bat</code>.")}
+      ${row(c.logged_in, "Вход в Claude по подписке", c.logged_in ? "Выполнен" + (c.method?` (${esc(c.method)})`:"") : "Не выполнен. Запустите <code>login_claude.bat</code> и войдите аккаунтом с подпиской Pro или Max.")}
+      ${row(st.ffmpeg, "FFmpeg", st.ffmpeg ? "Найден" : "Не найден. Запустите <code>setup.bat</code> или <code>winget install Gyan.FFmpeg</code>.")}
+      ${row(st.whisper, "Распознавание речи на процессоре (faster-whisper)", st.whisper ? "Установлено" : "Не установлено. Запустите <code>setup.bat</code>.")}
+      ${gpuRow(st, row)}
+      ${row(st.ytdlp, "Загрузка с Twitch (yt-dlp)", st.ytdlp ? "Установлено" : "Не установлено. Запустите <code>setup.bat</code>.")}
+    </div>
+    ${st.disk?`<div class="card"><h3>${icon("folder-open")} Место на диске</h3>
+      <div class="muted">Задачи занимают <b style="color:var(--text)">${(st.disk.total/1e9).toFixed(1)} ГБ</b>, из них видео и звук — ${(st.disk.heavy/1e9).toFixed(1)} ГБ.
+      Видео задач старше ${st.disk.keep_days} дн. удаляется само; названия, оценки, расшифровка, превью и статистика остаются.</div>
+      <div class="row mt" style="gap:8px"><button class="btn ghost sm" onclick="runCleanup(this, ${st.disk.keep_days})">${icon("trash","sm")} Удалить видео старше ${st.disk.keep_days} дн. сейчас</button>
+      <button class="btn ghost sm" onclick="runCleanup(this, 1)">Старше 1 дня</button></div></div>`:""}
+    <div class="card"><h3>${icon("key-round")} Twitch и качество видео</h3><div id="twbox"><div class="status-line">${icon("loader-circle","spin")} Проверяю…</div></div></div>
+    <div class="card"><h3>${icon("settings")} Текущие настройки анализа</h3>
+      <div class="muted">Режим: <b style="color:var(--text)">${st.llm_backend==="claude-cli"?"Claude Code (подписка)":esc(st.llm_backend)}</b>
+      ${st.llm_backend==="claude-cli"?` · модель по умолчанию: <b style="color:var(--text)">${esc(st.cli_model)}</b>`:""}</div>
+      <div class="hint">Меняется в <code>config.yaml</code> или для каждой нарезки отдельно на странице «Новая нарезка».</div></div></div>`;
+  twitchCard();
+}
+
+
+async function runCleanup(btn, days){
+  if (!confirm(`Удалить видео, звук и готовые клипы у задач старше ${days} дн.? Статистика и названия останутся.`)) return;
+  btn.disabled = true;
+  try{ const r = await api("/api/cleanup", {days}); toast(r.jobs.length?`Освобождено ${(r.freed/1e9).toFixed(2)} ГБ (${r.jobs.length} задач)`:"Нечего удалять"); renderStatus(); }
+  catch(e){ toast(e.message,"err"); }
+  btn.disabled = false;
+}
+
+/* ---------------------------------------------------------------- feedback */
+const REASONS = {boring:"скучно",context:"непонятно без контекста",cut:"плохо обрезано",not_funny:"не смешно",repeat:"повтор",quality:"плохая картинка/звук",risky:"нельзя выкладывать",other:"другое"};
+const fmtViews = v => v==null ? "—" : v>=1e6 ? (v/1e6).toFixed(1).replace(".0","")+" млн" : v>=1000 ? Math.round(v/1000)+" тыс." : String(v);
+function fbBlock(c){
+  const f = c.feedback || {};
+  let badge = "";
+  if (f.status==="posted") badge = `<div class="fbadge posted">${icon("send","sm")} Выложен${f.views!=null?` · ${icon("eye","sm")} ${fmtViews(f.views)}`:(f.url?" · просмотры загружаются…":" · просмотры не указаны")}
+      ${f.likes!=null?` · ${icon("thumbs-up","sm")} ${fmtViews(f.likes)}`:""}${f.comments!=null?` · комм. ${fmtViews(f.comments)}`:""}
+      ${f.url?`<a href="${esc(f.url)}" target="_blank">ссылка</a>`:""}${f.stats_error?` <span class="dim" title="${esc(f.stats_error)}">· не удалось обновить</span>`:""}</div>`;
+  if (f.status==="rejected") badge = `<div class="fbadge rejected">${icon("ban","sm")} Не подходит${(f.reasons||[]).length?": "+f.reasons.map(r=>REASONS[r]||r).join(", "):""}</div>`;
+  return `<div class="fb" id="fb-${c.n}">${badge}
+    <div class="row" style="gap:8px">
+      <button class="btn ghost sm" onclick="fbForm(${c.n},'rejected')">${icon("thumbs-down","sm")} Не подходит</button>
+      <button class="btn ghost sm" onclick="fbForm(${c.n},'posted')">${icon("send","sm")} ${f.status==="posted"?"Просмотры":"Выложил"}</button>
+    </div><div id="fbf-${c.n}"></div></div>`;
+}
+function fbForm(n, kind){
+  const c = S.clips.find(x=>x.n===n); const f = c.feedback || {}; const box = $("#fbf-"+n);
+  if (box.dataset.kind === kind){ box.innerHTML=""; box.dataset.kind=""; return; }
+  box.dataset.kind = kind;
+  if (kind==="rejected"){
+    const sel = new Set(f.status==="rejected" ? (f.reasons||[]) : []);
+    box.innerHTML = `<div class="hint" style="margin:0 0 6px">Почему не подходит? Это учтётся в следующих анализах.</div>
+      <div class="chips">${Object.entries(REASONS).map(([k,t])=>`<button type="button" class="${sel.has(k)?"on":""}" data-r="${k}" onclick="this.classList.toggle('on')">${t}</button>`).join("")}</div>
+      <input type="text" class="mt" id="fbn-${n}" placeholder="Комментарий (необязательно)" value="${esc(f.status==="rejected"?f.note||"":"")}" style="margin-top:8px">
+      <div class="row mt" style="margin-top:8px"><button class="btn sm" onclick="fbSave(${n},'rejected')">${icon("check","sm")} Сохранить</button>
+      ${f.status?`<button class="btn ghost sm" onclick="fbSave(${n},'none')">Снять отметку</button>`:""}</div>`;
+  } else {
+    box.innerHTML = `<div class="hint" style="margin:0 0 6px">Вставьте ссылку на ролик в TikTok — просмотры, лайки и комментарии подтянутся сами и будут обновляться. Без ссылки можно ввести цифры вручную.</div>
+      <input type="text" id="fbu-${n}" placeholder="https://vm.tiktok.com/… или https://www.tiktok.com/@…/video/…" value="${esc(f.url||"")}">
+      <details style="margin-top:6px" ${f.url?"":""}><summary class="muted" style="cursor:pointer;font-size:12px">Ввести просмотры вручную</summary>
+      <div class="grid g2" style="gap:8px;margin-top:6px"><input type="number" min="0" id="fbv-${n}" placeholder="Просмотры" value="${f.views??""}">
+      <input type="number" min="0" id="fbl-${n}" placeholder="Лайки" value="${f.likes??""}"></div></details>
+      <div class="row" style="margin-top:8px"><button class="btn sm" onclick="fbSave(${n},'posted')">${icon("check","sm")} Сохранить</button>
+      ${f.status?`<button class="btn ghost sm" onclick="fbSave(${n},'none')">Снять отметку</button>`:""}</div>`;
+  }
+}
+async function fbSave(n, status){
+  const c = S.clips.find(x=>x.n===n);
+  const body = {job:S.jobId, file:c.file, status};
+  if (status==="rejected"){ body.reasons = [...document.querySelectorAll(`#fbf-${n} .chips .on`)].map(b=>b.dataset.r); body.note = $("#fbn-"+n).value; }
+  if (status==="posted"){ body.views = $("#fbv-"+n).value; body.likes = $("#fbl-"+n).value; body.url = $("#fbu-"+n).value; }
+  try{ const r = await api("/api/feedback", body);
+    toast(status==="none"?"Отметка снята":r.stats_pending?"Сохранено — загружаю просмотры из TikTok…":"Сохранено — учтётся в следующих анализах");
+    S.lastJob=""; S.lastClips=""; renderJob();
+    if (r.stats_pending) setTimeout(()=>{ if(S.view==="job"){ S.lastJob=""; S.lastClips=""; renderJob(); } }, 15000); }
+  catch(e){ toast(e.message,"err"); }
+}
+
+/* ---------------------------------------------------------------- stats */
+async function renderStats(){
+  await refreshLists();
+  const login = S.statsStreamer || "";
+  let d; try{ d = await api("/api/feedback" + (login?`?streamer=${encodeURIComponent(login)}`:"")); }catch(e){ d = {items:[],stats:{}}; }
+  const st = d.stats || {}; const CATN = {...CAT};
+  const posted = d.items.filter(f=>f.status==="posted"), rej = d.items.filter(f=>f.status==="rejected");
+  const cats = Object.entries(st.by_category||{}).sort((a,b)=>b[1].median-a[1].median);
+  $("#main").innerHTML = `<div class="page">
+    <div class="ph"><div><h1>Статистика и обучение</h1><p>Ваши отметки и просмотры подмешиваются в анализ Claude как примеры того, что заходит</p></div><span class="sp"></span>
+      <select style="width:auto" onchange="S.statsStreamer=this.value;renderStats()"><option value="">Все стримеры</option>
+      ${S.streamers.map(s=>`<option value="${esc(s.login)}" ${login===s.login?"selected":""}>${esc(s.name)}</option>`).join("")}</select></div>
+    <div class="tiles">
+      <div class="tile"><b>${st.posted||0}</b><span>выложено</span></div>
+      <div class="tile"><b>${fmtViews(st.total_views||0)}</b><span>просмотров всего</span></div>
+      <div class="tile"><b>${fmtViews(st.median_views||0)}</b><span>медиана просмотров</span></div>
+      <div class="tile"><b>${fmtViews(st.total_likes||0)}</b><span>лайков${st.like_rate!=null?` · ${st.like_rate}% от просм.`:""}</span></div>
+      <div class="tile"><b>${st.rejected||0}</b><span>отклонено</span></div>
+    </div>
+    <div class="row mt" style="gap:8px"><button class="btn ghost sm" onclick="statRefresh(this)">${icon("refresh-cw","sm")} Обновить просмотры из TikTok</button>
+      <span class="dim" style="font-size:12px">Обновляются и сами: свежие ролики раз в 3 часа, старые раз в сутки${st.auto?` · автоматически отслеживается ${st.auto}`:""}</span></div>
+    ${cats.length?`<div class="card mt"><h3>${icon("chart-column-increasing")} Что заходит лучше</h3><table class="t"><tr><th>Тип момента</th><th>Клипов</th><th>Медиана просмотров</th></tr>
+      ${cats.map(([k,v])=>`<tr><td>${esc(CATN[k]||k)}</td><td>${v.n}</td><td>${fmtViews(v.median)}</td></tr>`).join("")}</table></div>`:""}
+    ${Object.keys(st.by_duration||{}).length>1?`<div class="card mt"><h3>${icon("clock","")} Длина клипа и просмотры</h3><table class="t"><tr><th>Длина</th><th>Клипов</th><th>Медиана просмотров</th></tr>
+      ${Object.entries(st.by_duration).sort((a,b)=>b[1].median-a[1].median).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.n}</td><td>${fmtViews(v.median)}</td></tr>`).join("")}</table></div>`:""}
+    <div class="card mt"><h3>${icon("send")} Выложенные клипы</h3>
+      ${posted.length?`<table class="t"><tr><th>Название</th><th>Тип</th><th>Просмотры</th><th>Лайки</th><th></th></tr>
+      ${posted.sort((a,b)=>(b.views||0)-(a.views||0)).map((f,i)=>`<tr><td>${esc(f.title||"")}<div class="dim" style="font-size:12px">${esc(f.streamer||"")}${f.url?` · <a href="${esc(f.url)}" target="_blank">ссылка</a>`:""}
+          ${f.comments!=null?` · комм. ${fmtViews(f.comments)}`:""}${f.shares!=null?` · репостов ${fmtViews(f.shares)}`:""}
+          ${f.stats_at?` · обновлено ${new Date(f.stats_at*1000).toLocaleString("ru",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}`:""}
+          ${f.stats_error?` · <span title="${esc(f.stats_error)}">не удалось обновить</span>`:""}${spark(f.history)}</div></td>
+        <td>${esc(CATN[f.category]||f.category||"")}</td>
+        <td><input type="number" id="sv-${i}" value="${f.views??""}"></td><td><input type="number" id="sl-${i}" value="${f.likes??""}"></td>
+        <td><button class="btn ghost sm" onclick='statSave(${JSON.stringify({job:f.job,file:f.file,url:f.url||""})},${i})'>${icon("save","sm")}</button></td></tr>`).join("")}</table>`
+      : `<div class="dim">Пока нет. На странице задачи нажмите «Выложил» у клипа и укажите просмотры.</div>`}</div>
+    <div class="card mt"><h3>${icon("thumbs-down")} Отклонённые</h3>
+      ${rej.length?`<table class="t"><tr><th>Название</th><th>Причина</th></tr>${rej.map(f=>`<tr><td>${esc(f.title||"")}</td><td class="muted">${esc((f.reasons||[]).map(r=>REASONS[r]||r).join(", "))}${f.note?" — "+esc(f.note):""}</td></tr>`).join("")}</table>`
+      : `<div class="dim">Пока нет.</div>`}</div>
+    <div class="hint mt">Claude получает до 6 лучших и худших выложенных клипов этого стримера с просмотрами, средние просмотры по типам и до 6 последних отклонённых с причинами. Чем больше отметок, тем точнее выбор.</div>
+  </div>`;
+}
+function spark(h){
+  if (!h || h.length < 2) return "";
+  const W=90, Hh=18, t0=h[0][0], t1=h[h.length-1][0], vmax=Math.max(...h.map(x=>x[1]))||1;
+  const pts = h.map(([t,v])=>`${((t-t0)/Math.max(1,t1-t0)*W).toFixed(1)},${(Hh-v/vmax*Hh).toFixed(1)}`).join(" ");
+  return ` <svg width="${W}" height="${Hh}" style="vertical-align:middle;margin-left:6px" title="рост просмотров"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+}
+async function statRefresh(btn){
+  btn.disabled = true;
+  try{ const r = await api("/api/feedback/refresh", {}); toast(r.count?`Обновляю ${r.count} роликов…`:"Нет роликов со ссылкой TikTok");
+    if (r.count) setTimeout(()=>{ if(S.view==="stats") renderStats(); }, Math.min(60000, 4000 + r.count*3000)); }
+  catch(e){ toast(e.message,"err"); }
+  btn.disabled = false;
+}
+async function statSave(ref, i){
+  try{ await api("/api/feedback", {...ref, status:"posted", views:$("#sv-"+i).value, likes:$("#sl-"+i).value}); toast("Сохранено"); renderStats(); }
+  catch(e){ toast(e.message,"err"); }
+}
+
+/* ---------------------------------------------------------------- twitch account */
+async function twitchCard(){
+  const box = $("#twbox"); if (!box) return;
+  let a; try{ a = await api("/api/twitch/auth"); }catch(e){ a = {ok:false,error:e.message}; }
+  box.innerHTML = `<div class="chk"><span class="${a.ok?'ok':'bad'}">${icon(a.ok?"circle-check":"circle-alert","lg")}</span><div style="flex:1">
+      <b>Аккаунт Twitch ${a.ok?"подключён: "+esc(a.name||a.login):"не подключён"}</b>
+      <span>${a.ok?"Используется для получения максимального качества (источник, 1440p) и доступа к записям.":(a.error&&a.error!=="Аккаунт не подключён"?esc(a.error)+". ":"")+"Нужен для качества «источник» (1440p)."}</span></div>
+      ${a.ok?`<button class="btn ghost sm" onclick="twClear()">Отключить</button>`:""}</div>
+    <details ${a.ok?"":"open"} class="mt"><summary class="muted" style="cursor:pointer;font-size:13px">${a.ok?"Заменить данные входа":"Как подключить"}</summary>
+      <ol class="muted" style="font-size:13px;line-height:1.7;margin:8px 0">
+        <li>Откройте twitch.tv в браузере, где вы вошли в аккаунт.</li>
+        <li>Расширением <b>Get cookies.txt LOCALLY</b> (Chrome/Edge/Firefox) экспортируйте cookies для twitch.tv — или в инструментах разработчика (F12 → Application → Cookies) скопируйте значение <code>auth-token</code>.</li>
+        <li>Вставьте ниже всё содержимое файла или только auth-token.</li></ol>
+      <textarea id="twtext" style="min-height:90px" placeholder="# Netscape HTTP Cookie File ... или только auth-token"></textarea>
+      <div class="hint">Данные хранятся только на этом ПК (папка data). Это ключ к вашему аккаунту — никому его не пересылайте. Отозвать: на Twitch «Настройки → Безопасность → выйти со всех устройств».</div>
+      <div class="row mt"><button class="btn sm" onclick="twSave(this)">${icon("key-round","sm")} Подключить</button></div></details>
+    <div class="mt"><label>Проверить, какие качества доступны у записи</label>
+      <div class="input-row"><input type="text" id="qvod" placeholder="https://www.twitch.tv/videos/…"><button class="btn ghost" onclick="qCheck(this)">${icon("search","sm")} Проверить</button></div>
+      <div id="qres" class="mt"></div></div>`;
+}
+async function twSave(btn){ btn.disabled=true; try{ const r = await api("/api/twitch/auth", {text:$("#twtext").value}); toast(r.ok?"Подключено: "+(r.name||r.login):"Сохранено, но Twitch не принял токен: "+(r.error||""), r.ok?"ok":"err"); twitchCard(); }catch(e){ toast(e.message,"err"); } btn.disabled=false; }
+async function twClear(){ if(!confirm("Отключить аккаунт Twitch?")) return; await api("/api/twitch/auth/clear", {}); twitchCard(); }
+async function qCheck(btn){
+  btn.disabled=true; $("#qres").innerHTML = `<div class="status-line">${icon("loader-circle","spin")} Спрашиваю Twitch…</div>`;
+  try{ const r = await api("/api/twitch/qualities?vod="+encodeURIComponent($("#qvod").value));
+    const best = r.variants.sort((a,b)=>b.height-a.height)[0];
+    $("#qres").innerHTML = `<div class="row" style="gap:6px">${r.variants.map(v=>`<span class="chip ${v===best?"c":""}">${esc(v.name)} · ${esc(v.codec)}</span>`).join("")||'<span class="dim">ничего не найдено</span>'}</div>
+      <pre class="dim" style="white-space:pre-wrap;font-size:12px;margin-top:8px">${esc((r.diag.attempts||[]).join("\n"))}</pre>`;
+  }catch(e){ $("#qres").innerHTML = `<div class="alert err">${esc(e.message)}</div>`; }
+  btn.disabled=false;
+}
+
+/* ---------------------------------------------------------------- boot */
+$("#logo").innerHTML = icon("scissors");
+(async () => { await refreshLists(); route(); refreshStatus(false); setInterval(refreshLists, 10000); })();
+</script>
+</body>
+</html>

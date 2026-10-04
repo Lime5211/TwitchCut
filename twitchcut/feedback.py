@@ -1,0 +1,174 @@
+"""Обратная связь по клипам: «не подходит» (с причиной) и «выложил» (с просмотрами).
+
+Эти отметки становятся примерами в промптах Claude: что у этого канала реально залетело,
+что зашло слабо и что автор отбраковал. Так система постепенно подстраивается под ваш вкус
+и под то, что набирает просмотры именно у вас.
+"""
+from __future__ import annotations
+
+import statistics
+import threading
+import time
+
+from .util import ROOT_DIR, read_json, write_json
+
+PATH = ROOT_DIR / "data" / "feedback.json"
+_lock = threading.Lock()
+
+REASONS = {
+    "boring": "скучно", "context": "непонятно без контекста", "cut": "плохо обрезано", "not_funny": "не смешно",
+    "repeat": "повтор / уже было", "quality": "плохая картинка или звук", "risky": "нельзя выкладывать",
+    "other": "другое",
+}
+CAT_RU = {"funny": "смешное", "story": "история", "news": "новость", "info": "интересное", "hot_take": "мнение",
+          "emotional": "эмоции", "drama": "драма", "fail": "фейл", "epic": "эпик", "rage": "ярость",
+          "scare": "испуг", "cringe": "кринж", "chat": "чат", "wholesome": "мило", "other": "другое"}
+
+
+def load() -> list[dict]:
+    return read_json(PATH) or []
+
+
+def for_job(job_id: str) -> dict[str, dict]:
+    return {f["file"]: f for f in load() if f.get("job") == job_id}
+
+
+def upsert(entry: dict) -> dict:
+    with _lock:
+        items = load()
+        key = f"{entry['job']}/{entry['file']}"
+        cur = next((x for x in items if x.get("id") == key), {})
+        rec = {**cur, **{k: v for k, v in entry.items() if v is not None}, "id": key, "updated": time.time()}
+        if rec.get("status") == "posted" and not rec.get("posted_at"):
+            rec["posted_at"] = time.time()
+        if rec.get("status") in ("none", "", None):
+            items = [x for x in items if x.get("id") != key]
+        else:
+            items = [x for x in items if x.get("id") != key] + [rec]
+        write_json(PATH, items)
+    return rec
+
+
+def replace(rec: dict) -> None:
+    """Перезаписать отметку целиком (используется фоновым обновлением статистики)."""
+    with _lock:
+        items = load()
+        if not any(x.get("id") == rec["id"] for x in items):
+            return  # отметку успели снять
+        items = [rec if x.get("id") == rec["id"] else x for x in items]
+        write_json(PATH, items)
+
+
+def fetch_stats_async(rec: dict) -> None:
+    """Сразу после «Выложил» со ссылкой TikTok — подтянуть просмотры в фоне."""
+    from . import tiktok
+    if rec.get("status") != "posted" or not tiktok.is_tiktok(rec.get("url") or ""):
+        return
+    threading.Thread(target=lambda: tiktok.refresh({rec["id"]}), daemon=True).start()
+
+
+def _dur_bucket(d) -> str:
+    d = float(d or 0)
+    return "до 30 с" if d < 30 else "30–60 с" if d < 60 else "1–2 мин" if d < 120 else "2+ мин"
+
+
+def _fmt_views(v) -> str:
+    v = int(v or 0)
+    if v >= 1_000_000:
+        return f"{v / 1e6:.1f} млн".replace(".0 ", " ")
+    if v >= 1000:
+        return f"{v / 1000:.0f} тыс."
+    return str(v)
+
+
+def stats(login: str | None = None) -> dict:
+    items = [f for f in load() if not login or f.get("streamer") == login]
+    posted = [f for f in items if f.get("status") == "posted"]
+    with_views = [f for f in posted if f.get("views") is not None]
+    rejected = [f for f in items if f.get("status") == "rejected"]
+    by_cat: dict[str, list] = {}
+    for f in with_views:
+        by_cat.setdefault(f.get("category") or "other", []).append(int(f["views"]))
+    reasons: dict[str, int] = {}
+    for f in rejected:
+        for r in f.get("reasons") or []:
+            reasons[r] = reasons.get(r, 0) + 1
+    views = [int(f["views"]) for f in with_views]
+    by_dur: dict[str, list] = {}
+    for f in with_views:
+        by_dur.setdefault(_dur_bucket(f.get("final_duration") or f.get("tt_duration")), []).append(int(f["views"]))
+    eng = [(f.get("likes") or 0) / f["views"] for f in with_views if f.get("likes") is not None and f["views"] > 0]
+    return {
+        "posted": len(posted), "rejected": len(rejected), "with_views": len(with_views),
+        "median_views": int(statistics.median(views)) if views else 0,
+        "total_views": sum(views),
+        "total_likes": sum(int(f.get("likes") or 0) for f in with_views),
+        "total_comments": sum(int(f.get("comments") or 0) for f in with_views),
+        "like_rate": round(100 * statistics.median(eng), 1) if eng else None,
+        "auto": sum(1 for f in posted if f.get("stats_auto")),
+        "by_category": {k: {"n": len(v), "median": int(statistics.median(v))} for k, v in by_cat.items()},
+        "by_duration": {k: {"n": len(v), "median": int(statistics.median(v))} for k, v in by_dur.items()},
+        "reasons": reasons,
+    }
+
+
+def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 6) -> str:
+    """Текст для промпта: что залетело, что нет, что отклонено. Пусто, если отметок ещё нет."""
+    allf = load()
+    items = [f for f in allf if f.get("streamer") == login] if login else allf
+    if login and not items:
+        items, login = allf, None  # по этому каналу отметок ещё нет — берём общий опыт
+    if not items:
+        return ""
+    posted = [f for f in items if f.get("status") == "posted" and f.get("views") is not None]
+    rejected = [f for f in items if f.get("status") == "rejected"]
+    lines = ["ОПЫТ ПРОШЛЫХ НАРЕЗОК" + (" ЭТОГО КАНАЛА" if login else "") +
+             " — учитывай вкус автора и реальные просмотры в TikTok:"]
+
+    def one(f: dict, extra: str) -> str:
+        cat = CAT_RU.get(f.get("category") or "", f.get("category") or "")
+        title = (f.get("title") or f.get("topic") or "").strip()
+        text = (f.get("text") or "").strip().replace("\n", " ")
+        if len(text) > 160:
+            text = text[:160] + "…"
+        return f"- [{cat}, {extra}] «{title}»" + (f" — «{text}»" if text else "")
+
+    def views_txt(f: dict) -> str:
+        t = _fmt_views(f["views"]) + " просм."
+        if f.get("likes") and f["views"]:
+            t += f", лайков {100 * f['likes'] / f['views']:.0f}%"
+        if f.get("comments"):
+            t += f", комм. {f['comments']}"
+        if f.get("final_duration"):
+            t += f", {f['final_duration']:.0f} с"
+        return t
+
+    if posted:
+        med = statistics.median([int(f["views"]) for f in posted])
+        good = sorted([f for f in posted if f["views"] >= med], key=lambda f: -f["views"])[:max_pos]
+        bad = sorted([f for f in posted if f["views"] < med * 0.5], key=lambda f: f["views"])[:max(2, max_pos // 2)]
+        if good:
+            lines.append(f"Зашли лучше всего (медиана канала {_fmt_views(med)} просмотров):")
+            lines += [one(f, views_txt(f)) for f in good]
+        if bad:
+            lines.append("Зашли слабо:")
+            lines += [one(f, views_txt(f)) for f in bad]
+        st = stats(login)
+        cats = sorted(st["by_category"].items(), key=lambda kv: -kv[1]["median"])
+        if len(cats) >= 2:
+            lines.append("Медиана просмотров по типам: " + ", ".join(
+                f"{CAT_RU.get(k, k)} {_fmt_views(v['median'])} ({v['n']})" for k, v in cats))
+        durs = sorted(st["by_duration"].items(), key=lambda kv: -kv[1]["median"])
+        if len(durs) >= 2 and sum(v["n"] for _, v in durs) >= 4:
+            lines.append("Медиана просмотров по длине клипа: " + ", ".join(
+                f"{k} {_fmt_views(v['median'])} ({v['n']})" for k, v in durs))
+    if rejected:
+        lines.append("Автор отклонил (не стал выкладывать) — избегай похожего:")
+        for f in sorted(rejected, key=lambda f: -f.get("updated", 0))[:max_neg]:
+            why = ", ".join(REASONS.get(r, r) for r in (f.get("reasons") or []))
+            if f.get("note"):
+                why = (why + "; " if why else "") + f["note"][:100]
+            lines.append(one(f, "причина: " + (why or "не понравилось")))
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)

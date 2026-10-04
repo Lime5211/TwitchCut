@@ -1,0 +1,12 @@
+.venv/
+workspace/
+config.yaml
+__pycache__/
+*.pyc
+data/twitch_cookies.txt
+data/twitch_auth.json
+data/feedback.json
+tools/
+data/whispercpp_status.json
+data/logs/
+data/snapshots/
