@@ -112,7 +112,10 @@ def stats(login: str | None = None) -> dict:
     }
 
 
-def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 6) -> str:
+_TECH_NOTE = __import__("re").compile(r"вебк|экран|формат|раскладк|лицо|область|звук и видео|рассинхр|блюр", __import__("re").I)
+
+
+def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10) -> str:
     """Текст для промпта: что залетело, что нет, что отклонено. Пусто, если отметок ещё нет."""
     allf = load()
     items = [f for f in allf if f.get("streamer") == login] if login else allf
@@ -120,7 +123,10 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 6) -> str:
         items, login = allf, None  # по этому каналу отметок ещё нет — берём общий опыт
     if not items:
         return ""
-    posted = [f for f in items if f.get("status") == "posted" and f.get("views") is not None]
+    import time as _time
+    # свежие ролики (меньше ~1.5 суток) ещё набирают просмотры — по ним рано судить
+    posted = [f for f in items if f.get("status") == "posted" and f.get("views") is not None
+              and _time.time() - float(f.get("posted_ts") or f.get("posted_at") or f.get("updated") or 0) > 36 * 3600]
     rejected = [f for f in items if f.get("status") == "rejected"]
     lines = ["ОПЫТ ПРОШЛЫХ НАРЕЗОК" + (" ЭТОГО КАНАЛА" if login else "") +
              " — учитывай вкус автора и реальные просмотры в TikTok:"]
@@ -164,10 +170,16 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 6) -> str:
                 f"{k} {_fmt_views(v['median'])} ({v['n']})" for k, v in durs))
     if rejected:
         lines.append("Автор отклонил (не стал выкладывать) — избегай похожего:")
-        for f in sorted(rejected, key=lambda f: -f.get("updated", 0))[:max_neg]:
+        for f in sorted(rejected, key=lambda f: -f.get("updated", 0))[:max_neg * 2]:
+            if sum(1 for l in lines if l.startswith("- [") and "причина:" in l) >= max_neg:
+                break
             why = ", ".join(REASONS.get(r, r) for r in (f.get("reasons") or []))
-            if f.get("note"):
-                why = (why + "; " if why else "") + f["note"][:100]
+            note = (f.get("note") or "").strip()
+            # заметки про картинку (вебка, раскладка, звук) Claude не помогут — их учитывает монтаж
+            if note and not _TECH_NOTE.search(note):
+                why = (why + "; " if why else "") + note[:220]
+            elif not why and note:
+                continue
             lines.append(one(f, "причина: " + (why or "не понравилось")))
     if len(lines) == 1:
         return ""

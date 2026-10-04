@@ -219,67 +219,108 @@ def _hrun(arr: np.ndarray, start: int, thr: float, gap: int = 4) -> tuple[int, i
     return l, r
 
 
-def cam_rect_from_edges(frames: list, cx: float, cy: float, fw: float) -> list[float] | None:
-    """Точные границы картинки вебки. Рамка вебки — прямая линия, которая стоит на месте во ВСЕХ кадрах
-    стрима (а человек в кадре двигается), поэтому ищем устойчивые линии на усреднённой карте краёв
-    по кадрам из разных моментов стрима. Возвращает [x, y, w, h] в долях кадра или None."""
-    import cv2
-    grays = [f.mean(axis=2).astype(np.float32) for _, f in frames]
-    if len(grays) < 4:
-        return None
-    h, w = grays[0].shape
-    gx = np.mean([np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)) for g in grays], axis=0)
-    gy = np.mean([np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)) for g in grays], axis=0)
+class _EdgeStack:
+    """Края кадров (по многим кадрам стрима) с быстрыми суммами вдоль строк/столбцов.
+    Рамка вебки — прямая линия, которая есть почти в КАЖДОМ кадре (человек и экран двигаются, рамка — нет)."""
+
+    def __init__(self, frames: list):
+        import cv2
+        grays = [f.mean(axis=2).astype(np.float32) for _, f in frames]
+        self.h, self.w = grays[0].shape
+        gy = np.stack([np.abs(cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)) for g in grays]) > 40
+        gx = np.stack([np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)) for g in grays]) > 40
+        # линия может быть смазана на пиксель — берём полосу в 3 пикселя
+        gy = gy | np.roll(gy, 1, axis=1) | np.roll(gy, -1, axis=1)
+        gx = gx | np.roll(gx, 1, axis=2) | np.roll(gx, -1, axis=2)
+        self.cy = np.concatenate([np.zeros(gy.shape[:2] + (1,), np.int16), np.cumsum(gy, axis=2, dtype=np.int16)], axis=2)
+        self.cx = np.concatenate([np.zeros((gx.shape[0], 1, gx.shape[2]), np.int16), np.cumsum(gx, axis=1, dtype=np.int16)], axis=1)
+
+    def h_score(self, y: int, x0: float, x1: float) -> float:
+        """Доля длины горизонтальной линии y на [x0, x1], «типичная» по кадрам. Край кадра = 1."""
+        if y <= 0 or y >= self.h - 1:
+            return 1.0
+        a, b = int(max(0, x0)), int(min(self.w, x1))
+        if b - a < 4:
+            return 0.0
+        return float(np.median((self.cy[:, y, b] - self.cy[:, y, a]) / (b - a)))
+
+    def v_score(self, x: int, y0: float, y1: float) -> float:
+        if x <= 0 or x >= self.w - 1:
+            return 1.0
+        a, b = int(max(0, y0)), int(min(self.h, y1))
+        if b - a < 4:
+            return 0.0
+        return float(np.median((self.cx[:, b, x] - self.cx[:, a, x]) / (b - a)))
+
+    def box_score(self, L: int, T: int, R: int, B: int) -> tuple[float, list[float]]:
+        sides = [self.h_score(T, L, R), self.h_score(B, L, R), self.v_score(L, T, B), self.v_score(R, T, B)]
+        return min(sides) + 0.25 * float(np.mean(sides)), sides
+
+
+def _box_score_rel(es: _EdgeStack, box: list[float]) -> float:
+    x, y, w, h = box
+    L, T = int(round(x * es.w)), int(round(y * es.h))
+    R, B = int(round((x + w) * es.w)), int(round((y + h) * es.h))
+    best = 0.0
+    for d in (-2, 0, 2):  # рамка могла быть сохранена с отступом внутрь
+        best = max(best, es.box_score(L + (d if L > 0 else 0), T + (d if T > 0 else 0),
+                                      R - (d if R < es.w else 0), B - (d if B < es.h else 0))[0])
+    return best
+
+
+def cam_rect_from_edges(frames: list, cx: float, cy: float, fw: float, es: "_EdgeStack | None" = None,
+                        with_score: bool = False):
+    """Точные границы картинки вебки [x, y, w, h] в долях кадра или None.
+    Перебираем прямоугольники из устойчивых линий вокруг лица (и краёв кадра) и выбираем тот, у которого
+    ВСЕ четыре стороны — настоящие линии рамки, а пропорции похожи на камеру (16:9 или 4:3)."""
+    import itertools
+    if len(frames) < 4:
+        return (None, 0.0) if with_score else None
+    es = es or _EdgeStack(frames)
+    h, w = es.h, es.w
     px, py, f = cx * w, cy * h, fw * w
-    thr_y = max(20.0, 4 * float(np.median(gy)))
-    thr_x = max(20.0, 4 * float(np.median(gx)))
-    xa, xb = int(max(0, px - 1.1 * f)), int(min(w, px + 1.1 * f))
+    span = 1.3 * f
 
-    def hline(y: int) -> bool:
-        row = gy[y, xa:xb]
-        return len(row) > 0 and float((row > thr_y).mean()) >= 0.92
-    B = h
-    for y in range(int(py + 1.0 * f), min(h - 1, int(py + 6 * f))):
-        if hline(y):
-            B = y
-            break
-    T = 0
-    for y in range(int(py - 1.3 * f), max(0, int(py - 5 * f)), -1):
-        if hline(y):
-            T = y + 1
-            break
-    L, R, got = 0, w, False
-    for row in ([B] if B < h else []) + ([T - 1] if T > 0 else []):
-        rr = gy[max(0, row - 1):row + 2].max(axis=0)
-        l, r = _hrun(rr, int(px), thr_y)
-        if r - l >= 1.6 * f and l < px - 0.6 * f and r > px + 0.6 * f:
-            L, R = (l, r + 1) if not got else (max(L, l), min(R, r + 1))
-            got = True
-    if not got:
-        ya, yb = int(T + 0.1 * (B - T)), int(B - 0.1 * (B - T))
-
-        def vline(x: int) -> bool:
-            col = gx[ya:yb, x]
-            return len(col) > 0 and float((col > thr_x).mean()) >= 0.92
-        for x in range(int(px - 1.0 * f), 0, -1):
-            if vline(x):
-                L = x + 1
+    def cands(lo, hi, fn, lim):
+        out = []
+        for v in range(int(max(1, lo)), int(min(lim - 1, hi))):
+            sc = fn(v)
+            if sc > 0.6:
+                out.append((sc, v))
+        out.sort(reverse=True)
+        picked: list[int] = []
+        for sc, v in out:
+            if all(abs(v - p) > 2 for p in picked):
+                picked.append(v)
+            if len(picked) >= 8:
                 break
-        for x in range(int(px + 1.0 * f), w - 1):
-            if vline(x):
-                R = x
-                break
-    # вебка не бывает шире ~9 лиц: если линия «убежала» в узор экрана — ограничиваем
-    L, R = max(L, int(px - 4.5 * f)), min(R, int(px + 4.5 * f))
-    T, B = max(T, int(py - 4 * f)), min(B, int(py + 5 * f))
+        return picked
+    tops = [0] + cands(py - 6 * f, py - 0.9 * f, lambda y: es.h_score(y, px - span, px + span), h)
+    bots = [h] + cands(py + 0.9 * f, py + 7 * f, lambda y: es.h_score(y, px - span, px + span), h)
+    lefts = [0] + cands(px - 7 * f, px - 0.9 * f, lambda x: es.v_score(x, py - span, py + span), w)
+    rights = [w] + cands(px + 0.9 * f, px + 7 * f, lambda x: es.v_score(x, py - span, py + span), w)
+    best = None
+    for T, B, L, R in itertools.product(tops, bots, lefts, rights):
+        bw, bh = R - L, B - T
+        if bw < 3.5 * f or bw > 10 * f or bh < 2.5 * f:
+            continue
+        asp = bw / bh
+        if not (1.15 < asp < 2.0):
+            continue
+        if not (L < px - 0.8 * f and R > px + 0.8 * f and T < py - 0.8 * f and B > py + 0.8 * f):
+            continue
+        sc, _ = es.box_score(L, T, R, B)
+        sc -= 0.5 * min(abs(asp - 16 / 9), abs(asp - 4 / 3) + 0.1)
+        if best is None or sc > best[0]:
+            best = (sc, L, T, R, B)
+    if best is None or best[0] < 0.55:
+        return (None, 0.0) if with_score else None
+    sc, L, T, R, B = best
     # отступ внутрь от рамки, чтобы не попала сама линия
     L, T = (L + 2 if L > 0 else 0), (T + 2 if T > 0 else 0)
     R, B = (R - 2 if R < w else w), (B - 2 if B < h else h)
-    if not (L < px - 0.5 * f and R > px + 0.5 * f and T < py - 0.5 * f and B > py + 0.6 * f):
-        return None
-    if (R - L) * (B - T) > 0.6 * w * h:
-        return None
-    return [L / w, T / h, (R - L) / w, (B - T) / h]
+    box = [L / w, T / h, (R - L) / w, (B - T) / h]
+    return (box, sc) if with_score else box
 
 
 def stream_cam(samples: list[tuple[list, list]], prior: dict | None = None) -> dict | None:
@@ -322,14 +363,23 @@ def stream_cam(samples: list[tuple[list, list]], prior: dict | None = None) -> d
         return None
     if n == 1 and not best.get("prior") and best["n"] < 0.3 * len(samples[0][1]):
         return None
-    frames = [fr for fs, _ in samples for fr in fs[:: max(1, len(fs) // 12)]][:72]
+    frames = [fr for fs, _ in samples for fr in fs[:: max(1, len(fs) // 24)]][:72]
     box = None
     try:
-        box = cam_rect_from_edges(frames, best["cx"], best["cy"], best["fw"])
+        es = _EdgeStack(frames)
+        box, sc = cam_rect_from_edges(frames, best["cx"], best["cy"], best["fw"], es=es, with_score=True)
+        if prior and best.get("prior") and prior.get("box"):
+            # рамка, найденная раньше, — если она по-прежнему лучше совпадает с линиями в кадре, оставляем её
+            px_, py_, _ = best["cx"], best["cy"], best["fw"]
+            pb = prior["box"]
+            if pb[0] <= px_ <= pb[0] + pb[2] and pb[1] <= py_ <= pb[1] + pb[3]:
+                sp = _box_score_rel(es, pb)
+                if box is None or sp >= sc - 0.05:
+                    box = pb
     except Exception as e:
         log.warning("Рамка вебки не найдена: %s", e)
-    if box is None and prior and best.get("prior") and prior.get("box"):
-        box = prior["box"]
+        if prior and best.get("prior") and prior.get("box"):
+            box = prior["box"]
     res = {"face": [round(best["cx"], 4), round(best["cy"], 4), round(best["fw"], 4)],
            "box": [round(v, 4) for v in box] if box else None, "clips": best["present"], "of": n,
            "updated": __import__("time").time()}
@@ -346,13 +396,128 @@ def sample_for_cam(path: Path, offset: float, dur: float) -> tuple[list, list]:
     return frames, _detect_faces(frames)
 
 
-def detect_layout(path: Path, offset: float, dur: float, cfg: dict) -> dict:
-    """Раскладка кадра — по каждому ключевому кадру клипа, поэтому внутри одного клипа она может
-    меняться: стример показывает что-то на экране (вебка + экран), потом переключается на вебку
-    на весь экран (кадр по лицу) или экран пустеет (только вебка крупно)."""
+def _default_cam_box(cx: float, cy: float, fw: float, sw: int, sh: int) -> list[float]:
+    """Рамку вебки не нашли — берём область 16:9 вокруг лица (типичная вебка ≈ 5.5 ширин лица)."""
+    bw = min(1.0, fw * 5.6)
+    bh = min(1.0, bw * sw / sh * 9 / 16)
+    return [float(np.clip(cx - bw / 2, 0, 1 - bw)), float(np.clip(cy - bh * 0.45, 0, 1 - bh)), bw, bh]
+
+
+def top_height(box: list[float], sw: int, sh: int, cfg: dict) -> int:
+    """Высота зоны вебки в «вебка + экран»: под пропорции самой вебки, чтобы она вошла ЦЕЛИКОМ."""
+    W = int(cfg["render"]["width"])
+    bw, bh = box[2] * sw, box[3] * sh
+    if bw <= 0 or bh <= 0:
+        return cam_height(cfg)
+    lo, hi = int(cfg["render"].get("cam_height_min", 560)), int(cfg["render"].get("cam_height_max", 1100))
+    return int(np.clip(W * bh / bw, lo, hi)) // 2 * 2
+
+
+def _screen_motion(frames: list, cam_rel: list[float]) -> list[dict]:
+    """Что происходит на экране (без области вебки) между соседними кадрами: доля изменившейся площади
+    самого большого «живого» участка (видео, игра) и по столбцам — где именно движение."""
+    import cv2
+    if len(frames) < 2:
+        return [{"blob": 0.0, "cols": None} for _ in frames]
+    small = []
+    for _, fr in frames:
+        g = cv2.resize(fr.mean(axis=2).astype(np.uint8), (192, 108), interpolation=cv2.INTER_AREA)
+        small.append(cv2.GaussianBlur(g, (3, 3), 0).astype(np.int16))
+    h, w = small[0].shape
+    x, y, cw, ch = cam_rel
+    pad = 0.03
+    mask = np.ones((h, w), bool)
+    mask[max(0, int((y - pad) * h)):int((y + ch + pad) * h) + 1, max(0, int((x - pad) * w)):int((x + cw + pad) * w) + 1] = False
+    out = []
+    for i in range(len(small)):
+        j = i - 1 if i > 0 else 1
+        d = (np.abs(small[i] - small[j]) > 18) & mask
+        d8 = cv2.morphologyEx(d.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        n, lab, st, _ = cv2.connectedComponentsWithStats(d8)
+        blob = 0.0
+        for k in range(1, n):
+            bx, by, bw, bh, area = st[k]
+            if bw >= 0.18 * w and bh >= 0.12 * h:  # широкий участок — видео/игра, а не лента чата
+                blob = max(blob, area / float(mask.sum()))
+        out.append({"blob": blob, "cols": d.sum(axis=0).astype(np.float32)})
+    return out
+
+
+def _cam_modes(times: list[float], frames: list, faces: list, cam_rel: list[float], cam_face: tuple,
+               words: list[dict] | None, dur: float, cfg: dict) -> tuple[list[str], dict]:
+    """Режим для каждого кадра, когда у стримера есть вебка. Лицо стримера видно ВСЕГДА:
+    split — вебка сверху + экран снизу (на экране что-то происходит и стример это комментирует);
+    cam   — вебка на весь кадр (экран стоит/пустой, а стример долго рассказывает)."""
+    r = cfg["render"]
+    mot = _screen_motion(frames, cam_rel)
+    empty = [screen_is_empty(fr, cam_rel) for _, fr in frames]
+    act_thr = float(r.get("screen_active", 0.05))
+    active = [(not e) and m["blob"] >= act_thr for e, m in zip(empty, mot)]
+    cx, cy, fw = cam_face
+    on_cam = [any(abs(f[0] - cx) < 0.06 and abs(f[1] - cy) < 0.09 for f in fs) for fs in faces]
+
+    def talking(t: float) -> bool:
+        return bool(words) and any(w["s"] - 1.5 <= t <= w["e"] + 1.5 for w in words)
+    n = len(frames)
+    info = {"screen_active": round(sum(active) / max(1, n), 2)}
+    if not r.get("dynamic_layout", True):
+        return ["split"] * n, info
+    if n and sum(active) <= 0.15 * n:
+        # экран весь клип стоит (OBS, пустой рабочий стол, статичная страница) — только вебка
+        return ["cam" if (on_cam[i] or not any(on_cam)) else "split" for i in range(n)], info
+    modes = ["split" if a else "cam?" for a in active]
+    # «cam» — только длинные отрезки без действия на экране, где стример говорит, и не в самом начале:
+    # первые секунды зритель должен увидеть, о чём речь
+    min_cam = float(r.get("cam_min_seconds", 7.0))
+    intro = float(r.get("intro_screen_seconds", 8.0))
+    i = 0
+    while i < n:
+        if modes[i] != "cam?":
+            i += 1
+            continue
+        j = i
+        while j < n and modes[j] == "cam?":
+            j += 1
+        t0 = times[i] if i else 0.0
+        t1 = times[j] if j < n else dur
+        span = [k for k in range(i, j) if times[k] >= intro]
+        talk = sum(1 for k in span if talking(times[k]))
+        ok = (t1 - max(t0, intro) >= min_cam and span and talk >= 0.5 * len(span)
+              and sum(on_cam[k] for k in span) >= 0.6 * len(span))
+        for k in range(i, j):
+            modes[k] = "cam" if ok and times[k] >= intro else "split"
+        i = j
+    return modes, info
+
+
+def _screen_focus(mot: list[dict], sw: int, gw: int) -> int:
+    """Где на экране главное действие (идущее видео, игра): окно ширины gw с наибольшим движением."""
+    cols = [m["cols"] for m in mot if m.get("cols") is not None and m.get("blob", 0) > 0]
+    if not cols or gw >= sw:
+        return max(0, (sw - gw) // 2)
+    energy = np.sum(cols, axis=0)
+    w = len(energy)
+    win = max(1, int(round(gw / sw * w)))
+    if energy.sum() <= 0:
+        return (sw - gw) // 2
+    cs = np.concatenate([[0], np.cumsum(energy)])
+    sums = cs[win:] - cs[:-win]
+    k = int(np.argmax(sums))
+    # без резких перекосов: если движение равномерное — по центру
+    if sums[k] < 1.15 * sums[(w - win) // 2]:
+        return (sw - gw) // 2
+    return int(np.clip(k / w * sw, 0, sw - gw)) // 2 * 2
+
+
+def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[dict] | None = None) -> dict:
+    """Раскладка кадра — по каждому ключевому кадру клипа, поэтому внутри одного клипа она может меняться.
+    Если у стримера есть вебка — его лицо в клипе видно всегда: «вебка + экран», пока на экране что-то
+    происходит, и «только вебка», когда экран стоит, а стример долго рассказывает.
+    words — слова клипа (время от начала клипа), чтобы понимать, когда стример говорит."""
     r = cfg["render"]
     info = ffprobe_video(path)
     sw, sh = int(info.get("width") or 1920), int(info.get("height") or 1080)
+    W, H = int(r["width"]), int(r["height"])
     res: dict = {"src_w": sw, "src_h": sh, "layout": "blur"}
     want = r["layout"]
 
@@ -366,30 +531,21 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict) -> dict:
     times = [t for t, _ in frames]
     res["face_frames"] = f"{sum(1 for f in faces if f)}/{n}"
 
-    # --- вебка поверх экрана: маленькое лицо, стоящее на одном месте в углу
-    cam_rel = None
+    # --- вебка поверх экрана: маленькое лицо, стоящее на одном месте
     cam_face = None
     box = None
     scam = r.get("stream_cam") if not r.get("cam_rect") else None
     if r.get("cam_rect"):
         x, y, w, h = r["cam_rect"]
-        cam_rel = [x, y, w, h]
-        cam_face = (x + w / 2, y + h * 0.45, w / 3.6)
-        box = cam_rel
-        # лицо внутри указанной вебки — точнее центр
+        box = [x, y, w, h]
+        cam_face = (x + w / 2, y + h * 0.45, w / 5.6)
         inside = [f for fs in faces for f in fs if x <= f[0] <= x + w and y <= f[1] <= y + h]
         if inside:
             cam_face = (float(np.median([f[0] for f in inside])), float(np.median([f[1] for f in inside])),
                         float(np.median([f[2] for f in inside])))
-        cam_rel = _fit_aspect(box, cam_face, sw, sh, 1080 / cam_height(cfg))
     elif scam:
-        cx, cy, fw = scam["face"]
-        cam_face = (cx, cy, fw)
+        cam_face = tuple(scam["face"])
         box = scam.get("box")
-        if not box:  # рамку не нашли — берём область вокруг лица с запасом поменьше, чтобы не захватить лишнее
-            bw, bh = min(1.0, fw * 4.2), min(1.0, fw * 3.4 * sw / sh)
-            box = [float(np.clip(cx - bw / 2, 0, 1 - bw)), float(np.clip(cy - bh * 0.45, 0, 1 - bh)), bw, bh]
-        cam_rel = _fit_aspect(box, cam_face, sw, sh, 1080 / cam_height(cfg))
     else:
         flat = [(i, f) for i, fs in enumerate(faces) for f in fs if f[2] < 0.11]
         best, support = None, 0
@@ -401,33 +557,26 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict) -> dict:
             cl = [g for _, g in flat if abs(g[0] - best[0]) < 0.05 and abs(g[1] - best[1]) < 0.07]
             cx, cy = float(np.median([g[0] for g in cl])), float(np.median([g[1] for g in cl]))
             fw = float(np.median([g[2] for g in cl]))
-            in_corner = (cx < 0.33 or cx > 0.67) or (cy < 0.3 or cy > 0.7)
-            if in_corner:
+            if (cx < 0.33 or cx > 0.67) or (cy < 0.3 or cy > 0.7):
                 cam_face = (cx, cy, fw)
-                aspect = 1080 / cam_height(cfg)
-                cwp = min(1.0, fw * 3.6)
-                chp = min(1.0, cwp * sw / aspect / sh)
-                cwp = chp * sh * aspect / sw
-                cam_rel = [float(np.clip(cx - cwp / 2, 0, 1 - cwp)), float(np.clip(cy - chp * 0.45, 0, 1 - chp)), cwp, chp]
-    if cam_rel:
+                try:
+                    box = cam_rect_from_edges(frames, cx, cy, fw) or cam_box(frames, cx, cy)
+                except Exception:
+                    box = None
+    cam_rel = None
+    if cam_face:
+        cx, cy, fw = cam_face
+        if not box:
+            box = _default_cam_box(cx, cy, fw, sw, sh)
+        top = top_height(box, sw, sh, cfg)
+        cam_rel = _fit_aspect(box, cam_face, sw, sh, W / top)
         x, y, w, h = cam_rel
         res["cam"] = [int(x * sw), int(y * sh), int(w * sw) // 2 * 2, int(h * sh) // 2 * 2]
-        cx, cy, fw = cam_face
+        res["top_h"] = top
         res.update(face_cx=int(cx * sw), face_cy=int(cy * sh), face_w=fw)
-        if box is None:
-            try:
-                box = cam_rect_from_edges(frames, cx, cy, fw) or cam_box(frames, cx, cy)
-            except Exception:
-                box = None
-            if box:
-                cam_rel = _fit_aspect(box, cam_face, sw, sh, 1080 / cam_height(cfg))
-                x, y, w, h = cam_rel
-                res["cam"] = [int(x * sw), int(y * sh), int(w * sw) // 2 * 2, int(h * sh) // 2 * 2]
         res["cam_box"] = box
-        if box:  # вебка шире нужного кадра — кадр двигается за лицом, но только внутри вебки
-            res["cam_lim"] = [int(box[0] * sw), int((box[0] + box[2]) * sw)]
-        res.update(_cam_params(sw, sh, cx, cy, fw, box or cam_rel))
-        # слежение за лицом внутри вебки
+        res["cam_lim"] = [int(box[0] * sw), int((box[0] + box[2]) * sw)]
+        res.update(_cam_params(sw, sh, cx, cy, fw, box))
         cam_faces = [[f for f in fs if abs(f[0] - cx) < 0.08 and abs(f[1] - cy) < 0.1] for fs in faces]
         res["cam_track"] = _track_camera(times, cam_faces, res["camcrop"][2] / sw) or [(0.0, cx)]
 
@@ -440,14 +589,24 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict) -> dict:
         res.update(_crop_params(sw, sh, float(np.median(fws)), float(np.median(cys)), times, big_faces))
 
     # --- режим для каждого кадра
-    modes = []
-    for (t, fr), fs, bf in zip(frames, faces, big_faces):
-        if cam_rel and not (bf and max(f[2] for f in bf) >= 0.11):
-            modes.append("cam" if screen_is_empty(fr, cam_rel) else "split")
-        elif bf:
-            modes.append("crop")
+    if cam_rel:
+        cx, cy, _ = cam_face
+        on_cam = [any(abs(f[0] - cx) < 0.06 and abs(f[1] - cy) < 0.09 for f in fs) for fs in faces]
+        scene_full_cam = n and sum(on_cam) < 0.3 * n and sum(1 for bf in big_faces if bf and
+                                                              max(f[2] for f in bf) >= 0.11) >= 0.6 * n
+        if scene_full_cam and res.get("crop"):
+            # стример переключил сцену на вебку во весь экран: маленькой вебки в кадре нет, есть его крупное лицо
+            modes = ["crop" if bf else "split" for bf in big_faces]
         else:
-            modes.append("blur")
+            modes, act = _cam_modes(times, frames, faces, cam_rel, cam_face, words, dur, cfg)
+            res.update(act)
+        gw = int(min(sw, sh * W / (H - res["top_h"]))) // 2 * 2
+        try:
+            res["screen_x"] = _screen_focus(_screen_motion(frames, cam_rel), sw, gw)
+        except Exception:
+            pass
+    else:
+        modes = ["crop" if bf else "blur" for bf in big_faces]
     res["modes"] = modes
     if want != "auto":
         if want in ("split", "cam") and not cam_rel:
@@ -457,7 +616,8 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict) -> dict:
         res["layout"] = want
         res["segments"] = [{"t0": 0.0, "t1": dur, "layout": want}]
         return res
-    segs = _smooth_modes(times, modes, dur) if modes else [{"t0": 0.0, "t1": dur, "layout": "blur"}]
+    segs = _smooth_modes(times, modes, dur, min_len=float(r.get("layout_min_seconds", 5.0))) if modes \
+        else [{"t0": 0.0, "t1": dur, "layout": "blur"}]
     if not r.get("dynamic_layout", True) and segs:
         main = max(segs, key=lambda x: x["t1"] - x["t0"])["layout"]
         segs = [{"t0": 0.0, "t1": dur, "layout": main}]
@@ -533,11 +693,11 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
     W, H = int(r["width"]), int(r["height"])
     sw, sh = li["src_w"], li["src_h"]
     if layout == "split" and li.get("cam"):
-        top = cam_height(cfg)
+        top = int(li.get("top_h") or cam_height(cfg))
         x, y, cw, ch = li["cam"]
         bot_h = H - top
         gw = int(min(sw, sh * W / bot_h)) // 2 * 2
-        gx = (sw - gw) // 2
+        gx = int(np.clip(li.get("screen_x", (sw - gw) // 2), 0, sw - gw))
         xc = str(x)
         lim = li.get("cam_lim")
         if lim and lim[1] - lim[0] > cw + 8 and li.get("cam_track"):
@@ -875,8 +1035,12 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     D = tl.final_dur
 
     fps = out_fps(src, cfg)
-    li = dict(layout_info or detect_layout(src, offset, dur, cfg))
+    li = dict(layout_info or detect_layout(src, offset, dur, cfg, words_rel))
     layout = li["layout"]
+    if li.get("top_h"):
+        # зона вебки подогнана под пропорции этой вебки — субтитры и склейки считаем от неё
+        cfg = {**cfg, "render": {**cfg["render"], "cam_height": int(li["top_h"])}}
+        r = cfg["render"]
     sw, sh = li["src_w"], li["src_h"]
     # движение камеры — в шкале после вырезания пауз
     for k in ("track", "cam_track"):
