@@ -10,3 +10,6 @@ tools/
 data/whispercpp_status.json
 data/logs/
 data/snapshots/
+data/tiktok_app.json
+data/tiktok_token.json
+data/tiktok_tokens.json

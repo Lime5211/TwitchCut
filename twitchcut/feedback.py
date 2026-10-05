@@ -9,8 +9,9 @@ from __future__ import annotations
 import statistics
 import threading
 import time
+from pathlib import Path
 
-from .util import ROOT_DIR, read_json, write_json
+from .util import ROOT_DIR, log, read_json, write_json
 
 PATH = ROOT_DIR / "data" / "feedback.json"
 _lock = threading.Lock()
@@ -184,3 +185,80 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10) -> str:
     if len(lines) == 1:
         return ""
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------ монтажные замечания
+def edit_notes(login: str | None, max_n: int = 14) -> str:
+    """Замечания автора про картинку (вебка, экран, формат, переключения) — для ИИ-режиссёра.
+    Сначала по этому каналу, затем общие (вкус к монтажу у автора один на все каналы)."""
+    from . import streamers
+    items = [f for f in load() if f.get("note") and _TECH_NOTE.search(f["note"])]
+    items.sort(key=lambda f: (f.get("streamer") != login, -f.get("updated", 0)))
+    lines = []
+    st = streamers.get(login) if login else None
+    if st and st.get("learned_edit"):
+        lines.append(st["learned_edit"].strip())
+    if items:
+        lines.append("Замечания автора к прошлым клипам:")
+        for f in items[:max_n]:
+            lay = f" (было: {f['layout']})" if f.get("layout") else ""
+            lines.append(f"- «{(f.get('title') or '')[:70]}»{lay}: {f['note'][:220]}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------ вкус канала
+LEARN_SYSTEM = """Ты анализируешь, какие клипы со стримов заходят у автора TikTok-аккаунта нарезок, а какие он отбраковывает.
+По его отметкам («выложил» с реальными просмотрами/лайками и «не подходит» с причинами и комментариями) составь
+КОРОТКИЙ профиль вкуса для этого канала — его будут читать модели, которые ищут и монтируют клипы.
+
+taste — 5–9 пунктов «- …»: какие темы/типы моментов у ЭТОГО стримера заходят (с опорой на просмотры), что брать
+нельзя или не стоит (скучные типы, повторяющиеся рубрики, которые автор отклоняет), какая длина лучше, на что
+обращать внимание в начале и конце клипа. Конкретно, с примерами тем, без воды.
+edit — 3–7 пунктов «- …» про картинку и монтаж (вебка/экран/когда переключать/что показывать крупно/темп),
+только то, что следует из замечаний автора. Если замечаний про монтаж нет — пустая строка.
+Не выдумывай того, чего нет в данных."""
+
+LEARN_JSON = """
+
+ФОРМАТ ОТВЕТА: строго один JSON-объект: {"taste":"- ...\\n- ...","edit":"- ...\\n- ..."}"""
+
+LEARN_TOOL = {"name": "submit_profile", "description": "Профиль вкуса канала", "input_schema": {
+    "type": "object", "properties": {"taste": {"type": "string"}, "edit": {"type": "string"}}, "required": ["taste"]}}
+
+
+def learn_profile(login: str, cfg: dict, workdir, force: bool = False) -> dict | None:
+    """Обновляет «вкус канала» по отметкам автора (если с прошлого раза появилось ≥3 новых отметки)."""
+    from . import streamers
+    from .llm import llm_call
+    st = streamers.get(login)
+    if not st:
+        return None
+    items = [f for f in load() if f.get("streamer") == login and f.get("status") in ("posted", "rejected")]
+    if len(items) < 4:
+        return None
+    if not force and len(items) - int(st.get("learned_n") or 0) < 3:
+        return None
+    rows = []
+    for f in sorted(items, key=lambda f: -f.get("updated", 0))[:60]:
+        dur = f.get("final_duration") or f.get("duration")
+        base = f"«{(f.get('title') or '')[:80]}» [{CAT_RU.get(f.get('category') or '', f.get('category') or '')}, {dur or '?'} с]"
+        if f["status"] == "posted":
+            v = f.get("views")
+            extra = f"выложен: {v if v is not None else '?'} просм." + (f", {f['likes']} лайков" if f.get("likes") else "")
+            if time.time() - float(f.get("posted_ts") or f.get("posted_at") or f.get("updated") or 0) < 36 * 3600:
+                extra += " (выложен меньше 1.5 суток назад — ещё набирает)"
+        else:
+            why = ", ".join(REASONS.get(r, r) for r in (f.get("reasons") or []))
+            extra = "отклонён: " + (why or "") + (("; " + f["note"][:200]) if f.get("note") else "")
+        rows.append(f"- {base} — {extra}")
+    user = (f"Канал: {st.get('name') or login}.\nОписание стримера: {(st.get('description') or '')[:800]}\n\n"
+            f"Отметки автора (новые сверху):\n" + "\n".join(rows))
+    usage: dict = {}
+    data = llm_call(LEARN_SYSTEM, user, cfg, usage, Path(workdir), tool=LEARN_TOOL, json_instruction=LEARN_JSON)
+    taste = str(data.get("taste") or "").strip()[:1800]
+    edit = str(data.get("edit") or "").strip()[:1200]
+    if not taste:
+        return None
+    streamers.set_fields(login, learned_taste=taste, learned_edit=edit, learned_n=len(items), learned_at=time.time())
+    log.info("Вкус канала %s обновлён по %d отметкам", login, len(items))
+    return {"taste": taste, "edit": edit}

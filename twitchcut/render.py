@@ -726,11 +726,90 @@ def _crop_x_expr(keys: list, sw: int, cw: int, lo: float = 0.0, hi: float | None
     return expr
 
 
-def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str, t_shift: float = 0.0) -> str:
-    """Цепочка фильтров одной раскладки: inp → кадр 1080×1920 → out."""
+def _overlap(a: tuple, b: tuple) -> float:
+    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    return ix * iy
+
+
+def focus_rect(focus: list[float] | None, sw: int, sh: int, aspect: float, max_grow: float = 1.6,
+               min_w: float = 0.24, min_h: float = 0.2, avoid: list[float] | None = None) -> tuple[int, int, int, int]:
+    """Область экрана для показа крупно: прямоугольник «важного» (чат, донат, видео, игра) расширяется
+    до нужных пропорций, но не больше чем в max_grow раз по каждой стороне (лишнее — размытым фоном),
+    и не меньше min_w/min_h кадра (иначе картинка рассыплется на пиксели). avoid — вебка: расширяемся так,
+    чтобы не захватить её больше, чем исходная область. Возвращает x, y, w, h в пикселях."""
+    x, y, w, h = focus or [0.0, 0.0, 1.0, 1.0]
+    cx, cy = (x + w / 2) * sw, (y + h / 2) * sh
+    w0, h0 = max(w, min_w) * sw, max(h, min_h) * sh
+    orig = (float(np.clip(cx - w0 / 2, 0, sw - w0)), float(np.clip(cy - h0 / 2, 0, sh - h0)), w0, h0)
+    av = (avoid[0] * sw, avoid[1] * sh, avoid[2] * sw, avoid[3] * sh) if avoid else None
+    base = _overlap(orig, av) if av else 0.0
+
+    def build(g: float):
+        w, h = w0, h0
+        if w / h < aspect:
+            w = min(h * aspect, w * g)
+        else:
+            h = min(w / aspect, h * g)
+        w, h = min(w, sw), min(h, sh)
+        # среди положений, которые накрывают исходную область, — с наименьшим захватом вебки
+        xs = np.linspace(max(0, orig[0] + orig[2] - w), min(sw - w, orig[0]), 7) if w >= orig[2] else [orig[0]]
+        ys = np.linspace(max(0, orig[1] + orig[3] - h), min(sh - h, orig[1]), 7) if h >= orig[3] else [orig[1]]
+        best = None
+        for x0 in xs:
+            for y0 in ys:
+                r = (float(x0), float(y0), w, h)
+                ov = _overlap(r, av) if av else 0.0
+                d = abs(x0 + w / 2 - cx) + abs(y0 + h / 2 - cy)
+                if best is None or (ov, d) < best[0]:
+                    best = ((ov, d), r)
+        return best[1], best[0][0]
+    g = max_grow
+    rect, ov = build(g)
+    while av and g > 1.0 and ov > base + 0.02 * sw * sh:
+        g = max(1.0, g - 0.1)
+        rect, ov = build(g)
+    x0, y0, w, h = rect
+    return int(x0) // 2 * 2, int(y0) // 2 * 2, int(w) // 2 * 2, int(h) // 2 * 2
+
+
+def _fit_panel(src_label: str, rect: tuple, PW: int, PH: int, tag: str, out: str) -> str:
+    """Показать область rect в панели PW×PH целиком (без обрезки): по центру, а свободное место —
+    размытой копией той же области."""
+    x, y, w, h = rect
+    if abs(w / h - PW / PH) < 0.04:  # пропорции совпали — просто масштаб
+        return f"{src_label}crop={w}:{h}:{x}:{y},scale={PW}:{PH}:flags=lanczos{out}"
+    return (f"{src_label}crop={w}:{h}:{x}:{y},split=2[{tag}fa][{tag}fb];"
+            f"[{tag}fa]scale={PW // 4}:{PH // 4}:force_original_aspect_ratio=increase,crop={PW // 4}:{PH // 4},"
+            f"boxblur=10:2,eq=brightness=-0.12,scale={PW}:{PH}[{tag}fg];"
+            f"[{tag}fb]scale={PW}:{PH}:force_original_aspect_ratio=decrease:flags=lanczos[{tag}ff];"
+            f"[{tag}fg][{tag}ff]overlay=(W-w)/2:(H-h)/2{out}")
+
+
+def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str, t_shift: float = 0.0,
+                  focus: list[float] | None = None) -> str:
+    """Цепочка фильтров одной раскладки: inp → кадр 1080×1920 → out.
+    focus — важная область экрана [x, y, w, h] в долях кадра (от ИИ-режиссёра): её показываем крупно."""
     r = cfg["render"]
     W, H = int(r["width"]), int(r["height"])
     sw, sh = li["src_w"], li["src_h"]
+    if layout == "screen":
+        rect = focus_rect(focus, sw, sh, W / H, max_grow=1.8, min_w=0.3, min_h=0.3, avoid=li.get("cam_box"))
+        return _fit_panel(inp, rect, W, H, tag, out)
+    if layout == "split" and li.get("cam") and focus is not None:
+        top = int(li.get("top_h") or cam_height(cfg))
+        x, y, cw, ch = li["cam"]
+        bot_h = H - top
+        xc = str(x)
+        lim = li.get("cam_lim")
+        track = li.get("split_track") or li.get("cam_track")
+        if lim and lim[1] - lim[0] > cw + 8 and track:
+            xc = "'" + _crop_x_expr(track, sw, cw, lo=lim[0], hi=lim[1] - cw, t_shift=t_shift) + "'"
+        rect = focus_rect(focus, sw, sh, W / bot_h, avoid=li.get("cam_box"))
+        return (f"{inp}split=2[{tag}a][{tag}b];"
+                f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{top}[{tag}t];"
+                + _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]") + ";"
+                f"[{tag}t][{tag}d]vstack{out}")
     if layout == "split" and li.get("cam"):
         top = int(li.get("top_h") or cam_height(cfg))
         x, y, cw, ch = li["cam"]
@@ -746,6 +825,18 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
                 f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{top}[{tag}t];"
                 f"[{tag}b]crop={gw}:{sh}:{gx}:0,scale={W}:{bot_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{bot_h}[{tag}d];"
                 f"[{tag}t][{tag}d]vstack{out}")
+    if layout == "cam" and li.get("camcrop") and li.get("cam_box") and \
+            H / max(1, li["camcrop"][3]) > float(r.get("cam_max_upscale", 4.5)):
+        # вебка маленькая: если растянуть её лицо на весь экран — будет «мыло». Показываем вебку целиком
+        # (в ширину кадра), а сверху и снизу — её же размытую копию
+        up = float(r.get("cam_max_upscale", 4.5))
+        bx, by, bw, bh = li["cam_box"]
+        ph = min(H, int(bh * sh * up))           # высота «окна» с лицом при допустимом увеличении
+        fx = li.get("face_cx", (bx + bw / 2) * sw) / sw
+        fy = li.get("face_cy", (by + bh / 2) * sh) / sh
+        x, y, w, h = _fit_aspect(li["cam_box"], (fx, fy), sw, sh, W / ph)
+        rect = (int(x * sw) // 2 * 2, int(y * sh) // 2 * 2, int(w * sw) // 2 * 2, int(h * sh) // 2 * 2)
+        return _fit_panel(inp, rect, W, H, tag, out)
     if layout == "cam" and li.get("camcrop"):
         x0, y0, cw, ch = li["camcrop"]
         bx, bw = li.get("cam_bounds", [0, sw])
@@ -763,9 +854,10 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
             f"[{tag}b]scale={W}:-2:flags=lanczos[{tag}f];[{tag}g][{tag}f]overlay=(W-w)/2:(H-h)/2{out}")
 
 
-def layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str, t_shift: float = 0.0) -> str:
+def layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str, t_shift: float = 0.0,
+                 focus: list[float] | None = None) -> str:
     """Цепочка фильтров одной раскладки; квадратный пиксель на выходе, чтобы куски склеивались."""
-    ch = _layout_chain(layout, li, cfg, inp, f"[{tag}o]", tag, t_shift)
+    ch = _layout_chain(layout, li, cfg, inp, f"[{tag}o]", tag, t_shift, focus)
     return ch + f";[{tag}o]setsar=1{out}"
 
 
@@ -792,11 +884,14 @@ def _esc(text: str) -> str:
 def text_positions(layout: str, cfg: dict | None = None) -> tuple[int, int]:
     """(y субтитров, y хука) для раскладки. В «вебка + экран» субтитры — в верхней части экрана игры,
     чтобы не закрывать лицо и не попадать под интерфейс TikTok снизу."""
-    if layout == "split":
+    if layout in ("split", "split_focus"):
         top = cam_height(cfg) if cfg else 820
         H = int(cfg["render"]["height"]) if cfg else 1920
+        if layout == "split_focus":
+            # внизу показываем что-то важное крупно (чат, донат, видео) — субтитры на стыке, чтобы не закрывать
+            return top + 8, top
         return int(top + (H - top) * 0.5), top
-    return {"crop": (1340, 330), "cam": (1400, 330), "blur": (1440, 430)}.get(layout, (1440, 430))
+    return {"crop": (1340, 330), "cam": (1400, 330), "blur": (1440, 430), "screen": (1500, 430)}.get(layout, (1440, 430))
 
 
 def build_ass(words: list[dict], hook: str, layout, cfg: dict, prof: ProfanityFilter | None) -> str:
@@ -1093,25 +1188,29 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     segs = []
     for sg in (li.get("segments") or [{"t0": 0.0, "t1": dur, "layout": layout}]):
         a, b = tl.cut(sg["t0"]), tl.cut(sg["t1"])
+        same = segs and segs[-1]["layout"] == sg["layout"] and segs[-1].get("focus") == sg.get("focus")
         if b - a < 0.5 and segs:
             segs[-1]["t1"] = b
             continue
-        if segs and segs[-1]["layout"] == sg["layout"]:
+        if same:
             segs[-1]["t1"] = b
         else:
-            segs.append({"t0": a, "t1": b, "layout": sg["layout"]})
+            segs.append({"t0": a, "t1": b, "layout": sg["layout"], "focus": sg.get("focus")})
     segs = [s_ for s_ in segs if s_["t1"] - s_["t0"] > 0.05] or [{"t0": 0.0, "t1": tl.cut_dur, "layout": layout}]
     segs[0]["t0"], segs[-1]["t1"] = 0.0, tl.cut_dur + 1.0
     if len(segs) == 1:
-        vf = layout_chain(segs[0]["layout"], li, cfg, "[vin]", "[v0]", "L0")
+        vf = layout_chain(segs[0]["layout"], li, cfg, "[vin]", "[v0]", "L0", focus=segs[0].get("focus"))
     else:
         n = len(segs)
         vf = f"[vin]split={n}" + "".join(f"[s{i}]" for i in range(n)) + ";"
         for i, sg in enumerate(segs):
             vf += (f"[s{i}]trim=start={sg['t0']:.3f}:end={sg['t1']:.3f},setpts=PTS-STARTPTS,"
-                   + layout_chain(sg["layout"], li, cfg, "", f"[p{i}]", f"L{i}", t_shift=sg["t0"]) + ";")
+                   + layout_chain(sg["layout"], li, cfg, "", f"[p{i}]", f"L{i}", t_shift=sg["t0"],
+                                  focus=sg.get("focus")) + ";")
         vf += "".join(f"[p{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v0]"
-    segs_final = [{"t0": sg["t0"] / tl.speed, "t1": sg["t1"] / tl.speed, "layout": sg["layout"]} for sg in segs]
+    segs_final = [{"t0": sg["t0"] / tl.speed, "t1": sg["t1"] / tl.speed,
+                   "layout": sg["layout"] + ("_focus" if sg.get("focus") and sg["layout"] == "split" else "")}
+                  for sg in segs]
 
     # субтитры и заглушение — в итоговой шкале
     words_final = [{**w, "s": tl.final(w["s"]), "e": tl.final(w["e"])} for w in words_rel
@@ -1225,6 +1324,7 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     except OSError:
         pass
     removed = round(dur - tl.cut_dur, 1)
-    return {"layout": layout, "layouts": [sg["layout"] for sg in segs], "censored": [[round(s, 2), round(e, 2)] for s, e in censored], "encoder": enc,
+    return {"layout": layout, "layouts": [sg["layout"] for sg in segs],
+            "shots": [{"t0": round(sg["t0"] / tl.speed, 1), "layout": sg["layout"], "focus": sg.get("focus")} for sg in segs], "censored": [[round(s, 2), round(e, 2)] for s, e in censored], "encoder": enc,
             "zooms": [round(z, 1) for z in zooms_f], "src_quality": f"{sh}p", "speed": tl.speed,
             "pauses_removed": removed, "pause_cuts": len(tl.keep) - 1, "final_duration": round(D, 1)}

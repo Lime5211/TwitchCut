@@ -26,6 +26,11 @@ FIELDS = {
     "language": "",         # пусто = как в настройках
     "watch": False,         # следить за эфиром и нарезать прямо во время стрима
     "cam_auto": None,       # где вебка — найдено автоматически по прошлым стримам (заполняется само)
+    "learned_taste": "",    # что заходит у канала — выучено по отметкам автора (обновляется само)
+    "learned_edit": "",     # пожелания к монтажу — выучено по замечаниям автора
+    "learned_n": 0,
+    "tiktok_account": "",   # open_id аккаунта TikTok, куда отправлять клипы этого стримера
+    "learned_at": 0,
 }
 
 
@@ -84,6 +89,17 @@ def upsert(data: dict, fetch_profile: bool = True) -> dict:
     return rec
 
 
+def set_fields(login: str, **fields) -> None:
+    """Записать служебные поля стримера (найденная вебка, выученный вкус канала)."""
+    with _lock:
+        items = read_json(PATH) or []
+        for d in items:
+            if isinstance(d, dict) and d.get("login") == login.lower():
+                d.update(fields)
+                write_json(PATH, items)
+                return
+
+
 def set_cam_auto(login: str, cam: dict | None) -> None:
     """Запомнить, где у стримера вебка (по клипам последнего стрима) — подсказка для следующих нарезок."""
     if not login:
@@ -129,6 +145,8 @@ def apply_to_config(st: dict, cfg: dict, extra_context: str = "") -> dict:
     if st.get("funny_emotes") or st.get("hype_emotes"):
         ctx.append("Эмоуты канала: смешно — " + (st.get("funny_emotes") or "—")
                    + "; круто — " + (st.get("hype_emotes") or "—") + ".")
+    if st.get("learned_taste"):
+        ctx.append("ЧТО ЗАХОДИТ У ЭТОГО КАНАЛА (выводы по отметкам автора и просмотрам):\n" + st["learned_taste"].strip())
     if extra_context:
         ctx.append(extra_context.strip())
     cfg["llm"]["streamer_context"] = "\n".join(ctx)

@@ -26,7 +26,13 @@ def is_tiktok(url: str) -> bool:
 
 def _via_ytdlp(url: str) -> dict:
     import yt_dlp
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 20}) as y:
+    class _Quiet:  # yt-dlp печатает ERROR в консоль даже с quiet — глушим, ошибка и так обрабатывается
+        def debug(self, msg): pass
+        def info(self, msg): pass
+        def warning(self, msg): pass
+        def error(self, msg): pass
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 20,
+                           "logger": _Quiet()}) as y:
         info = y.extract_info(url, download=False)
     if not info or info.get("view_count") is None:
         raise TwitchCutError("yt-dlp не вернул просмотры")
@@ -80,7 +86,8 @@ def fetch(url: str) -> dict:
     if not is_tiktok(url):
         raise TwitchCutError("Это не ссылка на TikTok")
     errors = []
-    for fn in (_via_ytdlp, _via_page):
+    # страница видео — быстрее и сейчас надёжнее; yt-dlp — запасной путь
+    for fn in (_via_page, _via_ytdlp):
         try:
             res = fn(url)
             return {k: v for k, v in res.items() if v is not None and v != ""}

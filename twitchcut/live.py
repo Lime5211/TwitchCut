@@ -56,7 +56,7 @@ class LiveJob(Job):
         self.update(status="live", live=True, title=meta["title"], channel=meta["channel"], error=None,
                     warning=None, stage="meta", message="Слежу за эфиром", live_min_score=lc["min_score"],
                     live_chunk_minutes=lc.get("max_chunk_minutes", 60))
-        self._apply_streamer(meta)
+        self._apply_streamer(meta, learn=True)
         if self.cfg["llm"]["backend"] == "manual":
             self.cfg["llm"]["backend"] = "none"  # в эфире вручную отвечать некому
 

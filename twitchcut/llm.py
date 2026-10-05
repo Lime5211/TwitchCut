@@ -90,6 +90,7 @@ SYSTEM_PROMPT = """Ты — продюсер популярного TikTok-ак�
 - start — с крючка (или с минимально нужного контекста перед ним). Не «ну короче», «так, чат», не тишина.
 - end — после развязки/вывода и короткой реакции; не обрывай на полуслове. ГЛАВНАЯ ОШИБКА, из-за которой автор отклоняет клипы, — «мысль не доведена до конца, клип заканчивается на самом интересном». Дочитай транскрипт: если история или мысль продолжается в блоке «Продолжение после окна» — ставь end там (end может быть больше длины окна). Если концовки нет нигде — score ≤ 40, keep=false.
 - start может быть и раньше окна (отрицательный, из блока «Перед окном»), если без этого непонятно, о чём речь.
+- Ответ на донат/вопрос чата/сообщение: start — там, где донат приходит или зачитывается (голос озвучки доната, «… пишет», «донат от …», вопрос зрителя), а НЕ на ответе стримера. Иначе непонятно, на что он отвечает: автор отклонял такие клипы как «начало обрезано, не хватило контекста».
 - Строка «(тишина N с — … упал стрим)» — обрыв. Клип не должен проходить через обрыв: закончи до него или не бери момент.
 - Паузы внутри речи потом вырежутся автоматически, их не нужно учитывать.
 
@@ -485,6 +486,67 @@ def call_claude_cli(system: str, user: str, cfg: dict, usage: dict, workdir: Pat
     except json.JSONDecodeError:
         text = raw
     return extract_json(text)
+
+
+def call_claude_cli_blocks(system: str, blocks: list[dict], cfg: dict, usage: dict, workdir: Path | None = None,
+                           model: str | None = None, timeout: int = 600) -> dict:
+    """Запрос с картинками через Claude Code (подписка): сообщение в формате API (текст + изображения base64)
+    передаётся через --input-format stream-json."""
+    exe = find_claude()
+    if not exe:
+        raise TwitchCutError("Claude Code не установлен")
+    workdir = workdir or Path.cwd()
+    sys_file = workdir / f"llm_vision_prompt_{os.getpid()}_{threading.get_ident()}.txt"
+    sys_file.write_text(system, encoding="utf-8")
+    model = model or cfg["llm"].get("cli_model") or "sonnet"
+    cmd = [exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+           "--model", model, "--system-prompt-file", str(sys_file), "--tools", "", "--no-session-persistence"]
+    msg = {"type": "user", "message": {"role": "user", "content": blocks}}
+    kwargs = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    try:
+        p = subprocess.run(cmd, input=(json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, cwd=str(workdir), **kwargs)
+    except subprocess.TimeoutExpired as e:
+        raise TwitchCutError("Claude Code не ответил вовремя") from e
+    finally:
+        try:
+            sys_file.unlink()
+        except OSError:
+            pass
+    out = (p.stdout or b"").decode("utf-8", "replace")
+    result = None
+    for line in out.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") == "result":
+            result = d
+    if result is None:
+        err = (p.stderr or b"").decode("utf-8", "replace")[-600:] + out[-400:]
+        low = err.lower()
+        if any(k in low for k in ("login", "not logged", "authenticat", "invalid api key")):
+            raise TwitchCutError("Claude Code не авторизован. Запустите login_claude.bat и войдите своей подпиской.")
+        if any(k in low for k in ("usage limit", "rate limit", "limit reached")):
+            raise TwitchCutError("Достигнут лимит подписки Claude.")
+        raise TwitchCutError("Claude Code (картинки) завершился с ошибкой: " + err)
+    if result.get("is_error"):
+        raise TwitchCutError("Claude Code: " + str(result.get("result"))[:400])
+    u = result.get("usage") or {}
+    usage["input_tokens"] = usage.get("input_tokens", 0) + int(u.get("input_tokens") or 0) \
+        + int(u.get("cache_read_input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
+    usage["output_tokens"] = usage.get("output_tokens", 0) + int(u.get("output_tokens") or 0)
+    return extract_json(result.get("result") or "")
+
+
+def llm_vision(system: str, blocks: list[dict], cfg: dict, usage: dict, workdir: Path, tool: dict,
+               json_instruction: str, cli_model: str | None = None) -> dict:
+    """Запрос к Claude с картинками (api или подписка через Claude Code)."""
+    blocks = list(blocks)
+    if cfg["llm"]["backend"] == "api":
+        return call_api(system, blocks, cfg, usage, tool=tool)
+    blocks.append({"type": "text", "text": json_instruction})
+    return call_claude_cli_blocks(system, blocks, cfg, usage, workdir, model=cli_model)
 
 
 def llm_call(system: str, user: str, cfg: dict, usage: dict, workdir: Path, tool: dict | None = None,

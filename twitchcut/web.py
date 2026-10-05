@@ -39,6 +39,8 @@ class Manager:
         threading.Thread(target=self._worker, daemon=True).start()
         threading.Thread(target=self._fill_avatars, daemon=True).start()
         self.rendering: dict[str, dict] = {}       # "job/n" -> перемонтаж клипа
+        self.compiling: dict[str, dict] = {}       # job -> склейка «Топ-N»
+        self.port = 8765
         self.render_errors: dict[str, str] = {}
         self._cleanup_stale()
         self.live_jobs: dict[str, tuple] = {}      # vod-job id -> (LiveJob, Thread)
@@ -195,6 +197,59 @@ class Manager:
         self.render_errors.pop(key, None)
         threading.Thread(target=target, daemon=True).start()
 
+    def make_compilation(self, job_id: str, n: int) -> None:
+        """Склейка «Топ-N» в фоне (по очереди с остальной тяжёлой работой)."""
+        if (self.compiling.get(job_id) or {}).get("status") == "running":
+            raise TwitchCutError("Склейка уже собирается")
+        d = self.ws / job_id
+        clips = read_json(d / "clips.json") or []
+        if not clips:
+            raise TwitchCutError("У задачи нет готовых клипов")
+        self.compiling[job_id] = {"status": "running", "n": n}
+        st = read_json(d / "job.json") or {}
+
+        def work():
+            from .compilation import build_top
+            from .pipeline import heavy
+            from . import feedback
+            try:
+                cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
+                with heavy(f"склейка «Топ-{n}»"):
+                    build_top(d, clips, feedback.for_job(job_id), cfg, n)
+                self.compiling.pop(job_id, None)
+            except Exception as e:
+                log.error("Склейка %s: %s", job_id, e)
+                self.compiling[job_id] = {"status": "error", "error": str(e)}
+        threading.Thread(target=work, daemon=True).start()
+
+    def send_to_tiktok(self, job_id: str, n: int | None = None, file: str | None = None,
+                       account: str | None = None) -> dict:
+        """Загрузить клип (или склейку) во «Входящие» TikTok как черновик."""
+        from . import tiktok_upload
+        d = self.ws / job_id
+        st = read_json(d / "job.json") or {}
+        acc = account or tiktok_upload.account_for(st.get("streamer"))
+        if n is not None:
+            clips = read_json(d / "clips.json") or []
+            c = next((x for x in clips if x.get("n") == n), None)
+            if not c:
+                raise TwitchCutError("Клип не найден")
+            res = tiktok_upload.upload_draft(d / c["file"], acc)
+            clips = read_json(d / "clips.json") or clips
+            for x in clips:
+                if x.get("n") == n:
+                    x["tiktok_draft"] = res
+            write_json(d / "clips.json", clips)
+            return res
+        comps = read_json(d / "compilations.json") or []
+        c = next((x for x in comps if x.get("file") == file), None)
+        if not c:
+            raise TwitchCutError("Склейка не найдена")
+        res = tiktok_upload.upload_draft(d / c["file"], acc)
+        c["tiktok_draft"] = res
+        write_json(d / "compilations.json", comps)
+        return res
+
     def _fill_avatars(self) -> None:
         """Подтягивает аватарки стримеров, добавленных без доступа к Twitch."""
         for st in streamers.load_all():
@@ -237,6 +292,8 @@ class Manager:
         st["rendering"] = {k.split("/", 1)[1]: v["status"] for k, v in self.rendering.items() if k.startswith(job_id + "/")}
         st["render_errors"] = {k.split("/", 1)[1]: v for k, v in self.render_errors.items() if k.startswith(job_id + "/")}
         st["timeline"] = read_json(d / "timeline.json")
+        st["compilations"] = [x for x in (read_json(d / "compilations.json") or []) if (d / x["file"]).exists()]
+        st["compiling"] = self.compiling.get(job_id)
         cands = read_json(d / "all_candidates.json") or read_json(d / "candidates.json") or []
         rank = (read_json(d / "ranking.json") or {}).get("ranking", {})
         st["candidates"] = [{"id": c["id"], "peak": c["peak"], "signal": c.get("signal", 0), "source": c.get("source"),
@@ -497,7 +554,42 @@ def make_handler(mgr: Manager):
                 if STATIC.resolve() not in target.parents:
                     return self._json({"error": "forbidden"}, 403)
                 return self._file(target)
+            if path in ("/tiktok/callback", "/tiktok/callback/"):
+                from urllib.parse import parse_qs
+                from . import tiktok_upload
+                q = parse_qs(urlparse(self.path).query)
+                try:
+                    if q.get("error"):
+                        raise TwitchCutError("TikTok: " + (q.get("error_description") or q["error"])[0])
+                    tok = tiktok_upload.finish_login(q.get("code", [""])[0], q.get("state", [""])[0])
+                    msg = (f"Готово: аккаунт TikTok «{tok.get('display_name') or 'аккаунт'}» подключён"
+                           + (f" и привязан к стримеру {tok['streamer']}" if tok.get("streamer") else "")
+                           + ". Вкладку можно закрыть.")
+                except Exception as e:
+                    msg = f"Не удалось войти в TikTok: {e}"
+                body = (f"<!doctype html><meta charset=utf-8><title>TwitchCut</title><body style='font:16px sans-serif;"
+                        f"background:#0e0e10;color:#efeff1;padding:40px'><h2>{msg}</h2>"
+                        f"<p><a style='color:#a970ff' href='/#/status'>Вернуться в TwitchCut</a></p>").encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
+                if path == "/api/tiktok/status":
+                    from . import tiktok_upload
+                    return self._json(tiktok_upload.status())
+                if path == "/api/tiktok/login":
+                    from . import tiktok_upload
+                    from urllib.parse import parse_qs
+                    who = parse_qs(urlparse(self.path).query).get("streamer", [""])[0]
+                    url = tiktok_upload.login_url(mgr.port, who or None)
+                    self.send_response(302)
+                    self.send_header("Location", url)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if path == "/api/status":
                     return self._json(mgr.status())
                 if path == "/api/feedback":
@@ -595,6 +687,15 @@ def make_handler(mgr: Manager):
                     from .twitch_api import clear_auth
                     clear_auth()
                     return self._json({"ok": True})
+                m = re.match(r"^/api/streamers/([\w]+)/learn$", path)
+                if m:
+                    from . import feedback
+                    cfg = load_config(mgr.config_path)
+                    d = ROOT_DIR / "data"
+                    res = feedback.learn_profile(m.group(1).lower(), cfg, d, force=True)
+                    if not res:
+                        raise TwitchCutError("Мало отметок: нужно хотя бы 4 «Выложил» / «Не подходит» у этого стримера")
+                    return self._json(res)
                 m = re.match(r"^/api/streamers/([\w]+)/delete$", path)
                 if m:
                     streamers.delete(m.group(1))
@@ -602,7 +703,7 @@ def make_handler(mgr: Manager):
                 m = re.match(r"^/api/jobs/([\w.-]+)/clips/(\d+)/(render|shorten|restore)$", path)
                 if m:
                     sp = float(data.get("speed") or 1.0)
-                    lay = data.get("layout") if data.get("layout") in ("auto", "split", "cam", "crop", "blur") else None
+                    lay = data.get("layout") if data.get("layout") in ("auto", "split", "cam", "screen", "crop", "blur") else None
                     tgt = None
                     if m.group(3) == "shorten":
                         tgt = float(data.get("seconds") or 0)
@@ -611,6 +712,30 @@ def make_handler(mgr: Manager):
                     mgr.rerender_clip(m.group(1), int(m.group(2)), sp, bool(data.get("trim", True)), lay,
                                       action=m.group(3), target=tgt)
                     return self._json({"ok": True})
+                if path == "/api/tiktok/app":
+                    from . import tiktok_upload
+                    tiktok_upload.save_app(data.get("client_key"), data.get("client_secret"))
+                    return self._json(tiktok_upload.status())
+                if path == "/api/tiktok/disconnect":
+                    from . import tiktok_upload
+                    tiktok_upload.disconnect(data.get("open_id") or None)
+                    return self._json(tiktok_upload.status())
+                if path == "/api/tiktok/assign":
+                    from . import tiktok_upload
+                    login = streamers.normalize_login(data.get("streamer") or "")
+                    streamers.set_fields(login, tiktok_account=data.get("open_id") or "")
+                    return self._json(tiktok_upload.status())
+                m = re.match(r"^/api/jobs/([\w.-]+)/clips/(\d+)/tiktok$", path)
+                if m:
+                    return self._json(mgr.send_to_tiktok(m.group(1), n=int(m.group(2)), account=data.get("open_id")))
+                m = re.match(r"^/api/jobs/([\w.-]+)/compilation$", path)
+                if m:
+                    n = int(data.get("n") or 5)
+                    mgr.make_compilation(m.group(1), max(2, min(10, n)))
+                    return self._json({"ok": True})
+                m = re.match(r"^/api/jobs/([\w.-]+)/compilation/tiktok$", path)
+                if m:
+                    return self._json(mgr.send_to_tiktok(m.group(1), file=data.get("file"), account=data.get("open_id")))
                 m = re.match(r"^/api/jobs/([\w.-]+)/stop$", path)
                 if m:
                     mgr.stop_live(m.group(1))
@@ -636,6 +761,7 @@ def make_handler(mgr: Manager):
 
 def serve(host: str = "127.0.0.1", port: int = 8765, config_path: Path | None = None) -> None:
     mgr = Manager(config_path)
+    mgr.port = port
     from . import tiktok
     tiktok.start_background()  # просмотры выложенных роликов обновляются сами
     class _Server(ThreadingHTTPServer):

@@ -20,7 +20,7 @@ import numpy as np
 from . import chat as chatmod
 from .llm import LONG_CATEGORIES, rank_candidates
 from .profanity import ProfanityFilter
-from .render import render_clip
+from .render import detect_layout, render_clip
 from .signals import audio_loudness, find_candidates
 from .sources import Source
 from .transcribe import Transcriber, slice_words
@@ -161,12 +161,13 @@ class Job:
             meta = self.source.meta()
             write_json(p, meta)
         self.update(title=meta.get("title"), channel=meta.get("channel"), duration=meta.get("duration"))
-        self._apply_streamer(meta)
+        self._apply_streamer(meta, learn=True)
         log.info("Видео: %s | %s | %s", meta.get("channel"), meta.get("title"), fmt_time(meta.get("duration", 0)))
         return meta
 
-    def _apply_streamer(self, meta: dict) -> None:
-        """Подключает карточку стримера: выбранную вручную или найденную по каналу VOD."""
+    def _apply_streamer(self, meta: dict, learn: bool = False) -> None:
+        """Подключает карточку стримера: выбранную вручную или найденную по каналу VOD.
+        learn=True (в начале анализа) — сначала обновить «вкус канала» по новым отметкам автора."""
         from . import streamers
         login = self.options.get("streamer") or meta.get("channel_id") or ""
         st = streamers.get(login)
@@ -176,6 +177,14 @@ class Job:
             if self.options.get("streamer_context"):
                 self.cfg["llm"]["streamer_context"] = self.options["streamer_context"]
             return
+        if learn and (self.cfg.get("learn") or {}).get("enabled", True) \
+                and self.cfg["llm"]["backend"] in ("api", "claude-cli"):
+            try:
+                from . import feedback
+                if feedback.learn_profile(st["login"], self.cfg, self.dir):
+                    st = streamers.get(st["login"]) or st
+            except Exception as e:
+                log.warning("Не удалось обновить вкус канала: %s", e)
         streamers.apply_to_config(st, self.cfg, self.options.get("streamer_context") or "")
         # явный выбор в форме важнее настроек стримера
         if self.options.get("layout") and self.options["layout"] != "auto":
@@ -537,8 +546,35 @@ class Job:
         hook = c.get("hook", "") if self.cfg["render"].get("hook_title") else ""
         hint = {"visual": c.get("visual"),
                 "spans": [(a - c["start"], b - c["start"]) for a, b in (c.get("screen_spans") or [])]}
-        info = render_clip(src, offset, dur, words_rel, hook, out, self.cfg, prof,
+        li, dplan = None, None
+        from . import director
+        if self.cfg["render"].get("layout") == "auto" and director.enabled(self.cfg):
+            try:
+                li = detect_layout(src, offset, dur, self.cfg, words_rel, hint)
+                if li.get("cam"):  # есть вебка — решаем, что показывать, глядя на кадры
+                    usage = self.state.get("director_usage") or {}
+                    about = f"О чём: «{c.get('title') or ''}» ({c.get('category') or ''}). {c.get('reason') or ''}"
+                    from . import feedback
+                    notes = feedback.edit_notes(self.cfg["llm"].get("streamer_login"))
+                    dplan = director.plan_clip(src, offset, dur, words_rel, keep or [(0.0, dur)], li, self.cfg,
+                                               self.dir, usage, about=about, notes=notes,
+                                               cache=self.dir / "segments" / f"{c.get('cand') or c.get('candidate')}.director.json")
+                    self.update(director_usage=usage)
+                    if dplan:
+                        if dplan["cuts"]:
+                            keep = subtract_intervals(keep or [(0.0, dur)], [tuple(x) for x in dplan["cuts"]])
+                            words_rel = [w for w in words_rel
+                                         if not any(a <= (w["s"] + w["e"]) / 2 <= b for a, b in dplan["cuts"])]
+                            cuts = cuts + [tuple(x) for x in dplan["cuts"]]
+                        li = director.apply_plan(li, dplan)
+            except Exception as e:  # режиссёр — улучшение, а не обязательный шаг
+                log.warning("ИИ-режиссёр не сработал для клипа %s: %s — раскладка по кадрам", c.get("cand"), e)
+                dplan = None
+        info = render_clip(src, offset, dur, words_rel, hook, out, self.cfg, prof, layout_info=li,
                            zooms=self.reaction_peaks(c["start"], c["end"]), keep=keep, speed=speed, layout_hint=hint)
+        info["director"] = bool(dplan)
+        if dplan:
+            info["director_shots"] = [{k: s_[k] for k in ("t0", "t1", "layout", "focus", "why")} for s_ in dplan["shots"]]
         info["content_cut_sec"] = round(sum(b - a for a, b in cuts), 1)
         info["pauses_removed"] = round(max(0.0, info.get("pauses_removed", 0) - info["content_cut_sec"]), 1)
         return info, words_rel
@@ -714,11 +750,32 @@ class Job:
         cam = stream_cam(samples, prior) if samples else None
         if cam is None and prev:
             cam = prev
+        if cam and cam.get("box") and not cam.get("verified"):
+            # ИИ-режиссёр один раз смотрит на рамку вебки: не захватывает ли чат/экран, не обрезает ли камеру
+            from . import director
+            pr = r.get("cam_prior") or {}
+            same_as_verified = pr.get("verified") and pr.get("box") and \
+                max(abs(a - b) for a, b in zip(pr["box"], cam["box"])) < 0.01
+            if same_as_verified:
+                cam["verified"] = True
+            elif director.enabled(self.cfg) and (self.cfg.get("director") or {}).get("verify_cam", True):
+                frames = [fr for fs, _ in samples for fr in fs[:: max(1, len(fs) // 3)]][:48]
+                try:
+                    self.progress("render", 0.32, "Claude проверяет рамку вебки")
+                    usage = self.state.get("director_usage") or {}
+                    res = director.verify_cam(frames, cam["box"], self.cfg, self.dir, usage)
+                    self.update(director_usage=usage)
+                    if res["box"]:
+                        log.info("Рамка вебки исправлена: %s → %s", cam["box"], res["box"])
+                        cam.update(box=res["box"], corrected=True)
+                    cam["verified"] = bool(res["ok"] or res["box"])
+                except Exception as e:
+                    log.warning("Проверка рамки вебки не удалась: %s", e)
         if cam:
             r["stream_cam"] = cam
             write_json(self.dir / "stream_cam.json", cam)
             login = self.cfg["llm"].get("streamer_login")
-            if login and (cam.get("clips", 0) >= 3 or (cam.get("clips", 0) >= 2 and cam.get("box"))):
+            if login and (cam.get("verified") or cam.get("clips", 0) >= 3 or (cam.get("clips", 0) >= 2 and cam.get("box"))):
                 streamers.set_cam_auto(login, cam)
 
 
