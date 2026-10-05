@@ -727,6 +727,19 @@ class Job:
         if failed:
             self.update(render_failed=failed,
                         warning=f"Не удалось смонтировать {len(failed)} клип(ов) — подробности в журнале (data/logs).")
+        # лучшие короткие фразы новых клипов — в архив для подборок «Лучшее» (не удаляется автоочисткой)
+        new = [x for x in clips if x.get("candidate") in {c["cand"] for c in todo}]
+        if new:
+            try:
+                from . import highlights
+                if highlights.enabled(self.cfg):
+                    self.progress("render", 0.99, "Claude выбирает лучшие короткие фразы для подборок")
+                    usage = self.state.get("director_usage") or {}
+                    highlights.extract(self.dir, new, self.cfg, usage,
+                                       streamer=self.cfg["llm"].get("streamer_login") or self.state.get("streamer") or "")
+                    self.update(director_usage=usage)
+            except Exception as e:
+                log.warning("Лучшие фразы не выбраны: %s", e)
         return clips
 
     def _prepare_stream_cam(self, chosen: list, srcs: dict) -> None:

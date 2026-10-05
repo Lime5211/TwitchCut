@@ -108,6 +108,8 @@ select.lay{width:auto;padding:5px 8px;font-size:12.5px}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chips button{background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:99px;padding:4px 10px;font:13px inherit;font-family:inherit;cursor:pointer}
 .chips button.on{background:var(--err-soft);border-color:var(--err);color:#ffb3ba}
+.stabs{margin-bottom:12px}.stabs button{padding:6px 14px;font-size:14px}
+.stabs button.on{background:var(--accent-soft,var(--panel2));border-color:var(--accent);color:var(--text)}
 .clip.rejected{opacity:.55}.clip.rejected:hover{opacity:1}
 .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 .tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px}
@@ -257,6 +259,7 @@ function route(){
   else if (h==="streamers") { S.view="streamers"; renderStreamers(); }
   else if (h==="status") { S.view="status"; renderStatus(); }
   else if (h==="stats") { S.view="stats"; renderStats(); }
+  else if (h==="best") { S.view="best"; renderBest(); }
   else if (h==="jobs") { S.view="jobs"; renderJobs(); }
   else { S.view="new"; renderNew(); }
   renderNav();
@@ -267,6 +270,7 @@ function renderNav(){
   const st = S.status, ok = st && st.ffmpeg && st.whisper && st.ytdlp && (st.llm_backend!=="claude-cli" || (st.claude?.installed && st.claude?.logged_in));
   const items = [["new","scissors","Новая нарезка",""],["jobs","list-video","Задачи",`<span class="cnt">${S.jobs.length||""}</span>`],
     ["streamers","users","Стримеры",`<span class="cnt">${S.streamers.length||""}</span>`],
+    ["best","flame","Лучшее",""],
     ["stats","chart-column-increasing","Статистика",""],
     ["status","activity","Статус",`<span class="dot ${st? (ok?"ok":"bad") : ""}"></span>`]];
   $("#nav").innerHTML = items.map(([k,ic,t,x]) => `<a href="#/${k}" class="${S.view===k?'on':''}">${icon(ic)}<span>${t}</span>${x}</a>`).join("");
@@ -481,7 +485,7 @@ async function renderJob(){
         ${rerr?`<div class="alert err" style="margin:0">${esc(rerr)}</div>`:""}
         ${c.missing?"":`<div class="acts"><a class="btn sm" href="${f}&download=1">${icon("download","sm")} Скачать</a>
           <button class="btn ghost sm" id="tt-${c.n}" onclick="toTikTok(${c.n}, this)" title="Отправить во «Входящие» TikTok как черновик — опубликуете в приложении сами">${icon("send","sm")} ${c.tiktok_draft?"Ещё раз в TikTok":"В TikTok"}</button>
-          ${c.tiktok_draft?`<span class="dim" style="font-size:12px">${icon("circle-check","sm")} в черновиках TikTok${c.tiktok_draft.account?" ("+esc(c.tiktok_draft.account)+")":""}</span>`:""}</div>`}
+          ${c.tiktok_draft?(c.tiktok_draft.url?`<a class="dim" style="font-size:12px" href="${esc(c.tiktok_draft.url)}" target="_blank">${icon("circle-check","sm")} опубликовано в TikTok</a>`:`<span class="dim" style="font-size:12px" title="Как только опубликуете черновик в приложении TikTok, ссылка поставится сама (проверка каждые 10 минут)">${icon("circle-check","sm")} в черновиках TikTok${c.tiktok_draft.account?" ("+esc(c.tiktok_draft.account)+")":""} · ждём публикации</span>`):""}</div>`}
         ${fbBlock(c)}</div></div>`;
     };
   const keyOf = (c) => JSON.stringify([c.file,c.score,c.titles,c.feedback,c.v,c.missing,c.layout_choice,c.speed,c.trim_pauses,c.tiktok_draft,
@@ -534,7 +538,8 @@ function compCard(st){
   return `<div class="card mt"><div class="row"><h3 style="margin:0">${icon("list-video")} Склейка «Топ за стрим» для YouTube Shorts</h3><span class="sp"></span>
     <select style="width:auto" onchange="S.compN=+this.value">${[3,5,7].map(v=>`<option value="${v}" ${v===sel?"selected":""}>Топ-${v}</option>`).join("")}</select>
     <button class="btn sm" onclick="makeComp(this)" ${cp.status==="running"?"disabled":""}>${icon(cp.status==="running"?"loader-circle":"clapperboard","sm"+(cp.status==="running"?" spin":""))} ${cp.status==="running"?"Собираю…":"Собрать"}</button></div>
-    <div class="hint">Лучшие клипы по оценке (без отклонённых) одним роликом до 3 минут, обратный отсчёт от последнего места к первому, на каждом — плашка «#N».</div>
+    <div class="hint">Лучшие клипы по оценке (без отклонённых) одним роликом до 3 минут, обратный отсчёт от последнего места к первому, на каждом — плашка «#N».
+      Короткие лучшие фразы из клипов попадают в архив <a href="#/best">«Лучшее»</a> сами после нарезки; для старых задач — <a href="#" onclick="bestExtract(this);return false">найти лучшие фразы</a>.</div>
     ${cp.status==="error"?`<div class="alert err" style="margin:8px 0 0">${esc(cp.error)}</div>`:""}
     ${comps.map(x=>{ const f = `/files/${encodeURIComponent(S.jobId)}/${encodeURI(x.file)}?v=${x.v||0}`;
       return `<div class="row mt" style="align-items:flex-start;gap:14px"><video controls preload="metadata" playsinline style="width:200px;border-radius:10px;background:#000" poster="/files/${encodeURIComponent(S.jobId)}/${encodeURI(x.thumb)}?v=${x.v||0}" src="${f}"></video>
@@ -542,7 +547,7 @@ function compCard(st){
         <ol class="muted" style="font-size:13px;margin:6px 0 10px 18px;padding:0">${x.clips.map(c=>`<li>#${c.place} — ${esc(c.title||"клип "+c.n)}</li>`).join("")}</ol>
         <div class="row" style="gap:8px"><a class="btn sm" href="${f}&download=1">${icon("download","sm")} Скачать</a>
         <button class="btn ghost sm" onclick='toTikTokComp(${JSON.stringify(x.file)}, this)'>${icon("send","sm")} В TikTok</button>
-        ${x.tiktok_draft?`<span class="dim" style="font-size:12px">${icon("circle-check","sm")} в черновиках TikTok</span>`:""}</div></div></div>`}).join("")}</div>`;
+        ${x.tiktok_draft?(x.tiktok_draft.url?`<a class="dim" style="font-size:12px" href="${esc(x.tiktok_draft.url)}" target="_blank">${icon("circle-check","sm")} опубликовано</a>`:`<span class="dim" style="font-size:12px">${icon("circle-check","sm")} в черновиках TikTok · ждём публикации</span>`):""}</div></div></div>`}).join("")}</div>`;
 }
 async function makeComp(btn){
   btn.disabled = true;
@@ -828,46 +833,139 @@ async function fbSave(n, status){
   catch(e){ toast(e.message,"err"); }
 }
 
+/* ---------------------------------------------------------------- best (архив моментов) */
+S.best = S.best || {streamer:"", days:30, n:5, max:60, sel:[]};
+async function renderBest(){
+  await refreshLists();
+  const b = S.best;
+  let d; try{ d = await api(`/api/highlights?streamer=${encodeURIComponent(b.streamer)}&days=${b.days||0}`); }catch(e){ d = {items:[],compilations:[]}; }
+  const bld = d.building || {};
+  if (bld.status==="running" && !S.bestTimer) S.bestTimer = setInterval(()=>{ if (S.view==="best") renderBest(); else { clearInterval(S.bestTimer); S.bestTimer=null; } }, 3000);
+  if (bld.status!=="running" && S.bestTimer){ clearInterval(S.bestTimer); S.bestTimer=null; }
+  const comps = (d.compilations||[]).filter(c => !b.streamer || c.streamer===b.streamer);
+  const sel = new Set(b.sel);
+  $("#main").innerHTML = `<div class="page">
+    <div class="ph"><div><h1>Лучшее</h1><p>Короткие сильные моменты из всех клипов всех стримов — для подборок «Топ моментов»</p></div></div>
+    <div class="card"><div class="row" style="gap:10px;flex-wrap:wrap">
+      <select style="width:auto" onchange="S.best.streamer=this.value;S.best.sel=[];renderBest()"><option value="">Все стримеры</option>
+        ${S.streamers.map(s=>`<option value="${esc(s.login)}" ${b.streamer===s.login?"selected":""}>${esc(s.name||s.login)}</option>`).join("")}</select>
+      <select style="width:auto" onchange="S.best.days=+this.value;renderBest()">${[[7,"за неделю"],[30,"за месяц"],[0,"за всё время"]].map(([v,t])=>`<option value="${v}" ${b.days===v?"selected":""}>${t}</option>`).join("")}</select>
+      <select style="width:auto" onchange="S.best.n=+this.value">${[3,5,7,10].map(v=>`<option value="${v}" ${b.n===v?"selected":""}>Топ-${v}</option>`).join("")}</select>
+      <select style="width:auto" onchange="S.best.max=+this.value" title="Предел длины подборки">${[[30,"до 30 с"],[60,"до 60 с"],[90,"до 90 с"],[178,"до 3 мин"]].map(([v,t])=>`<option value="${v}" ${b.max===v?"selected":""}>${t}</option>`).join("")}</select>
+      <button class="btn" onclick="bestBuild(false)" ${bld.status==="running"?"disabled":""}>${icon(bld.status==="running"?"loader-circle":"clapperboard","sm"+(bld.status==="running"?" spin":""))} ${bld.status==="running"?"Собираю…":"Собрать лучшие автоматически"}</button>
+      ${sel.size>=2?`<button class="btn ghost" onclick="bestBuild(true)" ${bld.status==="running"?"disabled":""}>Собрать из отмеченных (${sel.size})</button>`:""}
+      <span class="sp"></span><span class="dim" style="font-size:12px">${d.total||0} моментов · архив ${((d.size||0)/1e9).toFixed(2)} ГБ</span></div>
+      <div class="hint">Порядок: сначала моменты из клипов, которые набрали больше просмотров в TikTok (относительно обычного уровня канала), затем — оценка Claude. Не больше одного момента из одного клипа. В подборке обратный отсчёт с плашками «#N», лучший — последним. Моменты добавляются сами после каждой нарезки.</div>
+      ${bld.status==="error"?`<div class="alert err" style="margin:8px 0 0">${esc(bld.error)}</div>`:""}</div>
+    ${comps.length?`<div class="card mt"><h3>${icon("list-video")} Готовые подборки</h3>${comps.map(c=>`<div class="row mt" style="align-items:flex-start;gap:14px">
+        <video controls preload="metadata" playsinline style="width:180px;border-radius:10px;background:#000" poster="/${esc(c.thumb.replace(/^data\//,""))}" src="/${esc(c.file.replace(/^data\//,""))}"></video>
+        <div style="flex:1"><b>Топ-${c.n}</b> <span class="dim">· ${c.duration} с · ${esc(c.streamer||"все стримеры")} · ${new Date(c.created*1000).toLocaleDateString("ru")}</span>
+        <ol class="muted" style="font-size:13px;margin:6px 0 10px 18px;padding:0">${c.moments.map(m=>`<li>#${m.place} — «${esc(m.quote)}»</li>`).join("")}</ol>
+        <div class="row" style="gap:8px"><a class="btn sm" href="/${esc(c.file.replace(/^data\//,""))}?download=1">${icon("download","sm")} Скачать</a>
+        <button class="btn ghost sm" onclick='bestTikTok(${JSON.stringify(c.file)}, this)'>${icon("send","sm")} В TikTok</button>
+        <button class="btn ghost sm icon danger" title="Удалить подборку" onclick='bestDelComp(${JSON.stringify(c.file)})'>${icon("trash","sm")}</button>
+        ${c.tiktok_draft?(c.tiktok_draft.url?`<a class="dim" style="font-size:12px" href="${esc(c.tiktok_draft.url)}" target="_blank">${icon("circle-check","sm")} опубликовано</a>`:`<span class="dim" style="font-size:12px">${icon("circle-check","sm")} в черновиках TikTok · ждём публикации</span>`):""}</div></div></div>`).join("")}</div>`:""}
+    <div class="card mt"><h3>${icon("flame")} Моменты</h3>
+      ${(d.items||[]).length?`<div class="bestgrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px">${d.items.map(m=>`<div style="border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel2)">
+          <video controls preload="none" playsinline style="width:100%;aspect-ratio:9/16;object-fit:cover;background:#000" poster="/${esc(m.file.replace(/^data\//,"").replace(/\.mp4$/,".jpg"))}" src="/${esc(m.file.replace(/^data\//,""))}"></video>
+          <div style="padding:8px 10px;font-size:13px"><div style="font-weight:600;margin-bottom:4px">«${esc(m.quote)}»</div>
+          <div class="dim" style="font-size:12px">${esc(m.streamer||"")} · ${m.dur} с · оценка ${m.score}${m.views!=null?` · клип: ${fmtViews(m.views)} просм.${m.rel_views?` (×${m.rel_views})`:""}`:""}</div>
+          <div class="row" style="gap:6px;margin-top:6px"><label class="check" style="font-size:12px"><input type="checkbox" ${sel.has(m.id)?"checked":""} onchange="bestSel('${m.id}',this.checked)"> в подборку</label><span class="sp"></span>
+          <a href="#/job/${encodeURIComponent(m.job)}" class="dim" style="font-size:12px" title="${esc(m.clip_title||"")}">клип</a>
+          <a href="#" onclick="bestDel('${m.id}');return false" title="Удалить из архива">${icon("trash","sm")}</a></div></div></div>`).join("")}</div>`
+      :`<div class="dim">Пока пусто. Моменты появятся после следующей нарезки. Для уже готовых задач откройте задачу и нажмите «Найти лучшие фразы».</div>`}</div>
+  </div>`;
+}
+function bestSel(id, on){ const s = new Set(S.best.sel); on ? s.add(id) : s.delete(id); S.best.sel = [...s]; renderBest(); }
+async function bestBuild(useSel){
+  const b = S.best;
+  try{ await api("/api/highlights/build", {streamer:b.streamer, days:b.days||null, n:b.n, max_total:b.max, ids: useSel ? b.sel : null});
+    toast("Собираю подборку — пара минут"); renderBest(); }
+  catch(e){ toast(e.message,"err"); }
+}
+async function bestDel(id){ if(!confirm("Удалить момент из архива?")) return; await api("/api/highlights/delete", {id}); S.best.sel = S.best.sel.filter(x=>x!==id); renderBest(); }
+async function bestDelComp(file){ if(!confirm("Удалить подборку?")) return; await api("/api/highlights/compilation/delete", {file}); renderBest(); }
+async function bestTikTok(file, btn){
+  if (!await tiktokReady()) return;
+  btn.disabled = true; const old = btn.innerHTML; btn.innerHTML = `${icon("loader-circle","sm spin")} Загружаю…`;
+  try{ const r = await api("/api/highlights/compilation/tiktok", {file}); toast(`Подборка отправлена во «Входящие» TikTok (${r.account})`); renderBest(); }
+  catch(e){ toast(e.message,"err"); btn.disabled = false; btn.innerHTML = old; }
+}
+async function bestExtract(btn){
+  btn.disabled = true;
+  try{ await api("/api/highlights/extract", {job:S.jobId}); toast("Claude ищет лучшие короткие фразы — они появятся на странице «Лучшее»"); }
+  catch(e){ toast(e.message,"err"); btn.disabled = false; }
+}
+
 /* ---------------------------------------------------------------- stats */
 async function renderStats(){
   await refreshLists();
   const login = S.statsStreamer || "";
-  let d; try{ d = await api("/api/feedback" + (login?`?streamer=${encodeURIComponent(login)}`:"")); }catch(e){ d = {items:[],stats:{}}; }
+  let d; try{ d = await api("/api/feedback" + (login?`?streamer=${encodeURIComponent(login)}`:"")); }catch(e){ d = {items:[],stats:{},by_streamer:{}}; }
+  let tt; try{ tt = await api("/api/tiktok/status"); }catch(e){ tt = {accounts:[]}; }
+  const accName = {}; (tt.accounts||[]).forEach(a=>accName[a.open_id]=a.name);
   const st = d.stats || {}; const CATN = {...CAT};
+  const sname = (l) => { const x = S.streamers.find(s=>s.login===l); return x ? (x.name||x.login) : (l||"без стримера"); };
+  const savatar = (l) => { const x = S.streamers.find(s=>s.login===l); return x&&x.avatar ? `<img src="${esc(x.avatar)}" style="width:22px;height:22px;border-radius:50%;vertical-align:middle;margin-right:6px">` : ""; };
   const posted = d.items.filter(f=>f.status==="posted"), rej = d.items.filter(f=>f.status==="rejected");
   const cats = Object.entries(st.by_category||{}).sort((a,b)=>b[1].median-a[1].median);
-  $("#main").innerHTML = `<div class="page">
-    <div class="ph"><div><h1>Статистика и обучение</h1><p>Ваши отметки и просмотры подмешиваются в анализ Claude как примеры того, что заходит</p></div><span class="sp"></span>
-      <select style="width:auto" onchange="S.statsStreamer=this.value;renderStats()"><option value="">Все стримеры</option>
-      ${S.streamers.map(s=>`<option value="${esc(s.login)}" ${login===s.login?"selected":""}>${esc(s.name)}</option>`).join("")}</select></div>
-    <div class="tiles">
-      <div class="tile"><b>${st.posted||0}</b><span>выложено</span></div>
-      <div class="tile"><b>${fmtViews(st.total_views||0)}</b><span>просмотров всего</span></div>
-      <div class="tile"><b>${fmtViews(st.median_views||0)}</b><span>медиана просмотров</span></div>
-      <div class="tile"><b>${fmtViews(st.total_likes||0)}</b><span>лайков${st.like_rate!=null?` · ${st.like_rate}% от просм.`:""}</span></div>
-      <div class="tile"><b>${st.rejected||0}</b><span>отклонено</span></div>
-    </div>
-    <div class="row mt" style="gap:8px"><button class="btn ghost sm" onclick="statRefresh(this)">${icon("refresh-cw","sm")} Обновить просмотры из TikTok</button>
-      <span class="dim" style="font-size:12px">Обновляются и сами: свежие ролики раз в 3 часа, старые раз в сутки${st.auto?` · автоматически отслеживается ${st.auto}`:""}</span></div>
-    ${cats.length?`<div class="card mt"><h3>${icon("chart-column-increasing")} Что заходит лучше</h3><table class="t"><tr><th>Тип момента</th><th>Клипов</th><th>Медиана просмотров</th></tr>
-      ${cats.map(([k,v])=>`<tr><td>${esc(CATN[k]||k)}</td><td>${v.n}</td><td>${fmtViews(v.median)}</td></tr>`).join("")}</table></div>`:""}
-    ${Object.keys(st.by_duration||{}).length>1?`<div class="card mt"><h3>${icon("clock","")} Длина клипа и просмотры</h3><table class="t"><tr><th>Длина</th><th>Клипов</th><th>Медиана просмотров</th></tr>
-      ${Object.entries(st.by_duration).sort((a,b)=>b[1].median-a[1].median).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.n}</td><td>${fmtViews(v.median)}</td></tr>`).join("")}</table></div>`:""}
-    <div class="card mt"><h3>${icon("send")} Выложенные клипы</h3>
-      ${posted.length?`<table class="t"><tr><th>Название</th><th>Тип</th><th>Просмотры</th><th>Лайки</th><th></th></tr>
-      ${posted.sort((a,b)=>(b.views||0)-(a.views||0)).map((f,i)=>`<tr><td>${esc(f.title||"")}<div class="dim" style="font-size:12px">${esc(f.streamer||"")}${f.url?` · <a href="${esc(f.url)}" target="_blank">ссылка</a>`:""}
+  const bys = d.by_streamer || {};
+  const logins = [...new Set([...S.streamers.map(s=>s.login), ...Object.keys(bys)])];
+  const tabs = `<div class="chips stabs"><button class="${!login?"on":""}" onclick="S.statsStreamer='';renderStats()">Все стримеры</button>
+    ${logins.map(l=>`<button class="${login===l?"on":""}" onclick="S.statsStreamer='${esc(l)}';renderStats()">${esc(sname(l))}${bys[l]?` <span class="dim">${bys[l].posted}</span>`:""}</button>`).join("")}</div>`;
+  const tiles = (x) => `<div class="tiles">
+      <div class="tile"><b>${x.posted||0}</b><span>выложено</span></div>
+      <div class="tile"><b>${fmtViews(x.total_views||0)}</b><span>просмотров всего</span></div>
+      <div class="tile"><b>${fmtViews(x.median_views||0)}</b><span>медиана просмотров</span></div>
+      <div class="tile"><b>${fmtViews(x.total_likes||0)}</b><span>лайков${x.like_rate!=null?` · ${x.like_rate}% от просм.`:""}</span></div>
+      <div class="tile"><b>${x.rejected||0}</b><span>отклонено</span></div></div>`;
+  const ttAcc = (l) => { const x = S.streamers.find(s=>s.login===l); return x&&x.tiktok_account&&accName[x.tiktok_account] ? accName[x.tiktok_account] : ""; };
+  const postedRow = (f,i) => `<tr><td>${esc(f.title||"")}<div class="dim" style="font-size:12px">${f.url?`<a href="${esc(f.url)}" target="_blank">ссылка</a>`:"без ссылки"}${f.auto_link?` <span title="Ссылка поставлена автоматически после публикации черновика">· авто</span>`:""}
           ${f.comments!=null?` · комм. ${fmtViews(f.comments)}`:""}${f.shares!=null?` · репостов ${fmtViews(f.shares)}`:""}
           ${f.stats_at?` · обновлено ${new Date(f.stats_at*1000).toLocaleString("ru",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}`:""}
           ${f.stats_error?` · <span title="${esc(f.stats_error)}">не удалось обновить</span>`:""}${spark(f.history)}</div></td>
         <td>${esc(CATN[f.category]||f.category||"")}</td>
         <td><input type="number" id="sv-${i}" value="${f.views??""}"></td><td><input type="number" id="sl-${i}" value="${f.likes??""}"></td>
-        <td><button class="btn ghost sm" onclick='statSave(${JSON.stringify({job:f.job,file:f.file,url:f.url||""})},${i})'>${icon("save","sm")}</button></td></tr>`).join("")}</table>`
-      : `<div class="dim">Пока нет. На странице задачи нажмите «Выложил» у клипа и укажите просмотры.</div>`}</div>
-    <div class="card mt"><h3>${icon("thumbs-down")} Отклонённые</h3>
+        <td><button class="btn ghost sm" onclick='statSave(${JSON.stringify({job:f.job,file:f.file,url:f.url||""})},${i})'>${icon("save","sm")}</button></td></tr>`;
+  const postedTable = (list, off) => `<table class="t"><tr><th>Название</th><th>Тип</th><th>Просмотры</th><th>Лайки</th><th></th></tr>
+      ${list.sort((a,b)=>(b.views||0)-(a.views||0)).map((f,i)=>postedRow(f, off+i)).join("")}</table>`;
+  let postedHtml;
+  if (!posted.length) postedHtml = `<div class="dim">Пока нет. Отправьте клип кнопкой «В TikTok» и опубликуйте — ссылка поставится сама. Или на странице задачи нажмите «Выложил» и вставьте ссылку.</div>`;
+  else if (login) postedHtml = postedTable(posted, 0);
+  else { let off = 0; postedHtml = logins.filter(l=>posted.some(f=>f.streamer===l)).concat(posted.some(f=>!logins.includes(f.streamer))?["__other"]:[]).map(l=>{
+      const list = posted.filter(f=> l==="__other" ? !logins.includes(f.streamer) : f.streamer===l); const h = `<h4 style="margin:14px 0 6px">${l==="__other"?"Другие":savatar(l)+esc(sname(l))} <span class="dim">· ${list.length}</span></h4>${postedTable(list, off)}`; off += list.length; return h; }).join(""); }
+  const compare = !login && logins.some(l=>bys[l]) ? `<div class="card mt"><h3>${icon("users")} По стримерам</h3><table class="t">
+      <tr><th>Стример</th><th>Аккаунт TikTok</th><th>Выложено</th><th>Просмотров</th><th>Медиана</th><th>Лайки</th><th>Отклонено</th><th>Лучший ролик</th></tr>
+      ${logins.filter(l=>bys[l]).map(l=>{ const x = bys[l]; return `<tr style="cursor:pointer" onclick="S.statsStreamer='${esc(l)}';renderStats()">
+        <td style="white-space:nowrap">${savatar(l)}<b>${esc(sname(l))}</b></td><td class="muted">${esc(ttAcc(l)||"—")}</td><td>${x.posted}</td><td>${fmtViews(x.total_views||0)}</td>
+        <td>${fmtViews(x.median_views||0)}</td><td>${x.like_rate!=null?x.like_rate+"%":"—"}</td><td>${x.rejected}</td>
+        <td class="muted" style="font-size:13px">${x.best?`${x.best.url?`<a href="${esc(x.best.url)}" target="_blank" onclick="event.stopPropagation()">${esc((x.best.title||"").slice(0,48))}</a>`:esc((x.best.title||"").slice(0,48))} · ${fmtViews(x.best.views)}`:"—"}</td></tr>`; }).join("")}</table>
+      <div class="hint">Нажмите на стримера, чтобы открыть его статистику: что заходит, какая длина, отклонённые.</div></div>` : "";
+  $("#main").innerHTML = `<div class="page">
+    <div class="ph"><div><h1>Статистика и обучение</h1><p>Ваши отметки и просмотры подмешиваются в анализ Claude отдельно для каждого стримера</p></div></div>
+    ${tabs}
+    ${login?`<div class="row" style="gap:8px;margin-bottom:12px">${savatar(login)}<b>${esc(sname(login))}</b>${ttAcc(login)?`<span class="dim">· TikTok: ${esc(ttAcc(login))}</span>`:""}</div>`:""}
+    ${tiles(st)}
+    <div class="row mt" style="gap:8px;flex-wrap:wrap"><button class="btn ghost sm" onclick="statRefresh(this)">${icon("refresh-cw","sm")} Обновить просмотры из TikTok</button>
+      ${tt.configured?`<button class="btn ghost sm" onclick="ttCheck(this)" title="Проверить, опубликованы ли отправленные черновики, и поставить ссылки">${icon("link","sm")} Найти опубликованные${tt.waiting?` (ждём ${tt.waiting})`:""}</button>`:""}
+      <span class="dim" style="font-size:12px">Обновляются и сами: свежие ролики раз в 3 часа, старые раз в сутки${st.auto?` · автоматически отслеживается ${st.auto}`:""}</span></div>
+    ${compare}
+    ${login&&cats.length?`<div class="card mt"><h3>${icon("chart-column-increasing")} Что заходит лучше</h3><table class="t"><tr><th>Тип момента</th><th>Клипов</th><th>Медиана просмотров</th></tr>
+      ${cats.map(([k,v])=>`<tr><td>${esc(CATN[k]||k)}</td><td>${v.n}</td><td>${fmtViews(v.median)}</td></tr>`).join("")}</table></div>`:""}
+    ${login&&Object.keys(st.by_duration||{}).length>1?`<div class="card mt"><h3>${icon("clock","")} Длина клипа и просмотры</h3><table class="t"><tr><th>Длина</th><th>Клипов</th><th>Медиана просмотров</th></tr>
+      ${Object.entries(st.by_duration).sort((a,b)=>b[1].median-a[1].median).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.n}</td><td>${fmtViews(v.median)}</td></tr>`).join("")}</table></div>`:""}
+    <div class="card mt"><h3>${icon("send")} Выложенные клипы</h3>${postedHtml}</div>
+    ${login?`<div class="card mt"><h3>${icon("thumbs-down")} Отклонённые</h3>
       ${rej.length?`<table class="t"><tr><th>Название</th><th>Причина</th></tr>${rej.map(f=>`<tr><td>${esc(f.title||"")}</td><td class="muted">${esc((f.reasons||[]).map(r=>REASONS[r]||r).join(", "))}${f.note?" — "+esc(f.note):""}</td></tr>`).join("")}</table>`
-      : `<div class="dim">Пока нет.</div>`}</div>
-    <div class="hint mt">Claude получает до 6 лучших и худших выложенных клипов этого стримера с просмотрами, средние просмотры по типам и до 6 последних отклонённых с причинами. Чем больше отметок, тем точнее выбор.</div>
+      : `<div class="dim">Пока нет.</div>`}</div>`:""}
+    <div class="hint mt">Claude получает до 6 лучших и худших выложенных клипов именно этого стримера с просмотрами, средние просмотры по типам и до 6 последних отклонённых с причинами — опыт каналов не смешивается.</div>
   </div>`;
+}
+async function ttCheck(btn){
+  btn.disabled = true;
+  try{ const r = await api("/api/tiktok/check", {}); toast(r.busy?"Проверка уже идёт":r.found?`Найдено опубликованных: ${r.found} — ссылки поставлены`:(r.checked?"Пока не опубликованы (или TikTok ещё проверяет ролик)":"Нет черновиков, которые ждут публикации")); if (r.found) renderStats(); }
+  catch(e){ toast(e.message,"err"); }
+  btn.disabled = false;
 }
 function spark(h){
   if (!h || h.length < 2) return "";
@@ -897,15 +995,20 @@ async function tiktokCard(){
   const accOpt = (sel) => `<option value="">— не выбран —</option>` + acc.map(a=>`<option value="${esc(a.open_id)}" ${a.open_id===sel?"selected":""}>${esc(a.name)}${a.ok?"":" (войти заново)"}</option>`).join("");
   box.innerHTML = `<div class="chk"><span class="${t.connected?'ok':'bad'}">${icon(t.connected?"circle-check":"circle-alert","lg")}</span><div style="flex:1">
       <b>${t.connected?`Подключено аккаунтов TikTok: ${acc.length}`:t.configured?"Приложение указано — войдите в аккаунты TikTok":"TikTok не подключён"}</b>
-      <span>Кнопка «В TikTok» у клипа отправляет видео во «Входящие» аккаунта TikTok <b>этого стримера</b> как черновик: подпись, звук и публикация — уже в приложении. Лимит TikTok — 5 неопубликованных черновиков в сутки на аккаунт.</span></div></div>
+      <span>Кнопка «В TikTok» у клипа отправляет видео во «Входящие» аккаунта TikTok этого стримера как черновик: подпись, звук и публикация — уже в приложении. Лимит TikTok — 5 неопубликованных черновиков в сутки на аккаунт.</span></div></div>
     ${t.configured?`<table class="t mt"><tr><th>Стример</th><th>Аккаунт TikTok</th><th></th></tr>
       ${S.streamers.map(s=>`<tr><td>${esc(s.name||s.login)}</td>
         <td><select style="width:auto" onchange="ttAssign('${esc(s.login)}', this.value)">${accOpt(s.tiktok_account||"")}</select></td>
         <td><a class="btn ghost sm" href="/api/tiktok/login?streamer=${encodeURIComponent(s.login)}" target="_blank" onclick="setTimeout(tiktokCard,20000)">${icon("log-in","sm")} Войти и привязать</a></td></tr>`).join("")}</table>
       <div class="hint">«Войти и привязать» откроет TikTok: войдите <b>в аккаунт этого стримера</b> и разрешите доступ — аккаунт сразу привяжется к стримеру. Перед входом в следующий аккаунт выйдите из TikTok в браузере (или переключите аккаунт на tiktok.com), иначе TikTok подставит уже открытый.
       ${local?"":" Входить нужно в браузере на этом ПК (127.0.0.1:8765), не с другого устройства."}</div>
-      ${acc.length?`<div class="row mt" style="gap:8px;flex-wrap:wrap">${acc.map(a=>`<span class="chip">${esc(a.name)}${a.streamers.length?" → "+a.streamers.map(esc).join(", "):""}
-        <a href="#" onclick="ttDisconnect('${esc(a.open_id)}');return false" title="Отключить аккаунт" style="margin-left:6px">${icon("x","sm")}</a></span>`).join("")}</div>`:""}`:""}
+      ${acc.length?`<div class="row mt" style="gap:8px;flex-wrap:wrap">${acc.map(a=>`<span class="chip">${esc(a.name)}${a.streamers.length?" → "+a.streamers.map(esc).join(", "):""}${t.video_list&&!a.video_list?` <span title="Войдите в этот аккаунт ещё раз, чтобы разрешить доступ к списку видео" style="color:var(--warn,#f5a524)">· войти заново</span>`:""}
+        <a href="#" onclick="ttDisconnect('${esc(a.open_id)}');return false" title="Отключить аккаунт" style="margin-left:6px">${icon("x","sm")}</a></span>`).join("")}</div>`:""}
+      <div class="card mt" style="background:var(--panel2)"><b>${icon("link","sm")} Ссылки на выложенные ролики ставятся сами</b>
+        <div class="muted" style="font-size:13px;margin-top:4px">После «В TikTok» сервис каждые 10 минут проверяет черновик. Когда вы опубликуете его в приложении и TikTok пропустит ролик в общий доступ (обычно до часа), у клипа появится ссылка, отметка «Выложил» и начнут подтягиваться просмотры. Вставлять ссылку руками не нужно.${t.waiting?` Сейчас ждём публикации: <b>${t.waiting}</b>.`:""}</div>
+        <label class="row mt" style="gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" ${t.video_list?"checked":""} onchange="ttVideoList(this.checked)" style="width:auto">
+          В приложение TikTok добавлен <b>Display API</b> (scope <code>video.list</code>)</label>
+        <div class="hint">Необязательно, но надёжнее: ролик найдётся по списку видео аккаунта, даже если TikTok не сообщит номер поста, а просмотры будут браться прямо из API TikTok, а не со страницы ролика. Как включить: developers.tiktok.com → ваше приложение → <b>Add products → Display API</b>, в Scopes включите <b>video.list</b>, сохраните. Затем поставьте галочку здесь и у каждого стримера нажмите «Войти и привязать» ещё раз.</div></div>`:""}
     <details ${t.configured?"":"open"} class="mt"><summary class="muted" style="cursor:pointer;font-size:13px">${t.configured?"Изменить приложение TikTok":"Как подключить (один раз, ~10 минут)"}</summary>
       <ol class="muted" style="font-size:13px;line-height:1.7;margin:8px 0">
         <li>Зайдите на <a href="https://developers.tiktok.com" target="_blank">developers.tiktok.com</a> (любым вашим аккаунтом TikTok) и нажмите <b>Manage apps → Connect an app</b>. Приложение одно на все аккаунты.</li>
@@ -919,6 +1022,7 @@ async function tiktokCard(){
 }
 async function ttAssign(login, open_id){ try{ await api("/api/tiktok/assign", {streamer:login, open_id}); toast("Сохранено"); tiktokCard(); }catch(e){ toast(e.message,"err"); } }
 async function ttSave(btn){ btn.disabled=true; try{ await api("/api/tiktok/app", {client_key:$("#ttkey").value, client_secret:$("#ttsecret").value}); toast("Сохранено — теперь «Войти в TikTok»"); tiktokCard(); }catch(e){ toast(e.message,"err"); } btn.disabled=false; }
+async function ttVideoList(on){ try{ await api("/api/tiktok/app", {video_list:on}); toast(on?"Теперь войдите в каждый аккаунт ещё раз («Войти и привязать»)":"Выключено"); tiktokCard(); }catch(e){ toast(e.message,"err"); } }
 async function ttDisconnect(open_id){ if(!confirm("Отключить этот аккаунт TikTok?")) return; await api("/api/tiktok/disconnect", {open_id}); tiktokCard(); }
 async function twitchCard(){
   const box = $("#twbox"); if (!box) return;

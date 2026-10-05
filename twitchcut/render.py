@@ -773,6 +773,43 @@ def focus_rect(focus: list[float] | None, sw: int, sh: int, aspect: float, max_g
     return int(x0) // 2 * 2, int(y0) // 2 * 2, int(w) // 2 * 2, int(h) // 2 * 2
 
 
+def fill_rect(focus: list[float] | None, sw: int, sh: int, aspect: float, avoid: list[float] | None = None,
+              min_w: float = 0.2) -> tuple[int, int, int, int]:
+    """«Приблизить максимально»: кадр ровно нужных пропорций внутри важной области (игра, видео) —
+    лишнее по краям обрезается, без размытых полос. Центр — по центру области; если рядом наложена
+    вебка стримера, кадр сдвигается так, чтобы её не захватить."""
+    x, y, w, h = (focus or [0.0, 0.0, 1.0, 1.0])[:4]
+    fx, fy, fw, fh = x * sw, y * sh, w * sw, h * sh
+    if fw / max(1.0, fh) > aspect:
+        cw, ch = fh * aspect, fh
+    else:
+        cw, ch = fw, fw / aspect
+    if cw < min_w * sw:  # слишком сильное увеличение — «мыло»
+        k = min_w * sw / cw
+        cw, ch = cw * k, ch * k
+    if ch > sh:
+        cw, ch = sh * aspect, sh
+    if cw > sw:
+        cw, ch = sw, sw / aspect
+    cx, cy = fx + fw / 2, fy + fh / 2
+    av = (avoid[0] * sw, avoid[1] * sh, avoid[2] * sw, avoid[3] * sh) if avoid else None
+    xs = np.linspace(max(0.0, min(fx, sw - cw)), max(0.0, min(fx + fw - cw, sw - cw)), 9) if cw < fw else \
+        [float(np.clip(cx - cw / 2, 0, sw - cw))]
+    ys = np.linspace(max(0.0, min(fy, sh - ch)), max(0.0, min(fy + fh - ch, sh - ch)), 9) if ch < fh else \
+        [float(np.clip(cy - ch / 2, 0, sh - ch))]
+    best = None
+    for x0 in xs:
+        for y0 in ys:
+            r = (float(x0), float(y0), cw, ch)
+            ov = _overlap(r, av) / (cw * ch) if av else 0.0
+            d = abs(x0 + cw / 2 - cx) / sw + abs(y0 + ch / 2 - cy) / sh
+            key = (round(ov, 2), d)
+            if best is None or key < best[0]:
+                best = (key, r)
+    x0, y0, cw, ch = best[1]
+    return int(x0) // 2 * 2, int(y0) // 2 * 2, int(cw) // 2 * 2, int(ch) // 2 * 2
+
+
 def _fit_panel(src_label: str, rect: tuple, PW: int, PH: int, tag: str, out: str) -> str:
     """Показать область rect в панели PW×PH целиком (без обрезки): по центру, а свободное место —
     размытой копией той же области."""
@@ -794,7 +831,10 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
     W, H = int(r["width"]), int(r["height"])
     sw, sh = li["src_w"], li["src_h"]
     if layout == "screen":
-        rect = focus_rect(focus, sw, sh, W / H, max_grow=1.8, min_w=0.3, min_h=0.3, avoid=li.get("cam_box"))
+        if focus is not None and len(focus) > 4 and focus[4]:  # показать область целиком
+            rect = focus_rect(focus[:4], sw, sh, W / H, max_grow=1.8, min_w=0.3, min_h=0.3, avoid=li.get("cam_box"))
+        else:
+            rect = fill_rect(focus, sw, sh, W / H, avoid=li.get("cam_box"), min_w=0.3)
         return _fit_panel(inp, rect, W, H, tag, out)
     if layout == "split" and li.get("cam") and focus is not None:
         top = int(li.get("top_h") or cam_height(cfg))
@@ -805,7 +845,10 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
         track = li.get("split_track") or li.get("cam_track")
         if lim and lim[1] - lim[0] > cw + 8 and track:
             xc = "'" + _crop_x_expr(track, sw, cw, lo=lim[0], hi=lim[1] - cw, t_shift=t_shift) + "'"
-        rect = focus_rect(focus, sw, sh, W / bot_h, avoid=li.get("cam_box"))
+        if len(focus) > 4 and focus[4]:  # текст доната, чат, переписка — целиком, без обрезки краёв
+            rect = focus_rect(focus[:4], sw, sh, W / bot_h, avoid=li.get("cam_box"))
+        else:                              # игра, видео — приблизить максимально
+            rect = fill_rect(focus, sw, sh, W / bot_h, avoid=li.get("cam_box"))
         return (f"{inp}split=2[{tag}a][{tag}b];"
                 f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{top}[{tag}t];"
                 + _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]") + ";"
@@ -1325,6 +1368,7 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
         pass
     removed = round(dur - tl.cut_dur, 1)
     return {"layout": layout, "layouts": [sg["layout"] for sg in segs],
-            "shots": [{"t0": round(sg["t0"] / tl.speed, 1), "layout": sg["layout"], "focus": sg.get("focus")} for sg in segs], "censored": [[round(s, 2), round(e, 2)] for s, e in censored], "encoder": enc,
+            "shots": [{"t0": round(sg["t0"] / tl.speed, 1), "layout": sg["layout"], "focus": sg.get("focus")} for sg in segs],
+            "words_final": [[w["w"], round(w["s"], 2), round(w["e"], 2)] for w in words_final], "censored": [[round(s, 2), round(e, 2)] for s, e in censored], "encoder": enc,
             "zooms": [round(z, 1) for z in zooms_f], "src_quality": f"{sh}p", "speed": tl.speed,
             "pauses_removed": removed, "pause_cuts": len(tl.keep) - 1, "final_duration": round(D, 1)}

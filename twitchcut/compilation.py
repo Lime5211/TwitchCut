@@ -45,18 +45,15 @@ def pick_clips(job_dir: Path, clips: list[dict], fb: dict, n: int, max_total: fl
     return chosen
 
 
-def build_top(job_dir: Path, clips: list[dict], fb: dict, cfg: dict, n: int = 5) -> dict:
-    chosen = pick_clips(job_dir, clips, fb, n)
-    if len(chosen) < 2:
-        raise TwitchCutError("Для склейки нужно хотя бы 2 готовых клипа (не отклонённых), которые вместе короче 3 минут")
-    order = list(reversed(chosen))  # обратный отсчёт: лучший — в конце
-    k = len(order)
+def concat_with_numbers(paths: list[Path], out: Path, cfg: dict) -> list[float]:
+    """Склеивает ролики по порядку, на первых 2 с каждого — крупная плашка «#N» (обратный отсчёт до #1).
+    Возвращает длительности кусков."""
+    k = len(paths)
     r = cfg["render"]
     W, H = int(r["width"]), int(r["height"])
-    out = job_dir / "clips" / f"top_{k}.mp4"
-    work = job_dir / "clips" / f"top_{k}_work"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    work = out.with_name(out.stem + "_work")
     work.mkdir(parents=True, exist_ok=True)
-    # плашки «#N» на 2 секунды в начале каждого клипа
     hl = _ass_color(r.get("highlight_color", "#FFE135"))
     font = r.get("font", "Arial Black")
     lines = ["[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}", "", "[V4+ Styles]",
@@ -67,22 +64,21 @@ def build_top(job_dir: Path, clips: list[dict], fb: dict, cfg: dict, n: int = 5)
              "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
     t = 0.0
     durs = []
-    for i, c in enumerate(order):
-        d = _duration(c["_path"]) or c["_dur"]
+    for i, p in enumerate(paths):
+        d = _duration(p)
         durs.append(d)
-        place = k - i
-        lines.append(f"Dialogue: 0,{_ass_time(t + 0.05)},{_ass_time(t + min(2.0, d - 0.2))},Num,,0,0,0,,"
-                     f"{{\\pos({W // 2},{int(H * 0.09)})\\fad(120,250)\\fscx80\\fscy80\\t(0,150,\\fscx100\\fscy100)}}#{place}")
+        lines.append(f"Dialogue: 0,{_ass_time(t + 0.05)},{_ass_time(t + max(0.6, min(2.0, d - 0.2)))},Num,,0,0,0,,"
+                     f"{{\\pos({W // 2},{int(H * 0.09)})\\fad(120,250)\\fscx80\\fscy80\\t(0,150,\\fscx100\\fscy100)}}#{k - i}")
         t += d
     (work / "top.ass").write_text("\n".join(lines) + "\n", encoding="utf-8")
     cmd = [ffmpeg_bin(), "-y", "-v", "error"]
-    for c in order:
-        cmd += ["-i", str(c["_path"].resolve())]
+    for p in paths:
+        cmd += ["-i", str(Path(p).resolve())]
     parts = []
-    for i, c in enumerate(order):
+    for i, p in enumerate(paths):
         parts.append(f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
                      f"fps=30,setsar=1,format=yuv420p[v{i}]")
-        if has_audio(c["_path"]):
+        if has_audio(p):
             parts.append(f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{durs[i]:.3f}[a{i}]")
         else:
             parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{durs[i]:.3f}[a{i}]")
@@ -103,12 +99,23 @@ def build_top(job_dir: Path, clips: list[dict], fb: dict, cfg: dict, n: int = 5)
         cmd[i:i + len(vcodec)] = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", *X264_EXTRA]
         run(cmd, cwd=work)
     tmp.replace(out)
-    thumb = out.with_suffix(".jpg")
     run([ffmpeg_bin(), "-y", "-v", "error", "-ss", "1", "-i", str(out.resolve()), "-frames:v", "1", "-vf", "scale=360:-2",
-         str(thumb.resolve())], check=False)
+         str(out.with_suffix(".jpg").resolve())], check=False)
     for p in work.iterdir():
         p.unlink(missing_ok=True)
     work.rmdir()
+    return durs
+
+
+def build_top(job_dir: Path, clips: list[dict], fb: dict, cfg: dict, n: int = 5) -> dict:
+    chosen = pick_clips(job_dir, clips, fb, n)
+    if len(chosen) < 2:
+        raise TwitchCutError("Для склейки нужно хотя бы 2 готовых клипа (не отклонённых), которые вместе короче 3 минут")
+    order = list(reversed(chosen))  # обратный отсчёт: лучший — в конце
+    k = len(order)
+    out = job_dir / "clips" / f"top_{k}.mp4"
+    durs = concat_with_numbers([c["_path"] for c in order], out, cfg)
+    thumb = out.with_suffix(".jpg")
     info = {"file": f"clips/{out.name}", "thumb": f"clips/{thumb.name}", "n": k, "duration": round(sum(durs), 1),
             "clips": [{"n": c["n"], "title": c.get("title"), "place": k - i} for i, c in enumerate(order)],
             "created": time.time(), "v": int(time.time())}

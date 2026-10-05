@@ -113,6 +113,21 @@ def stats(login: str | None = None) -> dict:
     }
 
 
+def stats_by_streamer() -> dict[str, dict]:
+    """Сводка по каждому стримеру отдельно + лучший ролик канала."""
+    out = {}
+    for login in sorted({f.get("streamer") or "" for f in load()}):
+        if not login:
+            continue
+        st = stats(login)
+        best = max((f for f in load() if f.get("streamer") == login and f.get("status") == "posted"
+                    and f.get("views") is not None), key=lambda f: f["views"], default=None)
+        if best:
+            st["best"] = {"title": best.get("title"), "views": best.get("views"), "url": best.get("url")}
+        out[login] = st
+    return out
+
+
 _TECH_NOTE = __import__("re").compile(r"вебк|экран|формат|раскладк|лицо|область|звук и видео|рассинхр|блюр", __import__("re").I)
 
 

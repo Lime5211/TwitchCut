@@ -11,12 +11,18 @@
    (у каждого стримера может быть свой аккаунт — клип уходит в аккаунт своего стримера).
 
 Ограничения TikTok: не больше 5 неопубликованных черновиков за сутки, 6 запросов в минуту.
+
+После отправки TwitchCut сам следит за черновиком: как только вы опубликуете его в приложении и TikTok
+пропустит ролик в общий доступ, ссылка ставится сама, клип отмечается «Выложил» и начинают
+подтягиваться просмотры. Если в приложение TikTok добавлен Display API (scope video.list), ролик
+находится ещё и по списку видео аккаунта, а просмотры берутся напрямую из API, без чтения страницы.
 """
 from __future__ import annotations
 
 import hashlib
 import secrets
 import string
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -32,6 +38,10 @@ AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 API = "https://open.tiktokapis.com/v2"
 SCOPES = "user.info.basic,video.upload"
+SCOPES_LIST = SCOPES + ",video.list"   # если в приложение добавлен Display API
+UPLOADS_PATH = ROOT_DIR / "data" / "tiktok_uploads.json"  # отправленные черновики, за которыми следим
+_up_lock = threading.Lock()
+_track_lock = threading.Lock()
 REDIRECT = "http://127.0.0.1:{port}/tiktok/callback/"
 
 _pending: dict[str, dict] = {}   # state -> {verifier, redirect, at, streamer}
@@ -50,11 +60,25 @@ def app_info() -> dict:
     return read_json(APP_PATH) or {}
 
 
-def save_app(client_key: str, client_secret: str) -> None:
+def save_app(client_key: str, client_secret: str, video_list: bool | None = None) -> None:
+    old = app_info()
     client_key, client_secret = (client_key or "").strip(), (client_secret or "").strip()
+    if not client_key and not client_secret and old.get("client_key") and video_list is not None:
+        write_json(APP_PATH, {**old, "video_list": bool(video_list)})  # меняем только галочку Display API
+        return
     if not client_key or not client_secret:
         raise TwitchCutError("Укажите Client key и Client secret приложения TikTok")
-    write_json(APP_PATH, {"client_key": client_key, "client_secret": client_secret})
+    write_json(APP_PATH, {**old, "client_key": client_key, "client_secret": client_secret,
+                          **({"video_list": bool(video_list)} if video_list is not None else {})})
+
+
+def _scopes() -> str:
+    return SCOPES_LIST if app_info().get("video_list") else SCOPES
+
+
+def has_list(open_id: str) -> bool:
+    """Выдан ли этому аккаунту доступ к списку видео (video.list)."""
+    return "video.list" in ((_tokens().get(open_id) or {}).get("scope") or "")
 
 
 def _tokens() -> dict:
@@ -79,14 +103,17 @@ def accounts() -> list[dict]:
     for oid, t in _tokens().items():
         out.append({"open_id": oid, "name": t.get("display_name") or oid[:10], "avatar": t.get("avatar_url"),
                     "ok": bool(t.get("refresh_token")) and t.get("refresh_expires_at", 0) > time.time(),
-                    "streamers": by.get(oid, [])})
+                    "video_list": "video.list" in (t.get("scope") or ""), "streamers": by.get(oid, [])})
     return out
 
 
 def status() -> dict:
     app = app_info()
     acc = accounts()
-    return {"configured": bool(app.get("client_key")), "connected": any(a["ok"] for a in acc), "accounts": acc}
+    ups = _uploads()
+    waiting = sum(1 for u in ups if not u.get("url") and not u.get("gone") and time.time() - u.get("at", 0) < TRACK_DAYS * 86400)
+    return {"configured": bool(app.get("client_key")), "connected": any(a["ok"] for a in acc), "accounts": acc,
+            "video_list": bool(app.get("video_list")), "waiting": waiting}
 
 
 def disconnect(open_id: str | None = None) -> None:
@@ -112,7 +139,7 @@ def login_url(port: int, streamer: str | None = None) -> str:
     for k in [k for k, v in _pending.items() if time.time() - v["at"] > 900]:
         _pending.pop(k, None)
     _pending[state] = {"verifier": verifier, "redirect": redirect, "at": time.time(), "streamer": streamer or ""}
-    q = {"client_key": app["client_key"], "scope": SCOPES, "redirect_uri": redirect, "state": state,
+    q = {"client_key": app["client_key"], "scope": _scopes(), "redirect_uri": redirect, "state": state,
          "response_type": "code", "code_challenge": challenge, "code_challenge_method": "S256"}
     return AUTH_URL + "?" + urlencode(q)
 
@@ -259,3 +286,171 @@ def upload_draft(path: Path, open_id: str, progress=None) -> dict:
     log.info("TikTok: %s отправлен в черновики (%s, %s)", path.name, pid, st)
     name = (_tokens().get(open_id) or {}).get("display_name") or open_id[:10]
     return {"publish_id": pid, "status": st, "at": time.time(), "account": name}
+
+
+# ------------------------------------------------------------------ слежение за опубликованными черновиками
+TRACK_DAYS = 14
+
+
+def _uploads() -> list[dict]:
+    return read_json(UPLOADS_PATH) or []
+
+
+def _save_uploads(items: list[dict]) -> None:
+    cut = time.time() - 60 * 86400
+    write_json(UPLOADS_PATH, [u for u in items if u.get("at", 0) > cut])
+
+
+def register(res: dict, open_id: str, kind: str, job: str, file: str, duration: float | None,
+             streamer: str | None = None, extra: dict | None = None) -> None:
+    """Запомнить отправленный черновик, чтобы потом найти его публикацию и поставить ссылку."""
+    rec = {"publish_id": res.get("publish_id"), "open_id": open_id, "at": res.get("at") or time.time(),
+           "kind": kind, "job": job, "file": file, "duration": float(duration or 0), "streamer": streamer or "",
+           **(extra or {})}
+    with _up_lock:
+        items = [u for u in _uploads() if not (u.get("job") == job and u.get("file") == file and not u.get("url"))]
+        _save_uploads(items + [rec])
+
+
+def video_url(post_id, username: str | None = None) -> str:
+    # TikTok сам перенаправляет «@_» на настоящий ник автора
+    return f"https://www.tiktok.com/@{username or '_'}/video/{post_id}"
+
+
+def _status(open_id: str, publish_id: str) -> dict:
+    h = {"Authorization": "Bearer " + access_token(open_id), "Content-Type": "application/json; charset=UTF-8"}
+    return _check(requests.post(API + "/post/publish/status/fetch/", headers=h, timeout=20,
+                                json={"publish_id": publish_id}))
+
+
+VIDEO_FIELDS = "id,create_time,duration,share_url,title,video_description,view_count,like_count,comment_count,share_count"
+
+
+def list_videos(open_id: str, since: float, limit: int = 60) -> list[dict]:
+    """Видео аккаунта, опубликованные после since (нужен video.list)."""
+    h = {"Authorization": "Bearer " + access_token(open_id), "Content-Type": "application/json; charset=UTF-8"}
+    out, cursor = [], None
+    while len(out) < limit:
+        body = {"max_count": 20, **({"cursor": cursor} if cursor else {})}
+        d = _check(requests.post(API + "/video/list/?fields=" + VIDEO_FIELDS, headers=h, json=body, timeout=30))
+        vids = d.get("videos") or []
+        out += vids
+        if not d.get("has_more") or not vids or min(v.get("create_time") or 0 for v in vids) < since:
+            break
+        cursor = d.get("cursor")
+    return [v for v in out if (v.get("create_time") or 0) >= since]
+
+
+def query_videos(open_id: str, ids: list[str]) -> dict[str, dict]:
+    """Статистика конкретных видео аккаунта напрямую из API (нужен video.list). {id: video}."""
+    h = {"Authorization": "Bearer " + access_token(open_id), "Content-Type": "application/json; charset=UTF-8"}
+    res = {}
+    for i in range(0, len(ids), 20):
+        d = _check(requests.post(API + "/video/query/?fields=" + VIDEO_FIELDS, headers=h, timeout=30,
+                                 json={"filters": {"video_ids": [str(x) for x in ids[i:i + 20]]}}))
+        for v in d.get("videos") or []:
+            res[str(v.get("id"))] = v
+    return res
+
+
+def video_stats(v: dict) -> dict:
+    """Видео из API -> поля статистики как у tiktok.fetch."""
+    st = {"views": v.get("view_count"), "likes": v.get("like_count"), "comments": v.get("comment_count"),
+          "shares": v.get("share_count"), "video_id": str(v.get("id") or ""), "posted_ts": v.get("create_time"),
+          "tt_duration": v.get("duration"), "tt_desc": (v.get("video_description") or v.get("title") or "")[:300]}
+    if v.get("share_url"):
+        st["url_full"] = v["share_url"]
+    return {k: x for k, x in st.items() if x is not None and x != ""}
+
+
+def _due(u: dict, now: float) -> bool:
+    age = now - u.get("at", now)
+    if u.get("url") or u.get("gone") or age > TRACK_DAYS * 86400:
+        return False
+    period = 600 if age < 2 * 86400 else 3600 if age < 5 * 86400 else 6 * 3600
+    return now - u.get("checked", 0) >= period
+
+
+def track_once(on_found, force: bool = False) -> dict:
+    """Проверяет неопубликованные черновики. on_found(upload, url, stats) вызывается для каждого найденного."""
+    if not _track_lock.acquire(blocking=False):
+        return {"found": 0, "busy": True}
+    try:
+        now = time.time()
+        items = _uploads()
+        todo = [u for u in items if (force and not u.get("url") and not u.get("gone")
+                                     and now - u.get("at", now) < TRACK_DAYS * 86400) or _due(u, now)]
+        if not todo:
+            return {"found": 0, "checked": 0}
+        toks = _tokens()
+        found = 0
+        used = {str(u.get("video_id")) for u in items if u.get("video_id")}
+        lists: dict[str, list] = {}
+        for u in todo:
+            oid = u.get("open_id")
+            if oid not in toks:
+                continue
+            u["checked"] = now
+            post_id, stats = None, {}
+            try:  # 1) статус публикации: после модерации TikTok отдаёт id поста
+                d = _status(oid, u["publish_id"])
+                u["status"] = d.get("status") or u.get("status")
+                ids = d.get("publicaly_available_post_id") or []
+                if ids:
+                    post_id = str(ids[0])
+                if u["status"] == "FAILED":
+                    u["gone"] = True
+                    continue
+            except Exception as e:
+                log.info("TikTok: статус черновика %s: %s", u.get("publish_id"), e)
+            if not post_id and has_list(oid) and u.get("duration"):
+                # 2) по списку видео аккаунта: опубликовано после отправки и совпадает длина
+                try:
+                    if oid not in lists:
+                        since = min(x.get("at", now) for x in todo if x.get("open_id") == oid) - 120
+                        lists[oid] = list_videos(oid, since)
+                    cand = [v for v in lists[oid] if str(v.get("id")) not in used
+                            and (v.get("create_time") or 0) >= u["at"] - 120
+                            and abs(float(v.get("duration") or 0) - u["duration"]) <= 2.5]
+                    if cand:
+                        v = min(cand, key=lambda v: (abs(float(v.get("duration") or 0) - u["duration"]), v.get("create_time") or 0))
+                        post_id, stats = str(v["id"]), video_stats(v)
+                except Exception as e:
+                    log.info("TikTok: список видео аккаунта: %s", e)
+            if post_id:
+                if not stats and has_list(oid):
+                    try:
+                        v = query_videos(oid, [post_id]).get(post_id)
+                        stats = video_stats(v) if v else {}
+                    except Exception as e:
+                        log.info("TikTok: статистика видео %s: %s", post_id, e)
+                url = stats.get("url_full") or video_url(post_id)
+                u.update(video_id=post_id, url=url, found_at=now)
+                used.add(post_id)
+                found += 1
+                try:
+                    on_found(u, url, stats)
+                except Exception as e:
+                    log.warning("TikTok: не удалось отметить выложенный клип: %s", e)
+                log.info("TikTok: черновик опубликован — %s", url)
+        with _up_lock:
+            cur = {(x.get("publish_id")): x for x in _uploads()}
+            for u in todo:
+                if u.get("publish_id") in cur:
+                    cur[u["publish_id"]].update(u)
+            _save_uploads(list(cur.values()))
+        return {"found": found, "checked": len(todo)}
+    finally:
+        _track_lock.release()
+
+
+def start_tracker(on_found, interval: float = 300) -> None:
+    def loop():
+        time.sleep(45)
+        while True:
+            try:
+                track_once(on_found)
+            except Exception as e:
+                log.warning("Слежение за черновиками TikTok: %s", e)
+            time.sleep(interval)
+    threading.Thread(target=loop, name="tiktok-drafts", daemon=True).start()

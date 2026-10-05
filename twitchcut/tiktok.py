@@ -113,6 +113,9 @@ def apply(rec: dict, st: dict) -> dict:
     """Записывает статистику в отметку и дописывает историю просмотров."""
     rec = {**rec, **st, "stats_at": time.time(), "stats_auto": True}
     rec.pop("stats_error", None)
+    full = st.get("url_full") or ""
+    if "/@_/" in (rec.get("url") or "") and is_tiktok(full) and "/@_/" not in full:
+        rec["url"] = full.split("?")[0]  # временная ссылка без ника -> настоящая
     hist = list(rec.get("history") or [])
     if st.get("views") is not None and (not hist or hist[-1][1] != st["views"]):
         hist.append([int(time.time()), int(st["views"])])
@@ -127,11 +130,38 @@ def refresh(force_ids: set | None = None) -> dict:
         return {"updated": 0, "errors": 0, "busy": True}
     try:
         ok = err = 0
+        todo = []
         for rec in feedback.load():
             if force_ids is not None:
                 if rec.get("id") not in force_ids or rec.get("status") != "posted" or not is_tiktok(rec.get("url") or ""):
                     continue
             elif not due(rec):
+                continue
+            todo.append(rec)
+        # ролики своих аккаунтов с доступом video.list — пачкой напрямую из API TikTok
+        api_done = set()
+        try:
+            from . import tiktok_upload as tu
+            by_acc: dict[str, list] = {}
+            for rec in todo:
+                if rec.get("tt_open_id") and rec.get("video_id") and tu.has_list(rec["tt_open_id"]):
+                    by_acc.setdefault(rec["tt_open_id"], []).append(rec)
+            for oid, recs in by_acc.items():
+                try:
+                    vids = tu.query_videos(oid, [r["video_id"] for r in recs])
+                except Exception as e:
+                    log.info("TikTok API: %s", e)
+                    continue
+                for rec in recs:
+                    v = vids.get(str(rec["video_id"]))
+                    if v:
+                        feedback.replace(apply(rec, tu.video_stats(v)))
+                        api_done.add(rec["id"])
+                        ok += 1
+        except Exception as e:
+            log.info("TikTok API статистика: %s", e)
+        for rec in todo:
+            if rec["id"] in api_done:
                 continue
             try:
                 st = fetch(rec["url"])
