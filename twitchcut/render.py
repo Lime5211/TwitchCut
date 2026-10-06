@@ -18,6 +18,9 @@ from .profanity import ProfanityFilter
 from .util import ROOT_DIR, ffmpeg_bin, ffprobe_video, log, run
 
 YUNET = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
+# версия логики раскладки: клипы, смонтированные старой версией, после обновления перемонтируются сами
+# (без запросов к Claude). 2 — в кадре показываются все участники (соведущий на вебке, гость, второй стример)
+LAYOUT_VERSION = 2
 
 
 # ------------------------------------------------------------ face / layout
@@ -384,6 +387,27 @@ def stream_cam(samples: list[tuple[list, list]], prior: dict | None = None) -> d
     res = {"face": [round(best["cx"], 4), round(best["cy"], 4), round(best["fw"], 4)],
            "box": [round(v, 4) for v in box] if box else None, "clips": best["present"], "of": n,
            "updated": __import__("time").time()}
+    # второй участник со СВОЕЙ вебкой (второй стример, гость): маленькое лицо на одном месте почти во всех
+    # клипах, вне рамки главной вебки. Лица из роликов на экране так не держатся — в разных клипах они разные
+    others = []
+    if n >= 2:
+        for cl in clusters:
+            if cl is best or cl.get("present", 0) < max(2, 0.6 * n) or not (0.5 < cl["fw"] / best["fw"] < 2.0):
+                continue
+            if box and box[0] - 0.01 <= cl["cx"] <= box[0] + box[2] + 0.01 and box[1] - 0.01 <= cl["cy"] <= box[1] + box[3] + 0.01:
+                continue  # сидит на той же вебке — его найдёт раскладка клипа
+            if any(abs(cl["cx"] - o["face"][0]) < 0.05 and abs(cl["cy"] - o["face"][1]) < 0.08 for o in others):
+                continue
+            ob = None
+            try:
+                ob = cam_rect_from_edges(frames, cl["cx"], cl["cy"], cl["fw"])
+            except Exception:
+                pass
+            others.append({"face": [round(cl["cx"], 4), round(cl["cy"], 4), round(cl["fw"], 4)],
+                           "box": [round(v, 4) for v in ob] if ob else None, "clips": cl["present"]})
+    if others:
+        res["others"] = others[:2]
+        log.info("Ещё вебки участников: %s", [o["face"] for o in res["others"]])
     log.info("Вебка стримера: лицо %s, рамка %s (в %d из %d клипов)", res["face"], res["box"], best["present"], n)
     return res
 
@@ -600,6 +624,10 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         res["cam_track"] = _track_camera(times, cam_faces, res["camcrop"][2] / sw) or [(0.0, cx)]
         # отдельное, более чуткое слежение для зоны вебки в «вебка + экран»: лицо держим ровно по центру
         res["split_track"] = _track_camera(times, cam_faces, res["cam"][2] / sw, dead_frac=0.07) or [(0.0, cx)]
+        try:
+            _people_on_cam(res, times, faces, box, cam_face, scam, sw, sh, cfg)
+        except Exception as e:  # не должно ломать монтаж
+            log.warning("Поиск второго человека на вебке не удался: %s", e)
 
     # --- лицо крупно (вебка на весь экран, IRL): кадр по лицу со слежением
     big_faces = [[f for f in fs if f[2] >= 0.06 and not (cam_face and abs(f[0] - cam_face[0]) < 0.05
@@ -608,6 +636,10 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         fws = [max(fs, key=lambda f: f[2])[2] for fs in big_faces if fs]
         cys = [max(fs, key=lambda f: f[2])[1] for fs in big_faces if fs]
         res.update(_crop_params(sw, sh, float(np.median(fws)), float(np.median(cys)), times, big_faces))
+        try:
+            _people_full(res, times, big_faces, sw, sh, cfg)
+        except Exception as e:
+            log.warning("Поиск нескольких людей в кадре не удался: %s", e)
 
     # --- режим для каждого кадра
     if cam_rel:
@@ -617,7 +649,9 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
                                                               max(f[2] for f in bf) >= 0.11) >= 0.6 * n
         if scene_full_cam and res.get("crop"):
             # стример переключил сцену на вебку во весь экран: маленькой вебки в кадре нет, есть его крупное лицо
-            modes = ["crop" if bf else "split" for bf in big_faces]
+            full = res.get("full_mode") or "crop"
+            modes = [full if bf else "split" for bf in big_faces]
+            res["screen_active"] = 0.0  # экрана в кадре нет — только камера
         else:
             modes, act = _cam_modes(times, frames, faces, cam_rel, cam_face, words, dur, cfg, hint)
             res.update(act)
@@ -627,13 +661,20 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         except Exception:
             pass
     else:
-        modes = ["crop" if bf else "blur" for bf in big_faces]
+        full = res.get("full_mode") or "crop"
+        if full != "crop":
+            # несколько человек весь клип: держим общую раскладку и там, где детектор на кадре никого не нашёл
+            modes = [full] * n
+        else:
+            modes = ["crop" if bf else "blur" for bf in big_faces]
     res["modes"] = modes
     if want != "auto":
         if want in ("split", "cam") and not cam_rel:
             want = "crop" if res.get("crop") else "blur"
         if want == "crop" and not res.get("crop"):
             want = "cam" if cam_rel else "blur"
+        if want == "crop" and res.get("full_mode") in ("stack", "group"):
+            want = res["full_mode"]  # в кадре несколько человек — показываем всех
         res["layout"] = want
         res["segments"] = [{"t0": 0.0, "t1": dur, "layout": want}]
         return res
@@ -645,6 +686,92 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
     res["segments"] = segs
     res["layout"] = max(segs, key=lambda x: x["t1"] - x["t0"])["layout"]
     return res
+
+
+def _people_on_cam(res: dict, times: list, faces: list, box: list[float], cam_face: tuple, scam: dict | None,
+                   sw: int, sh: int, cfg: dict) -> None:
+    """На вебке не один человек (соведущий сидит рядом) или у второго участника своя вебка —
+    показываем всех: в «вебка + экран» зона вебки берёт всех людей; в «только вебка» — каждый в своей
+    полосе (stack) или общий кадр всех (group_rect)."""
+    from . import people as pp
+    r = cfg["render"]
+    if not r.get("show_all_people", True) or not times:
+        return
+    W, H = int(r["width"]), int(r["height"])
+    fw = cam_face[2]
+    grp = [p for p in pp.find_people(times, faces, region=box, min_share=0.2) if 0.5 < p["w"] / max(fw, 1e-6) < 2.0]
+    bounds: list = [box] * len(grp)
+    for o in (scam or {}).get("others") or []:
+        ox, oy, ofw = o["face"]
+        ob = o.get("box") or _default_cam_box(ox, oy, ofw, sw, sh)
+        mine = pp.find_people(times, faces, region=ob, min_share=0.2)
+        if mine:
+            grp.append(max(mine, key=lambda p: p["share"]))
+            bounds.append(ob)
+    if len(grp) < 2:
+        return
+    order = sorted(range(len(grp)), key=lambda i: (bounds[i][1] + bounds[i][3] / 2 > 0.5, grp[i]["cx"]))
+    grp, bounds = [grp[i] for i in order], [bounds[i] for i in order]
+    res["people"] = len(grp)
+    max_up = float(r.get("cam_max_upscale", 4.5))
+    if len(grp) <= 3 and min(p["share"] for p in grp) >= 0.35:
+        n = len(grp)
+        pan = pp.panels(grp, times, sw, sh, W, H // n // 2 * 2, bounds, max_up, _track_camera)
+        if pan:
+            res["stack"] = pan
+    same_box = all(b == box for b in bounds)
+    if not same_box and not res.get("stack") and len(grp) <= 3:
+        # у каждого своя вебка, общего кадра нет — полосы, пусть и чуть мягче по резкости
+        n = len(grp)
+        pan = pp.panels(grp, times, sw, sh, W, H // n // 2 * 2, bounds, max_up * 1.6, _track_camera)
+        if pan:
+            res["stack"] = pan
+    if same_box:
+        # «вебка + экран»: зона вебки — все люди целиком (по пропорциям самой вебки)
+        top = top_height(box, sw, sh, cfg)
+        res["top_h"] = top
+        res["top_rect"] = pp.expand_to_aspect(pp.group_rect(grp, sw, sh, box), W / top, sw, sh, box)
+        res["group_rect"] = pp.expand_to_aspect(pp.group_rect(grp, sw, sh, box), W / (H * 0.42), sw, sh, box)
+    else:
+        top = int(res.get("top_h") or cam_height(cfg))
+        n = len(grp)
+        pan = pp.panels(grp, times, sw, sh, W // n // 2 * 2, top, bounds, max_up * 1.3, _track_camera)
+        if pan:
+            res["top_panels"] = pan
+    log.info("На вебке/вебках %d человека: %s", len(grp),
+             "по полосам" if res.get("stack") else "общим кадром" if res.get("group_rect") else "по вебкам")
+
+
+def _people_full(res: dict, times: list, big_faces: list, sw: int, sh: int, cfg: dict) -> None:
+    """Камера на весь кадр (IRL, подкаст, сцена «только вебка»), в кадре несколько человек."""
+    from . import people as pp
+    r = cfg["render"]
+    if not r.get("show_all_people", True) or not times or not res.get("crop"):
+        return
+    W, H = int(r["width"]), int(r["height"])
+    grp = pp.find_people(times, big_faces, min_share=0.25)
+    if len(grp) < 2:
+        return
+    res["people"] = len(grp)
+    cw = res["crop"][0]
+    span = (max(p["cx"] + 0.8 * p["w"] for p in grp) - min(p["cx"] - 0.8 * p["w"] for p in grp)) * sw
+    if span <= 0.92 * cw:
+        # все и так помещаются в вертикальный кадр — камера держит центр группы
+        mid = (max(p["cx"] for p in grp) + min(p["cx"] for p in grp)) / 2
+        res["track"] = [(0.0, round(mid, 4))]
+        return
+    max_up = float(r.get("cam_max_upscale", 4.5))
+    if len(grp) <= 3:
+        n = len(grp)
+        pan = pp.panels(grp, times, sw, sh, W, H // n // 2 * 2, [None] * n, max_up, _track_camera)
+        if pan:
+            res["stack"] = pan
+            res["full_mode"] = "stack"
+            log.info("В кадре %d человека — каждый в своей полосе", n)
+            return
+    res["group_rect"] = pp.expand_to_aspect(pp.group_rect(grp, sw, sh), W / (H * 0.5), sw, sh)
+    res["full_mode"] = "group"
+    log.info("В кадре %d человек — общий кадр", len(grp))
 
 
 def _split_cam_crop(box: list[float], face: tuple, sw: int, sh: int, aspect: float, zoom: float = 1.0) -> list[float]:
@@ -823,6 +950,27 @@ def _fit_panel(src_label: str, rect: tuple, PW: int, PH: int, tag: str, out: str
             f"[{tag}fg][{tag}ff]overlay=(W-w)/2:(H-h)/2{out}")
 
 
+def _panels_chain(inp: str, panels: list[dict], PW: int, PH: int, horizontal: bool, sw: int, tag: str, out: str,
+                  t_shift: float = 0.0, total: int | None = None) -> str:
+    """Несколько людей — каждый в своей полосе (друг под другом или рядом). У каждой полосы своя
+    камера, которая следит за своим человеком. total — полный размер по оси склейки (остаток от деления
+    отдаётся последней полосе)."""
+    n = len(panels)
+    sizes = [PH if not horizontal else PW] * n
+    if total:
+        sizes[-1] = total - sum(sizes[:-1])
+    parts = [f"{inp}split={n}" + "".join(f"[{tag}i{k}]" for k in range(n))]
+    for k, p in enumerate(panels):
+        w_, h_ = (PW, sizes[k]) if not horizontal else (sizes[k], PH)
+        xexpr = _crop_x_expr(p.get("track") or [(0.0, (p["lo"] + p["w"] / 2) / sw)], sw, p["w"], lo=p["lo"],
+                             hi=max(p["lo"], p["hi"]), t_shift=t_shift)
+        parts.append(f"[{tag}i{k}]crop=w={p['w']}:h={p['h']}:x='{xexpr}':y={p['y']},"
+                     f"scale={w_}:{h_}:force_original_aspect_ratio=increase:flags=lanczos,crop={w_}:{h_}[{tag}q{k}]")
+    stack = "hstack" if horizontal else "vstack"
+    parts.append("".join(f"[{tag}q{k}]" for k in range(n)) + f"{stack}=inputs={n}{out}")
+    return ";".join(parts)
+
+
 def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str, t_shift: float = 0.0,
                   focus: list[float] | None = None) -> str:
     """Цепочка фильтров одной раскладки: inp → кадр 1080×1920 → out.
@@ -830,43 +978,50 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
     r = cfg["render"]
     W, H = int(r["width"]), int(r["height"])
     sw, sh = li["src_w"], li["src_h"]
+    # --- несколько человек: каждый в своей полосе / общий кадр всех
+    if layout in ("stack", "cam") and li.get("stack"):
+        n = len(li["stack"])
+        return _panels_chain(inp, li["stack"], W, H // n // 2 * 2, False, sw, tag, out, t_shift, total=H)
+    if layout in ("group", "cam") and li.get("group_rect"):
+        return _fit_panel(inp, tuple(li["group_rect"]), W, H, tag, out)
+    if layout in ("stack", "group"):
+        layout = "crop"
     if layout == "screen":
         if focus is not None and len(focus) > 4 and focus[4]:  # показать область целиком
             rect = focus_rect(focus[:4], sw, sh, W / H, max_grow=1.8, min_w=0.3, min_h=0.3, avoid=li.get("cam_box"))
         else:
             rect = fill_rect(focus, sw, sh, W / H, avoid=li.get("cam_box"), min_w=0.3)
         return _fit_panel(inp, rect, W, H, tag, out)
-    if layout == "split" and li.get("cam") and focus is not None:
-        top = int(li.get("top_h") or cam_height(cfg))
-        x, y, cw, ch = li["cam"]
-        bot_h = H - top
-        xc = str(x)
-        lim = li.get("cam_lim")
-        track = li.get("split_track") or li.get("cam_track")
-        if lim and lim[1] - lim[0] > cw + 8 and track:
-            xc = "'" + _crop_x_expr(track, sw, cw, lo=lim[0], hi=lim[1] - cw, t_shift=t_shift) + "'"
-        if len(focus) > 4 and focus[4]:  # текст доната, чат, переписка — целиком, без обрезки краёв
-            rect = focus_rect(focus[:4], sw, sh, W / bot_h, avoid=li.get("cam_box"))
-        else:                              # игра, видео — приблизить максимально
-            rect = fill_rect(focus, sw, sh, W / bot_h, avoid=li.get("cam_box"))
-        return (f"{inp}split=2[{tag}a][{tag}b];"
-                f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{top}[{tag}t];"
-                + _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]") + ";"
-                f"[{tag}t][{tag}d]vstack{out}")
     if layout == "split" and li.get("cam"):
         top = int(li.get("top_h") or cam_height(cfg))
         x, y, cw, ch = li["cam"]
         bot_h = H - top
-        gw = int(min(sw, sh * W / bot_h)) // 2 * 2
-        gx = int(np.clip(li.get("screen_x", (sw - gw) // 2), 0, sw - gw))
         xc = str(x)
         lim = li.get("cam_lim")
         track = li.get("split_track") or li.get("cam_track")
         if lim and lim[1] - lim[0] > cw + 8 and track:
             xc = "'" + _crop_x_expr(track, sw, cw, lo=lim[0], hi=lim[1] - cw, t_shift=t_shift) + "'"
-        return (f"{inp}split=2[{tag}a][{tag}b];"
-                f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{top}[{tag}t];"
-                f"[{tag}b]crop={gw}:{sh}:{gx}:0,scale={W}:{bot_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{bot_h}[{tag}d];"
+        if li.get("top_rect"):        # на вебке несколько человек — в зоне вебки все
+            top_chain = _fit_panel(f"[{tag}a]", tuple(li["top_rect"]), W, top, tag + "u", f"[{tag}t]")
+        elif li.get("top_panels"):    # у участников разные вебки — рядом друг с другом
+            n = len(li["top_panels"])
+            top_chain = _panels_chain(f"[{tag}a]", li["top_panels"], W // n // 2 * 2, top, True, sw, tag + "u",
+                                      f"[{tag}t]", t_shift, total=W)
+        else:
+            top_chain = (f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:"
+                         f"flags=lanczos,crop={W}:{top}[{tag}t]")
+        if focus is not None:
+            if len(focus) > 4 and focus[4]:  # текст доната, чат, переписка — целиком, без обрезки краёв
+                rect = focus_rect(focus[:4], sw, sh, W / bot_h, avoid=li.get("cam_box"))
+            else:                              # игра, видео — приблизить максимально
+                rect = fill_rect(focus, sw, sh, W / bot_h, avoid=li.get("cam_box"))
+            bottom = _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]")
+        else:
+            gw = int(min(sw, sh * W / bot_h)) // 2 * 2
+            gx = int(np.clip(li.get("screen_x", (sw - gw) // 2), 0, sw - gw))
+            bottom = (f"[{tag}b]crop={gw}:{sh}:{gx}:0,scale={W}:{bot_h}:force_original_aspect_ratio=increase:"
+                      f"flags=lanczos,crop={W}:{bot_h}[{tag}d]")
+        return (f"{inp}split=2[{tag}a][{tag}b];" + top_chain + ";" + bottom + ";"
                 f"[{tag}t][{tag}d]vstack{out}")
     if layout == "cam" and li.get("camcrop") and li.get("cam_box") and \
             H / max(1, li["camcrop"][3]) > float(r.get("cam_max_upscale", 4.5)):
@@ -934,7 +1089,13 @@ def text_positions(layout: str, cfg: dict | None = None) -> tuple[int, int]:
             # внизу показываем что-то важное крупно (чат, донат, видео) — субтитры на стыке, чтобы не закрывать
             return top + 8, top
         return int(top + (H - top) * 0.5), top
-    return {"crop": (1340, 330), "cam": (1400, 330), "blur": (1440, 430), "screen": (1500, 430)}.get(layout, (1440, 430))
+    if layout.startswith("stack"):
+        # несколько человек полосами: субтитры на стыке полос (на 2 полосах — по центру, на 3 — на нижнем стыке)
+        H = int(cfg["render"]["height"]) if cfg else 1920
+        n = int(layout[5:] or 2)
+        return (H // 2 if n == 2 else H * (n - 1) // n), 330
+    return {"crop": (1340, 330), "cam": (1400, 330), "blur": (1440, 430), "screen": (1500, 430),
+            "group": (1500, 330)}.get(layout, (1440, 430))
 
 
 def build_ass(words: list[dict], hook: str, layout, cfg: dict, prof: ProfanityFilter | None) -> str:
@@ -1224,6 +1385,9 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     for k in ("track", "cam_track", "split_track"):
         if li.get(k):
             li[k] = [(tl.cut(t), x) for t, x in li[k]]
+    for k in ("stack", "top_panels"):
+        if li.get(k):
+            li[k] = [{**p, "track": [(tl.cut(t), x) for t, x in p.get("track") or []]} for p in li[k]]
     if layout == "cam" and not li.get("camcrop") and li.get("face_cx"):
         li.update(_cam_params(sw, sh, li["face_cx"] / sw, li.get("face_cy", sh // 2) / sh, li.get("face_w", 0.06)))
 
@@ -1251,9 +1415,14 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
                    + layout_chain(sg["layout"], li, cfg, "", f"[p{i}]", f"L{i}", t_shift=sg["t0"],
                                   focus=sg.get("focus")) + ";")
         vf += "".join(f"[p{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v0]"
-    segs_final = [{"t0": sg["t0"] / tl.speed, "t1": sg["t1"] / tl.speed,
-                   "layout": sg["layout"] + ("_focus" if sg.get("focus") and sg["layout"] == "split" else "")}
-                  for sg in segs]
+    def sub_layout(sg: dict) -> str:
+        lay = sg["layout"]
+        if lay in ("stack", "cam") and li.get("stack"):
+            return f"stack{len(li['stack'])}"
+        if lay in ("group", "cam") and li.get("group_rect"):
+            return "group"
+        return lay + ("_focus" if sg.get("focus") and lay == "split" else "")
+    segs_final = [{"t0": sg["t0"] / tl.speed, "t1": sg["t1"] / tl.speed, "layout": sub_layout(sg)} for sg in segs]
 
     # субтитры и заглушение — в итоговой шкале
     words_final = [{**w, "s": tl.final(w["s"]), "e": tl.final(w["e"])} for w in words_rel

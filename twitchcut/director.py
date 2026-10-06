@@ -3,7 +3,8 @@
 когда стример выбирает зрителя; донат, на который он отвечает; видео, на которое он реагирует; игру
 целиком, а не её кусок). Ещё он один раз за стрим проверяет, правильно ли найдена рамка вебки.
 
-Расход: ~20 тыс. токенов на клип (4 картинки по 2×2 кадра + расшифровка). Выключается director.enabled: false.
+Расход: ~6–8 тыс. токенов на клип (до 3 картинок по 2×2 кадра + расшифровка). Не вызывается, когда стример
+просто рассказывает, а экран стоит (director.skip_static_talk). Выключается director.enabled: false.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import numpy as np
 from .util import TwitchCutError, ffmpeg_bin, log, read_json, write_json
 
 VERSION = 5
-TILE_W, TILE_H = 768, 432
+TILE_W, TILE_H = 640, 360
 
 DIRECTOR_SYSTEM = """Ты — режиссёр монтажа вертикальных роликов (TikTok, 9:16) из Twitch-стримов. Тебе показаны кадры клипа
 (подпись t=… — секунды от начала клипа; жёлтая рамка — где на экране вебка стримера; деления по краям — доли кадра
@@ -57,6 +58,9 @@ DIRECTOR_SYSTEM = """Ты — режиссёр монтажа вертикаль
 - Если в начале клипа приходит донат/сообщение, на которое стример отвечает, — первые секунды "split" с focus на донат.
 - Донаты и всплывашки НЕ по теме момента не показывай (кадр не переключай ради них). Если они мешают — верни их в cuts.
 - Если focus меняется (сначала донат, потом видео) — это разные шоты.
+- Все участники разговора должны быть в кадре. Если на вебке несколько человек — "cam"/"split" покажут всех
+  автоматически. Если стример говорит с кем-то, кого видно на ЭКРАНЕ (созвон, второй стример или гость в окне,
+  стрим другого человека), — "split" с focus на этого человека, пока они разговаривают.
 - shots покрывают весь клип от 0 до его длины, по порядку, без пропусков.
 Ещё проверь жёлтую рамку вебки: если она не совпадает с картинкой вебки (захватывает чат/экран или обрезает вебку) —
 верни cam_box с правильной рамкой [x, y, w, h]; если всё верно или вебки нет на кадрах — null.
@@ -248,6 +252,16 @@ def normalize_plan(data: dict, dur: float, min_len: float = 4.0) -> dict:
     return {"shots": merged, "cuts": cuts, "cam_box": _valid_rect(data.get("cam_box")) if data.get("cam_box") else None}
 
 
+def cached_plan(cache: Path | None, dur: float) -> dict | None:
+    """Готовое решение режиссёра из прошлого монтажа (для перемонтажа без запросов к Claude)."""
+    old = read_json(cache) if cache else None
+    if not old or not old.get("plan") or not old["plan"].get("shots"):
+        return None
+    if abs(float(old.get("dur") or old["plan"]["shots"][-1]["t1"]) - dur) > 1.0:
+        return None  # клип с тех пор ужали/расширили — старый план не подходит
+    return old["plan"]
+
+
 def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep: list | None, li: dict,
               cfg: dict, workdir: Path, usage: dict, about: str = "", notes: str = "",
               cache: Path | None = None) -> dict | None:
@@ -255,7 +269,7 @@ def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep:
     from .llm import llm_vision
     rc = cfg.get("director") or {}
     box = li.get("cam_box")
-    times = sample_times(dur, keep, int(rc.get("max_frames", 16)))
+    times = sample_times(dur, keep, int(rc.get("max_frames", 12)))
     key = hashlib.md5(json.dumps([VERSION, round(dur, 1), [round(t, 1) for t in times], box, about[:200], notes[:400],
                                   rc.get("model")], ensure_ascii=False).encode()).hexdigest()[:12]
     if cache:
@@ -300,7 +314,7 @@ def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep:
     if not plan["shots"]:
         return None
     if cache:
-        write_json(cache, {"key": key, "plan": plan})
+        write_json(cache, {"key": key, "plan": plan, "dur": round(dur, 2)})
     return plan
 
 

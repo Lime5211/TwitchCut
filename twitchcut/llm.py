@@ -160,7 +160,7 @@ TOOL = {
 JSON_INSTRUCTION = """
 
 ФОРМАТ ОТВЕТА: строго один JSON-объект без пояснений и без markdown:
-{"clips":[{"id":"c01","keep":true,"score":72,"category":"story","start":31.5,"end":78.0,"cuts":[[44.0,51.5]],"visual":"mixed","screen_spans":[[31.5,40.0]],"titles":["...","..."],"hashtags":["..."],"reason":"..."}]}
+{"clips":[{"id":"<номер кандидата ровно как в заголовке «### Кандидат …»>","keep":true,"score":72,"category":"story","start":31.5,"end":78.0,"cuts":[[44.0,51.5]],"visual":"mixed","screen_spans":[[31.5,40.0]],"titles":["...","..."],"hashtags":["..."],"reason":"..."}]}
 category — одно из: """ + ", ".join(CATEGORIES) + ". Верни запись для КАЖДОГО кандидата."
 
 
@@ -172,7 +172,7 @@ def transcript_lines(words: list[dict], start: float, max_chars: int, peak: floa
     cur_t = None
     last_e = None
     for w in words:
-        if cur and (w["s"] - last_e > 0.6 or len(cur) >= 12 or cur[-1].endswith((".", "!", "?"))):
+        if cur and (w["s"] - last_e > 0.6 or len(cur) >= 16 or (cur[-1].endswith((".", "!", "?")) and len(cur) >= 3)):
             lines.append((cur_t, " ".join(cur)))
             cur = []
         if last_e is not None and w["s"] - last_e > 25:
@@ -239,17 +239,27 @@ def candidate_block(c: dict, words: list[dict], cfg: dict) -> str:
     out.extend(lines or ["(речи нет)"])
     if after:
         out.append("Продолжение после окна (если мысль не закончилась — продли end сюда):")
-        out.extend(_plain_lines(after, st)[:14])
+        out.extend(_plain_lines(after, st)[:int(cfg["llm"].get("max_after_lines", 10))])
     if c.get("chat"):
         out.append("Чат (время от начала окна, отстаёт от событий):")
-        for t, user, text in c["chat"][:15]:
-            out.append(f"[{t - st:.0f}] {text}")
+        seen = set()
+        n_chat = int(cfg["llm"].get("max_chat_lines", 10))
+        for t, user, text in c["chat"]:
+            key = str(text).strip().lower()[:40]
+            if key in seen:  # одинаковые смайлы/пасты подряд ничего не добавляют
+                continue
+            seen.add(key)
+            out.append(f"[{t - st:.0f}] {str(text)[:120]}")
+            if len(seen) >= n_chat:
+                break
     return "\n".join(out)
 
 
 def build_prompt(meta: dict, cands: list[dict], words: list[dict], cfg: dict) -> tuple[str, str]:
     cl = cfg["clips"]
-    ctx = cfg["llm"].get("streamer_context") or ""
+    from .scan import short_context
+    # описание стримера без markdown-разметки; длинное — до разумного предела (имена и мемы — в начале)
+    ctx = short_context(cfg["llm"].get("streamer_context") or "", int(cfg["llm"].get("context_chars", 2500)))
     system = SYSTEM_PROMPT.format(
         today=time.strftime("%d.%m.%Y"),
         min_d=cl["min_duration"], max_d=cl["max_duration"], max_long=cl["max_duration"],
@@ -305,11 +315,40 @@ def _norm_cuts(raw) -> list[list[float]]:
     return sorted(out)
 
 
+def _match_ids(rows: list[dict], cands: list[dict]) -> list[tuple[str, dict]]:
+    """Сопоставляет ответы Claude кандидатам. Claude иногда теряет префикс номера («c07» вместо «L1c07»)
+    или нумерует по порядку («c01, c02…» вместо «L3c13…»): такие ответы раньше выбрасывались, и
+    оплаченная оценка заменялась эвристикой. Теперь: точное совпадение → по окончанию → по порядку."""
+    ids = [c["id"] for c in cands]
+    out, used = [], set()
+    pending = []
+    for r in rows:
+        cid = str(r.get("id", "")).strip()
+        if cid in ids and cid not in used:
+            out.append((cid, r))
+            used.add(cid)
+        else:
+            pending.append((cid, r))
+    rest = []
+    for cid, r in pending:
+        suf = [i for i in ids if i not in used and cid and i.lower().endswith(cid.lower())]
+        if len(suf) == 1:
+            out.append((suf[0], r))
+            used.add(suf[0])
+        else:
+            rest.append(r)
+    free = [i for i in ids if i not in used]
+    if rest and len(rest) == len(free):  # остальные — строго по порядку
+        out += list(zip(free, rest))
+    elif rest:
+        log.warning("Claude вернул %d оценок с непонятными номерами — пропускаю их", len(rest))
+    return out
+
+
 def normalize_result(data: dict, cands: list[dict]) -> dict[str, dict]:
     by_id = {c["id"]: c for c in cands}
     out = {}
-    for r in data.get("clips", []):
-        cid = str(r.get("id", "")).strip()
+    for cid, r in _match_ids(list(data.get("clips", []) or []), cands):
         if cid not in by_id:
             continue
         try:
@@ -368,9 +407,7 @@ def call_api(system: str, user: str, cfg: dict, usage: dict, tool: dict | None =
             continue
         if r.status_code == 200:
             data = r.json()
-            u = data.get("usage") or {}
-            usage["input_tokens"] = usage.get("input_tokens", 0) + u.get("input_tokens", 0)
-            usage["output_tokens"] = usage.get("output_tokens", 0) + u.get("output_tokens", 0)
+            _add_usage(usage, data.get("usage") or {})
             for block in data.get("content", []):
                 if block.get("type") == "tool_use":
                     return block.get("input") or {}
@@ -384,6 +421,21 @@ def call_api(system: str, user: str, cfg: dict, usage: dict, tool: dict | None =
             continue
         raise TwitchCutError(f"Ошибка Anthropic API {r.status_code}: {r.text[:500]}")
     raise TwitchCutError("Anthropic API недоступен после нескольких попыток")
+
+
+USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens", "requests")
+
+
+def _add_usage(usage: dict, u: dict) -> None:
+    """Учёт токенов. input_tokens — всё, что Claude прочитал (как и раньше); cache_read_tokens — сколько из
+    этого пришло из кэша (повтор того же системного промпта в течение нескольких минут: в API такой вход
+    стоит в 10 раз дешевле обычного)."""
+    cr = int(u.get("cache_read_input_tokens") or 0)
+    usage["input_tokens"] = usage.get("input_tokens", 0) + int(u.get("input_tokens") or 0) + cr \
+        + int(u.get("cache_creation_input_tokens") or 0)
+    usage["cache_read_tokens"] = usage.get("cache_read_tokens", 0) + cr
+    usage["output_tokens"] = usage.get("output_tokens", 0) + int(u.get("output_tokens") or 0)
+    usage["requests"] = usage.get("requests", 0) + 1
 
 
 def find_claude() -> str | None:
@@ -478,10 +530,7 @@ def call_claude_cli(system: str, user: str, cfg: dict, usage: dict, workdir: Pat
         if env.get("is_error"):
             raise TwitchCutError("Claude Code: " + str(env.get("result"))[:500])
         text = env.get("result") or ""
-        u = env.get("usage") or {}
-        usage["input_tokens"] = usage.get("input_tokens", 0) + int(u.get("input_tokens") or 0) \
-            + int(u.get("cache_read_input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
-        usage["output_tokens"] = usage.get("output_tokens", 0) + int(u.get("output_tokens") or 0)
+        _add_usage(usage, env.get("usage") or {})
         usage["model"] = model
     except json.JSONDecodeError:
         text = raw
@@ -532,10 +581,7 @@ def call_claude_cli_blocks(system: str, blocks: list[dict], cfg: dict, usage: di
         raise TwitchCutError("Claude Code (картинки) завершился с ошибкой: " + err)
     if result.get("is_error"):
         raise TwitchCutError("Claude Code: " + str(result.get("result"))[:400])
-    u = result.get("usage") or {}
-    usage["input_tokens"] = usage.get("input_tokens", 0) + int(u.get("input_tokens") or 0) \
-        + int(u.get("cache_read_input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
-    usage["output_tokens"] = usage.get("output_tokens", 0) + int(u.get("output_tokens") or 0)
+    _add_usage(usage, result.get("usage") or {})
     return extract_json(result.get("result") or "")
 
 

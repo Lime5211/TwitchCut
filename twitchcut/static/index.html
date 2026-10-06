@@ -400,9 +400,9 @@ async function renderJob(){
   const u = st.llm_usage || {};
   const meta = [st.channel, st.duration?fmt(st.duration):"", st.chat_messages!=null?`чат: ${st.chat_messages.toLocaleString("ru-RU")} сообщ.`:"",
     st.candidates?.length?`кандидатов: ${st.candidates.length}`:"",
-    u.backend==="claude-cli" && !u.fallback ? `Claude ${(u.model||"").replace(/^./,c=>c.toUpperCase())}: ${((u.input_tokens||0)+(u.output_tokens||0)).toLocaleString("ru-RU")} токенов` : "",
+    u.backend==="claude-cli" && !u.fallback ? `Claude ${(u.model||"").replace(/^./,c=>c.toUpperCase())}: ${((u.input_tokens||0)+(u.output_tokens||0)).toLocaleString("ru-RU")} токенов${u.cache_read_tokens?` (из кэша ${u.cache_read_tokens.toLocaleString("ru-RU")})`:""}` : "",
     u.cost_usd!=null?`API: $${u.cost_usd}`:"",
-    st.director_usage?.input_tokens?`режиссёр: ${((st.director_usage.input_tokens||0)+(st.director_usage.output_tokens||0)).toLocaleString("ru-RU")} токенов`:"",
+    st.director_usage?.input_tokens?`режиссёр: ${((st.director_usage.input_tokens||0)+(st.director_usage.output_tokens||0)).toLocaleString("ru-RU")} токенов${st.director_usage.cache_read_tokens?` (из кэша ${st.director_usage.cache_read_tokens.toLocaleString("ru-RU")})`:""}`:"",
     st.quality?`качество: ${st.quality}`:""].filter(Boolean).map(esc).join(" · ");
   let h = `<div class="page"><div class="card">
     <div class="row" style="align-items:flex-start">${ava(st.streamer_avatar,"lg")}

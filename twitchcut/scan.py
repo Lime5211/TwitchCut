@@ -15,7 +15,7 @@ from .util import ProgressFn, TwitchCutError, fmt_time, log, noop_progress, read
 
 SCAN_KINDS = ["story", "news", "info", "hot_take", "emotional", "drama", "funny", "chat", "fail", "epic", "other"]
 
-SCAN_SYSTEM = """Ты — продюсер TikTok-аккаунта с нарезками Twitch-стримов. Тебе дан кусок расшифровки стрима с таймкодами [ч:мм:сс] и пометками об активности чата. Сегодня {today}.
+SCAN_SYSTEM = """Ты — продюсер TikTok-аккаунта с нарезками Twitch-стримов. Тебе дан кусок расшифровки стрима с таймкодами ([мм:сс], после часа — [ч:мм:сс]) и пометками об активности чата. Сегодня {today}.
 
 Задача: найти фрагменты, из которых получится самостоятельный короткий ролик, интересный людям, которые НЕ знают стримера. Чат и громкость — лишь подсказка; особенно ищи то, что по чату не видно:
 - story — история из жизни с завязкой и концовкой (странная, смешная, жизненная, откровенная);
@@ -33,7 +33,7 @@ SCAN_SYSTEM = """Ты — продюсер TikTok-аккаунта с нарез
 НЕ включай и то, что TikTok режет или что опасно выкладывать: реальное насилие и жестокие аварии, оружие, смерть, наркотики, 18+.
 Если посреди фрагмента «тишина … упал стрим» и после неё тема не продолжается — фрагмент не законченный, не бери его (или закончи до обрыва, если смысл уже есть).
 
-Для каждого фрагмента: start и end — абсолютные таймкоды в секундах стрима (смотри [ч:мм:сс] перед строками), длина — сколько нужно, чтобы фрагмент был законченным (от 10 с до 5 минут — сколько нужно самому моменту, без подгонки под шаблон; обычно хватает 20–75 с самой сути): от начала завязки до развязки/вывода, без воды. ГЛАВНОЕ — не обрывать: end ставь только ПОСЛЕ того, как история/мысль досказана (развязка, вывод, реакция). Клипы, которые обрываются на самом интересном, автор отклоняет чаще всего. Начало — там, где начинается суть (крючок или минимально нужный контекст), а не долгая подводка к ней. Описательный рассказ без поворота, панчлайна, конфликта или полезного вывода — не бери (автор такое отклоняет как скучное). topic — о чём фрагмент, 4–10 слов. why — почему зайдёт в TikTok, одно предложение. score — предварительная оценка 0–100 (85+ сильно, 70+ хорошо, ниже 55 не возвращай).
+Для каждого фрагмента: start и end — абсолютные таймкоды в секундах стрима (смотри [мм:сс] или [ч:мм:сс] перед строками; переведи в секунды), длина — сколько нужно, чтобы фрагмент был законченным (от 10 с до 5 минут — сколько нужно самому моменту, без подгонки под шаблон; обычно хватает 20–75 с самой сути): от начала завязки до развязки/вывода, без воды. ГЛАВНОЕ — не обрывать: end ставь только ПОСЛЕ того, как история/мысль досказана (развязка, вывод, реакция). Клипы, которые обрываются на самом интересном, автор отклоняет чаще всего. Начало — там, где начинается суть (крючок или минимально нужный контекст), а не долгая подводка к ней. Описательный рассказ без поворота, панчлайна, конфликта или полезного вывода — не бери (автор такое отклоняет как скучное). topic — о чём фрагмент, 4–10 слов. why — почему зайдёт в TikTok, одно предложение. score — предварительная оценка 0–100 (85+ сильно, 70+ хорошо, ниже 55 не возвращай).
 Верни не больше {limit} лучших фрагментов. Если ничего достойного — пустой список.
 {streamer_context}"""
 
@@ -72,7 +72,21 @@ kind — одно из: """ + ", ".join(SCAN_KINDS) + "."
 
 def _hms(t: float) -> str:
     t = int(t)
+    if t < 3600:
+        return f"{t // 60}:{t % 60:02d}"  # [мм:сс] — короче, меньше токенов на каждую строку
     return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}"
+
+
+_FILLER = None
+
+
+def _is_filler(w: str) -> bool:
+    """Слова-паразиты, которые не несут смысла для поиска момента (эээ, ммм) — в просмотре не нужны."""
+    global _FILLER
+    if _FILLER is None:
+        import re
+        _FILLER = re.compile(r"^(э+|м+|а-а+|э-э+|хм+|ммм+|ээ+м*)[.,!?…]*$", re.I)
+    return bool(_FILLER.match(w.strip()))
 
 
 def chat_minutes(chat: list, duration: float, delay: float) -> dict[int, str]:
@@ -111,7 +125,11 @@ def transcript_text(words: list[dict], start: float, end: float, chat_marks: dic
     for w in words:
         if w["s"] < start or w["s"] >= end:
             continue
-        if cur and (w["s"] - last_e > 1.2 or len(cur) >= 22 or (cur[-1].endswith((".", "!", "?")) and len(cur) >= 6)):
+        if _is_filler(w["w"]):
+            continue
+        # строки подлиннее (до ~30 слов, разрыв на паузе > 1.5 с или конце длинной фразы): таймкод каждые
+        # 8–12 с — этого хватает, чтобы найти фрагмент, а точные границы потом ставит оценка
+        if cur and (w["s"] - last_e > 1.5 or len(cur) >= 30 or (cur[-1].endswith((".", "!", "?")) and len(cur) >= 14)):
             lines.append(f"[{_hms(cur_t)}] " + " ".join(cur))
             cur = []
         if last_e is not None and w["s"] - last_e > 25:
@@ -138,24 +156,25 @@ def scan_stream(meta: dict, tr: dict, chat: list, cfg: dict, job_dir: Path, usag
     if not words or dur <= 0:
         return []
     chunk = float(sc["chunk_minutes"]) * 60
-    overlap = 180.0  # запас на стыке кусков, чтобы история не обрывалась на границе
+    overlap = 150.0  # запас на стыке кусков, чтобы история не обрывалась на границе
     marks = chat_minutes(chat, dur, float(cfg["candidates"]["chat_delay_sec"]))
     parts_dir = job_dir / "scan_parts"
     parts_dir.mkdir(exist_ok=True)
     import time as _t
-    ctx = cfg["llm"].get("streamer_context") or ""
+    ctx = short_context(cfg["llm"].get("streamer_context") or "", int(sc.get("context_chars", 700)))
+    # куски одинаковой длины: вместо «25 + 25 + хвост 10 мин» (три запроса с одним и тем же системным
+    # промптом) — два по 32 мин; так меньше повторов и стыков
+    span = max(1.0, dur - start)
+    n_chunks = max(1, int(np.ceil((span - 60) / chunk)))
+    chunk = span / n_chunks
     limit = max(3, int(round(sc["per_hour"] * chunk / 3600)))
     system = SCAN_SYSTEM.format(today=_t.strftime("%d.%m.%Y"), limit=limit,
-                                streamer_context=("\nО СТРИМЕРЕ:\n" + ctx.strip()) if ctx.strip() else "")
+                                streamer_context=("\nО СТРИМЕРЕ:\n" + ctx) if ctx else "")
     from .feedback import prompt_block
-    fb = prompt_block(cfg["llm"].get("streamer_login") or None, max_pos=5, max_neg=5)
+    fb = prompt_block(cfg["llm"].get("streamer_login") or None, max_pos=4, max_neg=4, quote_chars=90)
     if fb:
         system += "\n\n" + fb
-    starts = []
-    s = start
-    while s < dur - 30:
-        starts.append(s)
-        s += chunk
+    starts = [start + k * chunk for k in range(n_chunks)]
     found: list[dict] = []
     model = sc.get("model") or cfg["llm"].get("cli_model") or "sonnet"
     for i, s in enumerate(starts):
@@ -211,6 +230,20 @@ def scan_stream(meta: dict, tr: dict, chat: list, cfg: dict, job_dir: Path, usag
     progress("scan", 1.0, f"Найдено по смыслу: {len(uniq)}")
     log.info("Смысловой просмотр: %d фрагментов", len(uniq))
     return uniq
+
+
+def short_context(ctx: str, max_chars: int) -> str:
+    """Описание стримера для просмотра — коротко: имя, как его называют, о чём стримы. Без markdown-разметки
+    (звёздочки и решётки — лишние токены). Полностью описание идёт в оценку, где пишутся названия."""
+    import re
+    t = re.sub(r"[*#`_]+", "", ctx or "")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n\s*\n+", "\n", t).strip()
+    if len(t) <= max_chars:
+        return t
+    cut = t[:max_chars]
+    cut = cut[:max(cut.rfind("\n"), cut.rfind(". ") + 1, int(max_chars * 0.6))]
+    return cut.strip() + " …"
 
 
 def _overlap(a: dict, b: dict) -> float:

@@ -20,7 +20,7 @@ import numpy as np
 from . import chat as chatmod
 from .llm import LONG_CATEGORIES, rank_candidates
 from .profanity import ProfanityFilter
-from .render import detect_layout, render_clip
+from .render import LAYOUT_VERSION, detect_layout, render_clip
 from .signals import audio_loudness, find_candidates
 from .sources import Source
 from .transcribe import Transcriber, slice_words
@@ -325,7 +325,8 @@ class Job:
 
             ranking, usage = rank_candidates(meta, cands, tr["words"], self.cfg, self.dir, self.progress, wait)
             scan_u = read_json(self.dir / "scan_usage.json") or {}
-            for k in ("input_tokens", "output_tokens"):
+            from .llm import USAGE_KEYS
+            for k in USAGE_KEYS:
                 usage[k] = usage.get(k, 0) + scan_u.get(k, 0)
             if scan_u.get("cost_usd") or usage.get("cost_usd") is not None:
                 usage["cost_usd"] = round((usage.get("cost_usd") or 0) + (scan_u.get("cost_usd") or 0), 4)
@@ -521,7 +522,10 @@ class Job:
         return words
 
     def _render_one(self, c: dict, words: list[dict], src: Path, offset: float, out: Path,
-                    prof: ProfanityFilter, speed: float, trim: bool) -> tuple[dict, list]:
+                    prof: ProfanityFilter, speed: float, trim: bool, director_mode: str = "new") -> tuple[dict, list]:
+        """Монтаж одного клипа. director_mode: new — режиссёр как обычно; cache — сначала готовый план из
+        прошлого монтажа (перемонтаж по кнопке), cache_only — вообще без запросов к Claude."""
+        reuse_only = director_mode == "cache_only"
         from .render import find_pauses
         dur = c["end"] - c["start"]
         words = self._synced_words(c, slice_words(words, c["start"] - 15, c["end"] + 15), src, offset)
@@ -551,28 +555,42 @@ class Job:
         if self.cfg["render"].get("layout") == "auto" and director.enabled(self.cfg):
             try:
                 li = detect_layout(src, offset, dur, self.cfg, words_rel, hint)
-                if li.get("cam"):  # есть вебка — решаем, что показывать, глядя на кадры
+                rc = self.cfg.get("director") or {}
+                # стример просто рассказывает (так решил Claude по смыслу), а экран весь клип стоит —
+                # и без режиссёра ясно, что нужна только вебка; не тратим на это запрос с картинками
+                static_talk = (rc.get("skip_static_talk", True) and c.get("visual") == "talk"
+                               and float(li.get("screen_active", 1.0)) <= 0.1)
+                cache = self.dir / "segments" / f"{c.get('cand') or c.get('candidate')}.director.json"
+                planned = director.cached_plan(cache, dur) if director_mode != "new" else None
+                if li.get("cam") and planned:
+                    dplan = planned  # перемонтаж: режиссёр уже решал по этому клипу — токены не тратим
+                elif li.get("cam") and not reuse_only and not static_talk:  # есть вебка — решаем, глядя на кадры
                     usage = self.state.get("director_usage") or {}
                     about = f"О чём: «{c.get('title') or ''}» ({c.get('category') or ''}). {c.get('reason') or ''}"
                     from . import feedback
                     notes = feedback.edit_notes(self.cfg["llm"].get("streamer_login"))
                     dplan = director.plan_clip(src, offset, dur, words_rel, keep or [(0.0, dur)], li, self.cfg,
-                                               self.dir, usage, about=about, notes=notes,
-                                               cache=self.dir / "segments" / f"{c.get('cand') or c.get('candidate')}.director.json")
+                                               self.dir, usage, about=about, notes=notes, cache=cache)
                     self.update(director_usage=usage)
-                    if dplan:
-                        if dplan["cuts"]:
-                            keep = subtract_intervals(keep or [(0.0, dur)], [tuple(x) for x in dplan["cuts"]])
-                            words_rel = [w for w in words_rel
-                                         if not any(a <= (w["s"] + w["e"]) / 2 <= b for a, b in dplan["cuts"])]
-                            cuts = cuts + [tuple(x) for x in dplan["cuts"]]
-                        li = director.apply_plan(li, dplan)
+                elif li.get("cam") and static_talk and not reuse_only:
+                    log.info("Клип %s: рассказ при неподвижном экране — только вебка, без режиссёра",
+                             c.get("cand") or c.get("candidate"))
+                if dplan:
+                    if dplan["cuts"]:
+                        keep = subtract_intervals(keep or [(0.0, dur)], [tuple(x) for x in dplan["cuts"]])
+                        words_rel = [w for w in words_rel
+                                     if not any(a <= (w["s"] + w["e"]) / 2 <= b for a, b in dplan["cuts"])]
+                        cuts = cuts + [tuple(x) for x in dplan["cuts"]]
+                    li = director.apply_plan(li, dplan)
             except Exception as e:  # режиссёр — улучшение, а не обязательный шаг
                 log.warning("ИИ-режиссёр не сработал для клипа %s: %s — раскладка по кадрам", c.get("cand"), e)
                 dplan = None
         info = render_clip(src, offset, dur, words_rel, hook, out, self.cfg, prof, layout_info=li,
                            zooms=self.reaction_peaks(c["start"], c["end"]), keep=keep, speed=speed, layout_hint=hint)
         info["director"] = bool(dplan)
+        info["layout_v"] = LAYOUT_VERSION
+        if li and li.get("people"):
+            info["people"] = li["people"]
         if dplan:
             info["director_shots"] = [{k: s_[k] for k in ("t0", "t1", "layout", "focus", "why")} for s_ in dplan["shots"]]
         info["content_cut_sec"] = round(sum(b - a for a, b in cuts), 1)
@@ -622,8 +640,10 @@ class Job:
         write_json(p, clips)
         return self.rerender_clip(n, speed, trim, layout)
 
-    def rerender_clip(self, n: int, speed: float, trim: bool, layout: str | None = None) -> dict:
-        """Перемонтировать один готовый клип: другое ускорение и/или вырезание пауз."""
+    def rerender_clip(self, n: int, speed: float, trim: bool, layout: str | None = None,
+                      director_mode: str = "cache") -> dict:
+        """Перемонтировать один готовый клип: другое ускорение и/или вырезание пауз. Решение режиссёра
+        берётся из прошлого монтажа (если клип не ужимали) — Claude заново не спрашиваем."""
         p = self.dir / "clips.json"
         clips = read_json(p) or []
         c = next((x for x in clips if x.get("n") == n), None)
@@ -646,7 +666,7 @@ class Job:
             self.cfg["render"]["layout"] = layout
         try:
             info, _ = self._render_one({**c, "cand": c["candidate"]}, tr["words"], src, offset, out, prof,
-                                       max(0.5, min(2.0, speed)), trim)
+                                       max(0.5, min(2.0, speed)), trim, director_mode=director_mode)
         finally:
             self.cfg["render"]["layout"] = saved
         info["layout_choice"] = layout
@@ -657,6 +677,53 @@ class Job:
                 x.update(trim_pauses=trim, v=int(time.time()))
         write_json(p, clips)
         return next(x for x in clips if x.get("n") == n)
+
+    def relayout_outdated(self, skip: set | None = None, on_clip=None) -> int:
+        """После обновления раскладки: перемонтировать готовые клипы этой задачи по-новому — без запросов
+        к Claude (оценка, границы, вырезки и решения режиссёра — из прошлого монтажа). Клип монтируется
+        заново, только если новая раскладка что-то меняет (например, в кадре несколько человек);
+        остальным просто ставится отметка новой версии. skip — номера клипов, которые не трогать
+        (уже выложенные). Возвращает, сколько клипов перемонтировано."""
+        p = self.dir / "clips.json"
+        clips = read_json(p) or []
+        todo = [c for c in clips if int(c.get("layout_v") or 1) < LAYOUT_VERSION and c.get("n") not in (skip or set())
+                and c.get("candidate")]
+        if not todo:
+            return 0
+        meta = read_json(self.dir / "meta.json") or {}
+        if meta:
+            self._apply_streamer(meta)
+        sc = read_json(self.dir / "stream_cam.json")
+        if sc and not self.cfg["render"].get("cam_rect"):
+            self.cfg["render"]["stream_cam"] = sc
+        done = 0
+        for c in todo:
+            seg_meta = read_json(self.dir / "segments" / f"{c['candidate']}.json") or {}
+            src = Path(seg_meta.get("file") or "")
+            stamp = {"layout_v": LAYOUT_VERSION}
+            if not seg_meta or not src.exists():
+                stamp["relayout_skipped"] = "видео фрагмента уже удалено автоочисткой"
+            else:
+                try:
+                    offset = float(c["start"]) - float(seg_meta["t0"])
+                    li = detect_layout(src, offset, float(c["end"]) - float(c["start"]), self.cfg)
+                    if (li.get("people") or 0) >= 2:
+                        if on_clip:
+                            on_clip(c)
+                        log.info("Перемонтаж клипа %s (%s): в кадре %d человека", c.get("n"), self.dir.name, li["people"])
+                        self.rerender_clip(c["n"], float(c.get("speed") or 1.0), bool(c.get("trim_pauses", True)),
+                                           c.get("layout_choice"), director_mode="cache_only")
+                        stamp["relayout"] = int(time.time())
+                        done += 1
+                except Exception as e:
+                    log.warning("Перемонтаж клипа %s (%s) не удался: %s", c.get("n"), self.dir.name, e)
+                    stamp["relayout_skipped"] = str(e)[:200]
+            clips = read_json(p) or clips
+            for x in clips:
+                if x.get("n") == c["n"]:
+                    x.update(stamp)
+            write_json(p, clips)
+        return done
 
     def render_list(self, chosen: list[dict], words: list[dict], n0: int, partial_path: Optional[Path] = None,
                     prev: Optional[list] = None) -> list[dict]:

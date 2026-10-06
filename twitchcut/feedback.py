@@ -128,10 +128,12 @@ def stats_by_streamer() -> dict[str, dict]:
     return out
 
 
-_TECH_NOTE = __import__("re").compile(r"вебк|экран|формат|раскладк|лицо|область|звук и видео|рассинхр|блюр", __import__("re").I)
+_TECH_NOTE = __import__("re").compile(
+    r"вебк|экран|формат|раскладк|лиц[оауе]\b|по лицу|област|звук и видео|рассинхр|блюр|в кадре|кадр[еау]?\b|"
+    r"(2|два|двое|двух|втор\w*)\s+(стример|человек|участник)", __import__("re").I)
 
 
-def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10) -> str:
+def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10, quote_chars: int = 120) -> str:
     """Текст для промпта: что залетело, что нет, что отклонено. Пусто, если отметок ещё нет."""
     allf = load()
     items = [f for f in allf if f.get("streamer") == login] if login else allf
@@ -151,8 +153,8 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10) -> str:
         cat = CAT_RU.get(f.get("category") or "", f.get("category") or "")
         title = (f.get("title") or f.get("topic") or "").strip()
         text = (f.get("text") or "").strip().replace("\n", " ")
-        if len(text) > 160:
-            text = text[:160] + "…"
+        if len(text) > quote_chars:
+            text = text[:quote_chars].rsplit(" ", 1)[0] + "…"
         return f"- [{cat}, {extra}] «{title}»" + (f" — «{text}»" if text else "")
 
     def views_txt(f: dict) -> str:

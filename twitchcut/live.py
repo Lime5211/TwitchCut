@@ -289,10 +289,11 @@ class LiveJob(Job):
         self._check_stop()
         # 7. оценка и монтаж сильных моментов
         ranking, u2 = rank_candidates(meta_now, cands, tr["words"], self.cfg, self.dir, self.progress)
-        for k in ("input_tokens", "output_tokens"):
+        from .llm import USAGE_KEYS
+        for k in USAGE_KEYS:
             usage[k] = usage.get(k, 0) + u2.get(k, 0)
         tot = self.state.get("llm_usage") or {"backend": self.cfg["llm"]["backend"]}
-        for k in ("input_tokens", "output_tokens"):
+        for k in USAGE_KEYS:
             tot[k] = tot.get(k, 0) + usage.get(k, 0)
         tot["model"] = self.cfg["llm"].get("cli_model")
         if u2.get("warning"):

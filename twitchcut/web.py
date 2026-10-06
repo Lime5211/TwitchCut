@@ -43,6 +43,7 @@ class Manager:
         self.port = 8765
         self.render_errors: dict[str, str] = {}
         self._cleanup_stale()
+        threading.Thread(target=self._relayout_outdated, daemon=True, name="relayout").start()
         self.live_jobs: dict[str, tuple] = {}      # vod-job id -> (LiveJob, Thread)
         self.live_status: dict[str, dict] = {}     # login -> статус эфира
         threading.Thread(target=self._watcher, daemon=True).start()
@@ -164,6 +165,43 @@ class Manager:
             except Exception as e:
                 log.warning("Не удалось продолжить %s: %s", jid, e)
 
+    def _relayout_outdated(self) -> None:
+        """После обновления программы готовые клипы перемонтируются по новой раскладке — без запросов к
+        Claude (всё, что он решил, сохранено). Меняются только клипы, где новая раскладка что-то даёт
+        (например, в кадре несколько человек); уже выложенные в TikTok не трогаются."""
+        from .pipeline import Job, heavy
+        from .render import LAYOUT_VERSION
+        from . import feedback
+        time.sleep(20)  # сначала пусть поднимется интерфейс и продолжатся прерванные задачи
+        dirs = sorted((d for d in self.ws.iterdir() if (d / "clips.json").exists()),
+                      key=lambda d: (d / "clips.json").stat().st_mtime, reverse=True)
+        for d in dirs:
+            try:
+                clips = read_json(d / "clips.json") or []
+                if not any(int(c.get("layout_v") or 1) < LAYOUT_VERSION for c in clips):
+                    continue
+                st = read_json(d / "job.json") or {}
+                if not st.get("ref") or st.get("status") in ("live", "running", "queued", "awaiting_llm"):
+                    continue  # идущую задачу не трогаем: её новые клипы и так монтируются по-новому
+                fb = feedback.for_job(d.name)
+                posted = {c.get("n") for c in clips if (fb.get(c.get("file")) or {}).get("status") == "posted"}
+                cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
+                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=d.name)
+
+                def on_clip(c, _id=d.name):
+                    for k in [k for k, v in self.rendering.items() if k.startswith(_id + "/") and v.get("relayout")]:
+                        self.rendering.pop(k, None)
+                    self.rendering[f"{_id}/{c['n']}"] = {"status": "rendering", "relayout": True}
+                with heavy(f"перемонтаж клипов «{st.get('title') or d.name}» по новой раскладке"):
+                    n = job.relayout_outdated(skip=posted, on_clip=on_clip)
+                if n:
+                    log.info("Задача %s: перемонтировано клипов по новой раскладке: %d", d.name, n)
+            except Exception as e:
+                log.warning("Перемонтаж клипов %s не удался: %s", d.name, e)
+            finally:
+                for k in [k for k, v in self.rendering.items() if k.startswith(d.name + "/") and v.get("relayout")]:
+                    self.rendering.pop(k, None)
+
     # --------------------------------------------------------- one clip
     def rerender_clip(self, job_id: str, n: int, speed: float, trim: bool, layout: str | None = None,
                       action: str = "render", target: float | None = None) -> None:
@@ -179,7 +217,8 @@ class Manager:
             from .pipeline import Job, heavy
             try:
                 cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
-                job = Job(st["ref"], cfg, options=st.get("options") or {})
+                # job_id — папка этой задачи (у эфира это live_<id>, а не vod_<id>)
+                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=job_id)
                 with heavy(f"перемонтаж клипа {n}"):
                     self.rendering[key]["status"] = "shortening" if action == "shorten" else "rendering"
                     if action == "shorten":
