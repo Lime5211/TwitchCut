@@ -213,7 +213,7 @@ class Manager:
             raise TwitchCutError("Задача не найдена")
         self.rendering[key] = {"speed": speed, "trim": trim, "status": "waiting"}
 
-        def target():
+        def work():  # не «target»: так называется параметр с целевой длиной для «ужать»
             from .pipeline import Job, heavy
             try:
                 cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
@@ -234,7 +234,36 @@ class Manager:
                 self.rendering.pop(key, None)
 
         self.render_errors.pop(key, None)
-        threading.Thread(target=target, daemon=True).start()
+        threading.Thread(target=work, daemon=True).start()
+
+    def render_moment(self, job_id: str, cid: str) -> None:
+        """Смонтировать любой найденный момент по уже готовой оценке Claude."""
+        key = f"{job_id}/m:{cid}"
+        if key in self.rendering:
+            raise TwitchCutError("Этот момент уже монтируется")
+        st = read_json(self.ws / job_id / "job.json") or {}
+        if not st.get("ref"):
+            raise TwitchCutError("Задача не найдена")
+        if st.get("status") in ("running", "queued"):
+            raise TwitchCutError("Дождитесь окончания анализа")
+        self.rendering[key] = {"status": "waiting"}
+
+        def work():
+            from .pipeline import Job, heavy
+            try:
+                cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
+                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=job_id)
+                with heavy(f"монтаж момента {cid}"):
+                    self.rendering[key]["status"] = "rendering"
+                    job.render_candidate(cid)
+            except Exception as e:
+                log.error("Монтаж момента %s: %s", key, e)
+                self.render_errors[key] = str(e)
+            finally:
+                self.rendering.pop(key, None)
+
+        self.render_errors.pop(key, None)
+        threading.Thread(target=work, daemon=True).start()
 
     def make_compilation(self, job_id: str, n: int) -> None:
         """Склейка «Топ-N» в фоне (по очереди с остальной тяжёлой работой)."""
@@ -417,13 +446,32 @@ class Manager:
         if st.get("clips"):
             from . import feedback
             fb = feedback.for_job(job_id)
-            st["clips"] = [{**c, "feedback": fb.get(c["file"]), "missing": not (d / c["file"]).exists()}
+            login = st.get("streamer") or (st.get("channel") or "").lower()
+            sobj = streamers.get(login) or {}
+            st["clips"] = [{**c, "feedback": fb.get(c["file"]), "missing": not (d / c["file"]).exists(),
+                            "caption": streamers.tiktok_caption(login, c.get("hashtags"), sobj)}
                            for c in st["clips"]]
         st["rendering"] = {k.split("/", 1)[1]: v["status"] for k, v in self.rendering.items() if k.startswith(job_id + "/")}
         st["render_errors"] = {k.split("/", 1)[1]: v for k, v in self.render_errors.items() if k.startswith(job_id + "/")}
         st["timeline"] = read_json(d / "timeline.json")
         st["compilations"] = [x for x in (read_json(d / "compilations.json") or []) if (d / x["file"]).exists()]
         st["compiling"] = self.compiling.get(job_id)
+        # все оценённые Claude моменты (и не прошедшие порог) — список «Все найденные моменты»
+        mc = read_json(d / "all_candidates.json") or read_json(d / "live_candidates.json") or []
+        mr = (read_json(d / "ranking.json") or {}).get("ranking") or {}
+        mr.update(read_json(d / "live_ranking.json") or {})
+        by_cand = {c.get("candidate"): c.get("n") for c in st.get("clips") or []}
+        moments = []
+        for c in mc:
+            r = mr.get(c.get("id"))
+            if not r:
+                continue
+            moments.append({"id": c["id"], "start": round(c["start"] + float(r.get("rel_start") or 0), 1),
+                            "end": round(c["start"] + float(r.get("rel_end") or 0), 1), "score": r.get("score"),
+                            "title": r.get("title") or c.get("topic") or "", "category": r.get("category"),
+                            "reason": r.get("reason") or "", "source": c.get("source"), "heuristic": bool(r.get("heuristic")),
+                            "clip": by_cand.get(c["id"])})
+        st["moments"] = sorted(moments, key=lambda m: m["start"])
         cands = read_json(d / "all_candidates.json") or read_json(d / "candidates.json") or []
         rank = (read_json(d / "ranking.json") or {}).get("ranking", {})
         st["candidates"] = [{"id": c["id"], "peak": c["peak"], "signal": c.get("signal", 0), "source": c.get("source"),
@@ -852,6 +900,10 @@ def make_handler(mgr: Manager):
                 m = re.match(r"^/api/streamers/([\w]+)/delete$", path)
                 if m:
                     streamers.delete(m.group(1))
+                    return self._json({"ok": True})
+                m = re.match(r"^/api/jobs/([\w.-]+)/moments/([\w.-]+)/render$", path)
+                if m:
+                    mgr.render_moment(m.group(1), m.group(2))
                     return self._json({"ok": True})
                 m = re.match(r"^/api/jobs/([\w.-]+)/clips/(\d+)/(render|shorten|restore)$", path)
                 if m:

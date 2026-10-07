@@ -289,6 +289,16 @@ class LiveJob(Job):
         self._check_stop()
         # 7. оценка и монтаж сильных моментов
         ranking, u2 = rank_candidates(meta_now, cands, tr["words"], self.cfg, self.dir, self.progress)
+        # все оценённые моменты — чтобы в интерфейсе было видно и то, что не прошло порог, и можно было
+        # смонтировать любой из них без нового анализа
+        keep_keys = ("id", "start", "end", "peak", "source", "topic", "kind", "why", "pre_score", "signal",
+                     "signal_norm", "chat_ratio", "reaction", "viewer_clips")
+        allc = [x for x in (read_json(self.dir / "live_candidates.json") or []) if x.get("id") not in {c["id"] for c in cands}]
+        allc += [{k: c[k] for k in keep_keys if k in c} for c in cands]
+        write_json(self.dir / "live_candidates.json", sorted(allc, key=lambda x: x["start"]))
+        allr = read_json(self.dir / "live_ranking.json") or {}
+        allr.update(ranking)
+        write_json(self.dir / "live_ranking.json", allr)
         from .llm import USAGE_KEYS
         for k in USAGE_KEYS:
             usage[k] = usage.get(k, 0) + u2.get(k, 0)

@@ -445,7 +445,7 @@ async function renderJob(){
   const clips = st.clips || [];
   S.clips = clips;
   const cardOf = (c) => {
-      const tags = (c.hashtags||[]).slice(0,5).map(t=>"#"+t.replace(/\s/g,"")).join(" ");
+      const tags = c.caption || (c.hashtags||[]).slice(0,5).map(t=>"#"+t.replace(/\s/g,"")).join(" ");
       const f = `/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.file)}?v=${c.v||0}`;
       const busy = (st.rendering||{})[String(c.n)];
       const rerr = (st.render_errors||{})[String(c.n)];
@@ -465,7 +465,7 @@ async function renderJob(){
         ${c.content_cut_sec>0?`<span class="chip" title="Claude вырезал лишнее: донат не по теме, повторы, поиск">${icon("scissors","sm")} −${c.content_cut_sec}с воды</span>`:""}
         ${c.director?`<span class="chip" title="${esc((c.director_shots||[]).map(x=>`${fmt(x.t0)}–${fmt(x.t1)}: ${({split:"вебка + экран",cam:"только вебка",screen:"только экран"})[x.layout]||x.layout}${x.focus?" (крупно: "+(x.why||"важное")+")":""}`).join("\n"))}">${icon("clapperboard","sm")} режиссёр</span>`:""}</div>
         <div class="titles">${titles.map(t=>`<div class="tv" onclick="copyTitle(this)" data-t="${esc(t)}" title="Нажмите, чтобы скопировать"><span>${esc(t)}</span>${icon("copy","sm")}</div>`).join("")}</div>
-        ${tags?`<div class="titles"><div class="tv tags" onclick="copyTitle(this)" data-t="${esc(tags)}" title="Скопировать хештеги"><span>${esc(tags)}</span>${icon("copy","sm")}</div></div>`:""}
+        ${tags?`<div class="titles"><div class="tv tags" onclick="copyTitle(this)" data-t="${esc(tags)}" title="Описание для TikTok — нажмите, чтобы скопировать"><span>${esc(tags)}</span>${icon("copy","sm")}</div></div>`:""}
         <div class="edit">
           <div class="seg sm">${[1,1.1,1.25,1.5,2].map(v=>`<button type="button" class="${Math.abs(sp-v)<0.01?'on':''}" onclick="setSpeed(${c.n},${v},this)">${v}×</button>`).join("")}</div>
           <label class="check" title="Вырезать «мёртвые» паузы, когда стример задумался. Смех, реакции и звук игры не трогаются.">
@@ -493,6 +493,7 @@ async function renderJob(){
   let bottom = "";
   if (clips.length >= 2 && !["running","queued"].includes(st.status)) bottom += compCard(st);
   if (!clips.length && st.status === "done") bottom = `<div class="card empty mt">${icon("film")}<div>Подходящих моментов не нашлось. Снизьте <code>clips.min_score</code> в config.yaml или выберите другой стрим.</div></div>`;
+  bottom += momentsCard(st);
   // Страница задачи обновляется на месте: шапка — целиком, а карточки клипов — только изменившиеся.
   // Так видео, которое вы смотрите, не останавливается и не начинается сначала при каждом обновлении.
   const scroll = $("main").scrollTop;
@@ -554,6 +555,40 @@ async function makeComp(btn){
   try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/compilation`, {n: S.compN || 5}); toast("Собираю склейку — займёт пару минут"); S.lastJob=""; renderJob(); }
   catch(e){ toast(e.message,"err"); btn.disabled = false; }
 }
+/* Все моменты, которые нашёл и оценил Claude, — в том числе не прошедшие порог. Любой можно смонтировать
+   по уже готовой оценке, без нового анализа. */
+function momentsCard(st){
+  const ms = st.moments || [];
+  if (!ms.length) return "";
+  const sort = S.momSort || "score";
+  const list = ms.slice().sort((a,b)=> sort==="time" ? a.start-b.start : (b.score||0)-(a.score||0));
+  const done = ms.filter(m=>m.clip!=null).length;
+  const busy = st.rendering || {}, errs = st.render_errors || {};
+  const col = s => s==null ? "var(--muted)" : s>=70 ? "var(--ok)" : s>=55 ? "var(--warn)" : "var(--err)";
+  return `<div class="card mt"><details ${S.momOpen?"open":""} ontoggle="S.momOpen=this.open">
+    <summary style="cursor:pointer"><h3 style="display:inline;margin:0">${icon("list-video")} Все найденные моменты</h3>
+      <span class="dim"> · ${ms.length}, смонтировано ${done}</span></summary>
+    <div class="hint">Всё, что Claude нашёл и оценил в этом стриме, в том числе не прошедшее порог. Если кажется, что момент недооценён, — «Смонтировать»: клип соберётся по уже готовой оценке, без нового анализа.</div>
+    <div class="row" style="gap:6px;margin:8px 0"><span class="dim" style="font-size:12.5px">Сортировка:</span>
+      <div class="seg sm"><button type="button" class="${sort==="score"?"on":""}" onclick="S.momSort='score';S.lastJob='';renderJob()">по оценке</button>
+      <button type="button" class="${sort==="time"?"on":""}" onclick="S.momSort='time';S.lastJob='';renderJob()">по времени</button></div></div>
+    <table class="t"><tr><th>Время</th><th>Оценка</th><th>Момент</th><th></th></tr>
+    ${list.map(m=>{ const b = busy["m:"+m.id], e = errs["m:"+m.id];
+      return `<tr><td style="white-space:nowrap">${fmt(m.start)}<div class="dim">${Math.round(m.end-m.start)} с</div></td>
+        <td><b style="color:${col(m.score)}">${m.score??"—"}</b></td>
+        <td><div>${esc(m.title||"")} <span class="chip c" style="font-size:11px">${CAT[m.category]||m.category||""}</span>${m.heuristic?` <span class="dim" title="Claude не оценил — оценка по чату и звуку">без оценки Claude</span>`:""}</div>
+          <div class="dim" style="font-size:12px">${esc(m.reason||"")}</div>${e?`<div style="color:var(--err);font-size:12px">${esc(e)}</div>`:""}</td>
+        <td style="white-space:nowrap">${m.clip!=null?`<a href="#clip-${m.clip}" onclick="document.getElementById('clip-${m.clip}')?.scrollIntoView({behavior:'smooth'});return false">клип ${m.clip}</a>`
+          : b?`<span class="dim">${icon("loader-circle","sm spin")} монтирую…</span>`
+          : `<button class="btn ghost sm" onclick="renderMoment('${esc(m.id)}', this)">${icon("scissors","sm")} Смонтировать</button>`}</td></tr>`; }).join("")}
+    </table></details></div>`;
+}
+async function renderMoment(id, btn){
+  btn.disabled = true;
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/moments/${encodeURIComponent(id)}/render`, {});
+    toast("Монтирую — клип появится в списке через пару минут"); S.lastJob=""; renderJob(); }
+  catch(e){ toast(e.message,"err"); btn.disabled = false; }
+}
 async function tiktokReady(){
   let t; try{ t = await api("/api/tiktok/status"); }catch(e){ t = {}; }
   if (t.connected) return true;
@@ -562,8 +597,10 @@ async function tiktokReady(){
 async function toTikTok(n, btn){
   if (!await tiktokReady()) return;
   btn.disabled = true; const old = btn.innerHTML; btn.innerHTML = `${icon("loader-circle","sm spin")} Загружаю…`;
+  const cap = (S.clips.find(x=>x.n===n)||{}).caption || "";
   try{ const r = await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/tiktok`, {});
-    toast(`Отправлено во «Входящие» TikTok (${r.account}) — откройте приложение, допишите подпись и опубликуйте`); S.lastJob=""; renderJob(); }
+    let copied = false; if (cap){ try{ await navigator.clipboard.writeText(cap); copied = true; }catch(e){} }
+    toast(`Отправлено во «Входящие» TikTok (${r.account})`+(copied?" — описание скопировано, вставьте его в подпись":" — допишите подпись в приложении")); S.lastJob=""; renderJob(); }
   catch(e){ toast(e.message,"err"); btn.disabled = false; btn.innerHTML = old; }
 }
 async function toTikTokComp(file, btn){
@@ -656,6 +693,8 @@ function editStreamer(login){
         ${login?"":`<button class="btn ghost icon" title="Найти на Twitch" onclick="lookup()">${icon("search")}</button>`}</div><div class="hint" id="s-look"></div></div>
       <div><label>Имя</label><input type="text" id="s-name" value="${esc(s.name)}" placeholder="как подписывать"></div>
     </div>
+    <div class="mt"><label>Хештег-прозвище для TikTok</label><input type="text" id="s-tag" value="${esc(s.tag_ru||"")}" placeholder="напр. стинт, тоха, дрейк">
+      <div class="hint">Описание ролика: «twitch: ${esc(s.login||"ник")} #${esc(s.login||"ник")} #${esc(s.tag_ru||"прозвище")}» + 3 хештега по теме (или #твич #стрим).</div></div>
     <div class="mt"><label>Кто это и что у него смешно</label>
       <textarea id="s-desc" style="min-height:150px" placeholder="Во что играет, какой характер (спокойный / взрывной / ироничный).&#10;Мемы и локальные шутки канала, коронные фразы.&#10;Прозвища друзей и постоянных гостей.&#10;Что больше всего любит чат: фейлы, ярость, истории, общение с донатами…">${esc(s.description)}</textarea>
       <div class="hint">Чем конкретнее, тем лучше Claude выбирает моменты. Этот текст передаётся при каждом анализе стримов этого канала.</div></div>
@@ -721,7 +760,7 @@ async function saveStreamer(btn){
   btn.disabled = true;
   try{
     const r = await api("/api/streamers", {login:$("#s-login").value, name:$("#s-name").value, description:$("#s-desc").value,
-      funny_emotes:$("#s-funny").value, hype_emotes:$("#s-hype").value, layout:$("#s-layout").value, cam_rect:$("#s-cam").value, watch:$("#s-watch").checked});
+      funny_emotes:$("#s-funny").value, hype_emotes:$("#s-hype").value, tag_ru:$("#s-tag").value, layout:$("#s-layout").value, cam_rect:$("#s-cam").value, watch:$("#s-watch").checked});
     closeModal(); toast("Сохранено: " + r.name); renderStreamers();
   }catch(e){ toast(e.message,"err"); }
   btn.disabled = false;
@@ -794,6 +833,7 @@ function fbBlock(c){
       ${f.likes!=null?` · ${icon("thumbs-up","sm")} ${fmtViews(f.likes)}`:""}${f.comments!=null?` · комм. ${fmtViews(f.comments)}`:""}
       ${f.url?`<a href="${esc(f.url)}" target="_blank">ссылка</a>`:""}${f.stats_error?` <span class="dim" title="${esc(f.stats_error)}">· не удалось обновить</span>`:""}</div>`;
   if (f.status==="rejected") badge = `<div class="fbadge rejected">${icon("ban","sm")} Не подходит${(f.reasons||[]).length?": "+f.reasons.map(r=>REASONS[r]||r).join(", "):""}</div>`;
+  if (f.note) badge += `<div class="dim" style="font-size:12.5px;margin:4px 0">${icon("message-square","sm")} ${esc(f.note)}</div>`;
   return `<div class="fb" id="fb-${c.n}">${badge}
     <div class="row" style="gap:8px">
       <button class="btn ghost sm" onclick="fbForm(${c.n},'rejected')">${icon("thumbs-down","sm")} Не подходит</button>
@@ -817,6 +857,7 @@ function fbForm(n, kind){
       <details style="margin-top:6px" ${f.url?"":""}><summary class="muted" style="cursor:pointer;font-size:12px">Ввести просмотры вручную</summary>
       <div class="grid g2" style="gap:8px;margin-top:6px"><input type="number" min="0" id="fbv-${n}" placeholder="Просмотры" value="${f.views??""}">
       <input type="number" min="0" id="fbl-${n}" placeholder="Лайки" value="${f.likes??""}"></div></details>
+      <input type="text" id="fbpn-${n}" style="margin-top:8px" placeholder="Заметка: недочёты монтажа или что можно было лучше (необязательно)" value="${esc(f.status==="posted"?f.note||"":"")}">
       <div class="row" style="margin-top:8px"><button class="btn sm" onclick="fbSave(${n},'posted')">${icon("check","sm")} Сохранить</button>
       ${f.status?`<button class="btn ghost sm" onclick="fbSave(${n},'none')">Снять отметку</button>`:""}</div>`;
   }
@@ -825,7 +866,7 @@ async function fbSave(n, status){
   const c = S.clips.find(x=>x.n===n);
   const body = {job:S.jobId, file:c.file, status};
   if (status==="rejected"){ body.reasons = [...document.querySelectorAll(`#fbf-${n} .chips .on`)].map(b=>b.dataset.r); body.note = $("#fbn-"+n).value; }
-  if (status==="posted"){ body.views = $("#fbv-"+n).value; body.likes = $("#fbl-"+n).value; body.url = $("#fbu-"+n).value; }
+  if (status==="posted"){ body.views = $("#fbv-"+n).value; body.likes = $("#fbl-"+n).value; body.url = $("#fbu-"+n).value; body.note = $("#fbpn-"+n).value; }
   try{ const r = await api("/api/feedback", body);
     toast(status==="none"?"Отметка снята":r.stats_pending?"Сохранено — загружаю просмотры из TikTok…":"Сохранено — учтётся в следующих анализах");
     S.lastJob=""; S.lastClips=""; renderJob();

@@ -338,36 +338,62 @@ class Job:
             self.update(warning=usage["warning"])
         return data["ranking"]
 
+    def _priors(self) -> dict:
+        from . import feedback
+        try:
+            return feedback.channel_priors(self.cfg["llm"].get("streamer_login") or self.state.get("streamer"))
+        except Exception as e:
+            log.warning("Статистика канала не прочитана: %s", e)
+            return {}
+
+    def candidate_item(self, c: dict, r: dict, words: list[dict], priors: dict) -> dict:
+        """Кандидат + оценка Claude → готовое к монтажу описание клипа (границы, вырезки, итоговая оценка)."""
+        from . import feedback
+        cl = self.cfg["clips"]
+        s, e = finalize_bounds(c, c["start"] + r["rel_start"], c["start"] + r["rel_end"], words, self.cfg,
+                               long=r["category"] in LONG_CATEGORIES)
+        # поправка по реальным просмотрам канала: тип ролика и примерная длина после вырезок
+        est = (e - s) - sum(max(0.0, min(b, e) - max(a, s)) for a, b in
+                            ((c["start"] + x, c["start"] + y) for x, y in (r.get("rel_cuts") or [])))
+        bonus = (priors.get("cat") or {}).get(r["category"], 0.0) + \
+            (priors.get("dur") or {}).get(feedback.dur_bucket(est * 0.93), 0.0)
+        bonus = max(-6.0, min(6.0, bonus))
+        score = r["score"] + bonus
+        # главное — оценка Claude по смыслу; реакция чата/звука — небольшая добавка
+        final = 0.88 * score + 12 * c.get("signal_norm", 0.3)
+        strong = (r["keep"] or score >= 55) and score >= cl["min_score"]
+        # вырезки «воды» от Claude (донат не по теме, повтор, поиск) — в абсолютном времени стрима
+        cuts = []
+        for a, b in r.get("rel_cuts") or []:
+            a, b = max(s + 0.5, c["start"] + a), min(e - 0.5, c["start"] + b)
+            if b - a >= 0.8:
+                cuts.append([round(a, 2), round(b, 2)])
+        if sum(b - a for a, b in cuts) > 0.6 * (e - s):
+            cuts = []  # подозрительно много — не доверяем
+        spans = [[round(max(s, c["start"] + a), 2), round(min(e, c["start"] + b), 2)]
+                 for a, b in (r.get("rel_screen") or [])]
+        spans = [x for x in spans if x[1] - x[0] >= 1.0]
+        return {**r, "cand": c["id"], "source": c.get("source", "signals"), "topic": c.get("topic", ""),
+                "start": s, "end": e, "final_score": round(final, 1), "extra": not strong,
+                "channel_bonus": round(bonus, 1), "adj_score": round(score, 1),
+                "content_cuts": cuts, "screen_spans": spans}
+
     def select(self, cands: list, tr: dict, ranking: dict) -> list[dict]:
         """Сильные моменты (оценка ≥ min_score); если их меньше, чем просили, — добираем лучшими
         из оставшихся (≥ fill_min_score), помечая их как «запасные»."""
         cl = self.cfg["clips"]
         words = tr["words"]
         floor = float(cl.get("fill_min_score", 40))
+        priors = self._priors()
         picked = []
         for c in cands:
             r = ranking.get(c["id"])
-            if not r or r["score"] < floor:
+            if not r:
                 continue
-            s, e = finalize_bounds(c, c["start"] + r["rel_start"], c["start"] + r["rel_end"], words, self.cfg,
-                                   long=r["category"] in LONG_CATEGORIES)
-            # главное — оценка Claude по смыслу; реакция чата/звука — небольшая добавка
-            final = 0.88 * r["score"] + 12 * c.get("signal_norm", 0.3)
-            strong = r["keep"] and r["score"] >= cl["min_score"]
-            # вырезки «воды» от Claude (донат не по теме, повтор, поиск) — в абсолютном времени стрима
-            cuts = []
-            for a, b in r.get("rel_cuts") or []:
-                a, b = max(s + 0.5, c["start"] + a), min(e - 0.5, c["start"] + b)
-                if b - a >= 0.8:
-                    cuts.append([round(a, 2), round(b, 2)])
-            if sum(b - a for a, b in cuts) > 0.6 * (e - s):
-                cuts = []  # подозрительно много — не доверяем
-            spans = [[round(max(s, c["start"] + a), 2), round(min(e, c["start"] + b), 2)]
-                     for a, b in (r.get("rel_screen") or [])]
-            spans = [x for x in spans if x[1] - x[0] >= 1.0]
-            picked.append({**r, "cand": c["id"], "source": c.get("source", "signals"), "topic": c.get("topic", ""),
-                           "start": s, "end": e, "final_score": round(final, 1), "extra": not strong,
-                           "content_cuts": cuts, "screen_spans": spans})
+            item = self.candidate_item(c, r, words, priors)
+            if item["adj_score"] < floor:
+                continue
+            picked.append(item)
         picked.sort(key=lambda x: (x["extra"], -x["final_score"]))
         chosen: list[dict] = []
         for p in picked:
@@ -378,6 +404,39 @@ class Job:
                 break
         chosen.sort(key=lambda x: -x["final_score"])
         return chosen
+
+    # ------------------------------------------------- все найденные моменты
+    def moments(self) -> tuple[list[dict], dict]:
+        """Все кандидаты, которые оценивал Claude, и его оценки (и для записи, и для эфира)."""
+        cands = read_json(self.dir / "all_candidates.json") or read_json(self.dir / "live_candidates.json") or []
+        ranking = (read_json(self.dir / "ranking.json") or {}).get("ranking") or {}
+        ranking.update(read_json(self.dir / "live_ranking.json") or {})
+        return cands, ranking
+
+    def render_candidate(self, cid: str) -> dict:
+        """Смонтировать любой найденный момент (даже не прошедший порог) — по уже готовой оценке Claude,
+        без новых запросов к нему (кроме режиссёра для раскладки, как у обычного клипа)."""
+        cands, ranking = self.moments()
+        c = next((x for x in cands if x.get("id") == cid), None)
+        r = ranking.get(cid)
+        if not c or not r:
+            raise TwitchCutError("Момент не найден (возможно, задачу анализировали до обновления)")
+        meta = read_json(self.dir / "meta.json") or {}
+        if meta:
+            self._apply_streamer(meta)
+        tr = read_json(self.dir / "transcript.json") or {"words": []}
+        item = self.candidate_item(c, r, tr["words"], self._priors())
+        item["manual"] = True
+        clips = read_json(self.dir / "clips.json") or []
+        if any(x.get("candidate") == cid for x in clips):
+            raise TwitchCutError("Этот момент уже смонтирован")
+        sc = read_json(self.dir / "stream_cam.json")
+        if sc and not self.cfg["render"].get("cam_rect"):
+            self.cfg["render"]["stream_cam"] = sc
+        clips = self.render_list([item], tr["words"], len(clips) + 1, prev=clips)
+        write_json(self.dir / "clips.json", clips)
+        self.update(clips=clips)
+        return next((x for x in clips if x.get("candidate") == cid), {})
 
     def _render(self, meta: dict, cands: list, tr: dict, ranking: dict) -> list[dict]:
         p = self.dir / "clips.json"
@@ -567,6 +626,16 @@ class Job:
                 elif li.get("cam") and not reuse_only and not static_talk:  # есть вебка — решаем, глядя на кадры
                     usage = self.state.get("director_usage") or {}
                     about = f"О чём: «{c.get('title') or ''}» ({c.get('category') or ''}). {c.get('reason') or ''}"
+                    vis = c.get("visual")
+                    if vis == "talk":
+                        about += ("\nПодсказка оценщика: стример РАССКАЗЫВАЕТ/рассуждает о своём — экран для смысла не "
+                                  "нужен, по умолчанию \"cam\" (или \"camwide\", если жестикулирует/показывает в камеру).")
+                    elif vis == "screen":
+                        about += "\nПодсказка оценщика: смысл в том, что на экране — нужен \"split\" с focus на важном."
+                    elif vis == "mixed" and hint.get("spans"):
+                        about += ("\nПодсказка оценщика: экран нужен только в эти секунды от начала клипа: "
+                                  + ", ".join(f"{max(0.0, a):.0f}–{b:.0f}" for a, b in hint["spans"])
+                                  + "; в остальное время — вебка.")
                     from . import feedback
                     notes = feedback.edit_notes(self.cfg["llm"].get("streamer_login"))
                     dplan = director.plan_clip(src, offset, dur, words_rel, keep or [(0.0, dur)], li, self.cfg,
@@ -589,8 +658,8 @@ class Job:
                            zooms=self.reaction_peaks(c["start"], c["end"]), keep=keep, speed=speed, layout_hint=hint)
         info["director"] = bool(dplan)
         info["layout_v"] = LAYOUT_VERSION
-        if li and li.get("people"):
-            info["people"] = li["people"]
+        from .render import people_shown
+        info["people"] = people_shown(li) if li else 1
         if dplan:
             info["director_shots"] = [{k: s_[k] for k in ("t0", "t1", "layout", "focus", "why")} for s_ in dplan["shots"]]
         info["content_cut_sec"] = round(sum(b - a for a, b in cuts), 1)
@@ -707,10 +776,13 @@ class Job:
                 try:
                     offset = float(c["start"]) - float(seg_meta["t0"])
                     li = detect_layout(src, offset, float(c["end"]) - float(c["start"]), self.cfg)
-                    if (li.get("people") or 0) >= 2:
+                    from .render import people_shown
+                    # перемонтируем, если сейчас в кадре несколько человек или прошлый монтаж ошибочно
+                    # показывал нескольких (например, лицо из видео на экране)
+                    if people_shown(li) >= 2 or int(c.get("people") or 1) >= 2:
                         if on_clip:
                             on_clip(c)
-                        log.info("Перемонтаж клипа %s (%s): в кадре %d человека", c.get("n"), self.dir.name, li["people"])
+                        log.info("Перемонтаж клипа %s (%s) по новой раскладке", c.get("n"), self.dir.name)
                         self.rerender_clip(c["n"], float(c.get("speed") or 1.0), bool(c.get("trim_pauses", True)),
                                            c.get("layout_choice"), director_mode="cache_only")
                         stamp["relayout"] = int(time.time())
@@ -773,10 +845,13 @@ class Job:
                 self.update(render_failed=failed)
                 continue
             i += 1
-            tags = " ".join("#" + h.replace(" ", "") for h in c.get("hashtags", []))
+            from . import streamers as _streamers
+            login = self.cfg["llm"].get("streamer_login") or self.state.get("streamer") or ""
+            tags = _streamers.tiktok_caption(login, c.get("hashtags", [])) if login else \
+                " ".join("#" + h.replace(" ", "") for h in c.get("hashtags", []))
             titles = c.get("titles") or ([c["title"]] if c.get("title") else [])
             (out_dir / f"{name}.txt").write_text(
-                "Варианты названия:\n" + "\n".join(f"- {t}" for t in titles) + f"\n\n{tags}\n", encoding="utf-8")
+                "Варианты названия:\n" + "\n".join(f"- {t}" for t in titles) + f"\n\nОписание для TikTok:\n{tags}\n", encoding="utf-8")
             clips.append({
                 "n": i, "file": f"clips/{out.name}", "thumb": f"clips/{out.with_suffix('.jpg').name}",
                 "title": c.get("title"), "titles": titles, "description": c.get("description"),

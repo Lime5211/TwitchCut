@@ -38,8 +38,9 @@ _add("wholesome", "<3", "❤", "❤️", "peepoHappy", "FeelsGoodMan", "peepoLov
 # Слова и паттерны (русский + английский чат)
 WORD_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("funny", re.compile(
-        r"(?:[хx][аa]){2,}|(?:[аa][хx]){2,}[аa]?|(?:ha){2,}|(?:ah){2,}|(?:хе){3,}|азаз|lmao|rofl|\blol\b|\bлол\b"
-        r"|\bору+\b|\bорн(?:у|ул)|\bкек\b|\)\){2,}|\bxd+\b|\bхд+\b|смешн|угар|ржу|ржака|\bрофл|ржомб|пхпх|пахах",
+        r"(?:[хx]+[аa]+){2,}|(?:[аa]+[хx]+){2,}[аa]?|(?:ha){2,}|(?:ah){2,}|(?:хе){3,}|(?:хы){2,}|азаз|lmao|rofl|\blol\b"
+        r"|\bлол\b|\bору+\b|\bорн(?:у|ул)|\bкек\b|\){2,}|^\s*\)\s*$|\bxd+\b|\bхд+\b|смешн|угар|ржу|ржака|\bрофл"
+        r"|ржомб|пхпх|пахах|ахаха|хахах|\bапхап|\bгы+\b",
         re.I)),
     ("hype", re.compile(
         r"\bимба\b|\bнайс\b|\bnice\b|\bклатч|\bclutch|\bкрасава|\bмощ|\bлегенд|\bгоу+\b|\bлетс\s*го|\bеее+\b|\bааа+\b"
@@ -87,11 +88,16 @@ def classify_message(text: str, emotes: list[str] | None = None) -> dict[str, fl
     return scores
 
 
+_LINK = re.compile(r"https?://|\bclck\.ru|\bwww\.", re.I)
+
+
 def is_noise(user: str, text: str) -> bool:
-    if user.lower() in BOT_NAMES:
+    if user.lower() in BOT_NAMES or user.lower().endswith("bot"):
         return True
     if text.startswith("!"):
         return True  # команды ботов
+    if _LINK.search(text):
+        return True  # реклама и ссылки (боты канала повторяют их сотни раз)
     if GREETING_RE.match(text):
         return True
     return False

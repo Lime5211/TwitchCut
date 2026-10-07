@@ -20,7 +20,7 @@ from .util import ROOT_DIR, ffmpeg_bin, ffprobe_video, log, run
 YUNET = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
 # версия логики раскладки: клипы, смонтированные старой версией, после обновления перемонтируются сами
 # (без запросов к Claude). 2 — в кадре показываются все участники (соведущий на вебке, гость, второй стример)
-LAYOUT_VERSION = 2
+LAYOUT_VERSION = 3  # 3 — лица из видео на экране больше не принимаются за второго участника
 
 
 # ------------------------------------------------------------ face / layout
@@ -628,6 +628,10 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
             _people_on_cam(res, times, faces, box, cam_face, scam, sw, sh, cfg)
         except Exception as e:  # не должно ломать монтаж
             log.warning("Поиск второго человека на вебке не удался: %s", e)
+        try:
+            _camwide(res, times, frames, box, cam_face, sw, sh, cfg)
+        except Exception as e:
+            log.warning("Поиск жестов на вебке не удался: %s", e)
 
     # --- лицо крупно (вебка на весь экран, IRL): кадр по лицу со слежением
     big_faces = [[f for f in fs if f[2] >= 0.06 and not (cam_face and abs(f[0] - cam_face[0]) < 0.05
@@ -647,6 +651,7 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         on_cam = [any(abs(f[0] - cx) < 0.06 and abs(f[1] - cy) < 0.09 for f in fs) for fs in faces]
         scene_full_cam = n and sum(on_cam) < 0.3 * n and sum(1 for bf in big_faces if bf and
                                                               max(f[2] for f in bf) >= 0.11) >= 0.6 * n
+        res["scene_full_cam"] = bool(scene_full_cam and res.get("crop"))
         if scene_full_cam and res.get("crop"):
             # стример переключил сцену на вебку во весь экран: маленькой вебки в кадре нет, есть его крупное лицо
             full = res.get("full_mode") or "crop"
@@ -673,7 +678,9 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
             want = "crop" if res.get("crop") else "blur"
         if want == "crop" and not res.get("crop"):
             want = "cam" if cam_rel else "blur"
-        if want == "crop" and res.get("full_mode") in ("stack", "group"):
+        if want == "crop" and cam_rel and not res.get("scene_full_cam"):
+            want = "cam"  # «по лицу» у стримера с вебкой — это его лицо на вебке, а не лица из видео на экране
+        if want == "crop" and res.get("full_mode") in ("stack", "group") and (res.get("scene_full_cam") or not cam_rel):
             want = res["full_mode"]  # в кадре несколько человек — показываем всех
         res["layout"] = want
         res["segments"] = [{"t0": 0.0, "t1": dur, "layout": want}]
@@ -686,6 +693,104 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
     res["segments"] = segs
     res["layout"] = max(segs, key=lambda x: x["t1"] - x["t0"])["layout"]
     return res
+
+
+def _camwide(res: dict, times: list, frames: list, box: list[float], cam_face: tuple, sw: int, sh: int,
+             cfg: dict) -> None:
+    """«Вебка общим планом» (camwide): лицо по-прежнему в центре, но кадр шире — видно руки и то, что
+    стример показывает в камеру. Нужен, только если обычный кадр «только вебка» — узкая вертикальная
+    полоса вокруг лица (большая вебка). Заодно ищем, когда стример жестикулирует или что-то показывает:
+    по кадрам вебки — появление участков кожи (руки) по бокам от лица там, где их обычно нет."""
+    import cv2
+    r = cfg["render"]
+    W, H = int(r["width"]), int(r["height"])
+    if not r.get("cam_wide", True) or not res.get("camcrop") or not frames:
+        return
+    bx, by, bw, bh = box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh
+    x0, y0, cw, ch = res["camcrop"]
+    if H / max(1, ch) > float(r.get("cam_max_upscale", 4.5)) or cw >= 0.75 * bw:
+        return  # «только вебка» и так показывает её целиком
+    # кадр 4:5 высотой во всю вебку, лицо по центру
+    wh = bh
+    ww = min(bw, wh * 0.8)
+    fx = cam_face[0] * sw
+    x = float(np.clip(fx - ww / 2, bx, bx + bw - ww))
+    res["camwide_rect"] = [int(x) // 2 * 2, int(by) // 2 * 2, int(ww) // 2 * 2, int(wh) // 2 * 2]
+    # жесты: кожа по бокам от лица, которой нет на «фоне» этого клипа
+    h, w = frames[0][1].shape[:2]
+    X0, X1 = int(box[0] * w), int((box[0] + box[2]) * w)
+    Y0, Y1 = int(box[1] * h), int((box[1] + box[3]) * h)
+    if X1 - X0 < 40 or Y1 - Y0 < 40 or len(frames) < 4:
+        return
+    col = (int((x0 - bx) / bw * (X1 - X0)), int((x0 + cw - bx) / bw * (X1 - X0)))
+    masks = []
+    for _, f in frames:
+        ycc = cv2.cvtColor(np.ascontiguousarray(f[Y0:Y1, X0:X1]), cv2.COLOR_BGR2YCrCb)
+        m = cv2.inRange(ycc, (40, 138, 80), (240, 175, 125))
+        masks.append(cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0)
+    bg = cv2.dilate((np.mean(masks, axis=0) > 0.5).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    thr = float(r.get("gesture_threshold", 0.018))
+    act = []
+    for m in masks:
+        o = m & ~bg
+        o[:, max(0, col[0]):max(0, col[1])] = False
+        act.append(float(o.mean()) >= thr)
+    spans = []
+    for i, a in enumerate(act):
+        # хотя бы два соседних кадра подряд — не случайное движение
+        if a and ((i > 0 and act[i - 1]) or (i + 1 < len(act) and act[i + 1])):
+            t0, t1 = max(0.0, times[i] - 1.0), times[i] + 1.0
+            if spans and t0 <= spans[-1][1] + 2.0:
+                spans[-1][1] = t1
+            else:
+                spans.append([t0, t1])
+    spans = [sp for sp in spans if sp[1] - sp[0] >= 4.0]
+    if spans:
+        res["gesture_spans"] = [[round(a, 2), round(b, 2)] for a, b in spans]
+
+
+def apply_gestures(segments: list[dict], spans: list | None, min_len: float = 4.0) -> list[dict]:
+    """Куски «только вебка», где стример жестикулирует или что-то показывает, — общим планом (camwide).
+    Короткие куски (< min_len) не создаём: кадр не должен дёргаться."""
+    if not spans:
+        return segments
+    out = []
+    for sg in segments:
+        if sg.get("layout") != "cam":
+            out.append(sg)
+            continue
+        wide = [[max(a, sg["t0"]), min(b, sg["t1"])] for a, b in spans]
+        merged: list[list[float]] = []
+        for a, b in (w for w in wide if w[1] - w[0] >= min_len):
+            if not merged and a - sg["t0"] < min_len:
+                a = sg["t0"]
+            if merged and a - merged[-1][1] < min_len:
+                merged[-1][1] = b
+                continue
+            merged.append([a, b])
+        if merged and sg["t1"] - merged[-1][1] < min_len:
+            merged[-1][1] = sg["t1"]
+        t = sg["t0"]
+        for a, b in merged:
+            if a > t:
+                out.append({**sg, "t0": t, "t1": a})
+            out.append({**sg, "t0": a, "t1": b, "layout": "camwide"})
+            t = b
+        if sg["t1"] - t > 0.05:
+            out.append({**sg, "t0": t, "t1": sg["t1"]})
+    return out
+
+
+def people_shown(li: dict) -> int:
+    """Сколько человек раскладка клипа реально показывает (для отчёта и перемонтажа)."""
+    segs = li.get("segments") or [{"layout": li.get("layout")}]
+    lays = {sg.get("layout") for sg in segs}
+    n = 1
+    if lays & {"cam", "camwide", "split"} and li.get("people"):
+        n = max(n, int(li["people"]))
+    if lays & {"stack", "group"} and li.get("full_people"):
+        n = max(n, int(li["full_people"]))
+    return n
 
 
 def _people_on_cam(res: dict, times: list, faces: list, box: list[float], cam_face: tuple, scam: dict | None,
@@ -743,7 +848,10 @@ def _people_on_cam(res: dict, times: list, faces: list, box: list[float], cam_fa
 
 
 def _people_full(res: dict, times: list, big_faces: list, sw: int, sh: int, cfg: dict) -> None:
-    """Камера на весь кадр (IRL, подкаст, сцена «только вебка»), в кадре несколько человек."""
+    """Камера на весь кадр (IRL, подкаст, сцена «только вебка»), в кадре несколько человек.
+    Пишет full_* — их используют только раскладки stack/group (кадр целиком — это камера). Если у стримера
+    маленькая вебка поверх экрана, крупные лица в кадре — это люди из видео на экране, и раскладка «cam»
+    их не трогает."""
     from . import people as pp
     r = cfg["render"]
     if not r.get("show_all_people", True) or not times or not res.get("crop"):
@@ -752,7 +860,7 @@ def _people_full(res: dict, times: list, big_faces: list, sw: int, sh: int, cfg:
     grp = pp.find_people(times, big_faces, min_share=0.25)
     if len(grp) < 2:
         return
-    res["people"] = len(grp)
+    res["full_people"] = len(grp)
     cw = res["crop"][0]
     span = (max(p["cx"] + 0.8 * p["w"] for p in grp) - min(p["cx"] - 0.8 * p["w"] for p in grp)) * sw
     if span <= 0.92 * cw:
@@ -765,11 +873,11 @@ def _people_full(res: dict, times: list, big_faces: list, sw: int, sh: int, cfg:
         n = len(grp)
         pan = pp.panels(grp, times, sw, sh, W, H // n // 2 * 2, [None] * n, max_up, _track_camera)
         if pan:
-            res["stack"] = pan
+            res["full_stack"] = pan
             res["full_mode"] = "stack"
             log.info("В кадре %d человека — каждый в своей полосе", n)
             return
-    res["group_rect"] = pp.expand_to_aspect(pp.group_rect(grp, sw, sh), W / (H * 0.5), sw, sh)
+    res["full_group_rect"] = pp.expand_to_aspect(pp.group_rect(grp, sw, sh), W / (H * 0.5), sw, sh)
     res["full_mode"] = "group"
     log.info("В кадре %d человек — общий кадр", len(grp))
 
@@ -979,13 +1087,19 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
     W, H = int(r["width"]), int(r["height"])
     sw, sh = li["src_w"], li["src_h"]
     # --- несколько человек: каждый в своей полосе / общий кадр всех
-    if layout in ("stack", "cam") and li.get("stack"):
-        n = len(li["stack"])
-        return _panels_chain(inp, li["stack"], W, H // n // 2 * 2, False, sw, tag, out, t_shift, total=H)
-    if layout in ("group", "cam") and li.get("group_rect"):
-        return _fit_panel(inp, tuple(li["group_rect"]), W, H, tag, out)
+    stack = li.get("full_stack") if layout == "stack" else li.get("stack") if layout in ("cam", "camwide") else None
+    if stack and not (layout == "camwide" and focus):
+        n = len(stack)
+        return _panels_chain(inp, stack, W, H // n // 2 * 2, False, sw, tag, out, t_shift, total=H)
+    grect = li.get("full_group_rect") if layout == "group" else li.get("group_rect") if layout in ("cam", "camwide") else None
+    if grect and not (layout == "camwide" and focus):
+        return _fit_panel(inp, tuple(grect), W, H, tag, out)
     if layout in ("stack", "group"):
         layout = "crop"
+    if layout == "camwide":
+        if li.get("camwide_rect"):
+            return _fit_panel(inp, tuple(li["camwide_rect"]), W, H, tag, out)
+        layout = "cam"
     if layout == "screen":
         if focus is not None and len(focus) > 4 and focus[4]:  # показать область целиком
             rect = focus_rect(focus[:4], sw, sh, W / H, max_grow=1.8, min_w=0.3, min_h=0.3, avoid=li.get("cam_box"))
@@ -1011,10 +1125,14 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
             top_chain = (f"[{tag}a]crop={cw}:{ch}:{xc}:{y},scale={W}:{top}:force_original_aspect_ratio=increase:"
                          f"flags=lanczos,crop={W}:{top}[{tag}t]")
         if focus is not None:
+            avoid = li.get("cam_box")
+            if avoid and _overlap(tuple(focus[:4]), tuple(avoid)) >= 0.6 * focus[2] * focus[3]:
+                avoid = None  # стример показывает что-то в камеру (телефон, предмет) — это и есть важное
             if len(focus) > 4 and focus[4]:  # текст доната, чат, переписка — целиком, без обрезки краёв
-                rect = focus_rect(focus[:4], sw, sh, W / bot_h, avoid=li.get("cam_box"))
+                small = 0.12 if (avoid is None and li.get("cam_box")) else None  # предмет в руках на вебке
+                rect = focus_rect(focus[:4], sw, sh, W / bot_h, avoid=avoid, min_w=small or 0.24, min_h=small or 0.2)
             else:                              # игра, видео — приблизить максимально
-                rect = fill_rect(focus, sw, sh, W / bot_h, avoid=li.get("cam_box"))
+                rect = fill_rect(focus, sw, sh, W / bot_h, avoid=avoid)
             bottom = _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]")
         else:
             gw = int(min(sw, sh * W / bot_h)) // 2 * 2
@@ -1095,7 +1213,7 @@ def text_positions(layout: str, cfg: dict | None = None) -> tuple[int, int]:
         n = int(layout[5:] or 2)
         return (H // 2 if n == 2 else H * (n - 1) // n), 330
     return {"crop": (1340, 330), "cam": (1400, 330), "blur": (1440, 430), "screen": (1500, 430),
-            "group": (1500, 330)}.get(layout, (1440, 430))
+            "group": (1500, 330), "camwide": (1540, 330)}.get(layout, (1440, 430))
 
 
 def build_ass(words: list[dict], hook: str, layout, cfg: dict, prof: ProfanityFilter | None) -> str:
@@ -1385,7 +1503,7 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     for k in ("track", "cam_track", "split_track"):
         if li.get(k):
             li[k] = [(tl.cut(t), x) for t, x in li[k]]
-    for k in ("stack", "top_panels"):
+    for k in ("stack", "top_panels", "full_stack"):
         if li.get(k):
             li[k] = [{**p, "track": [(tl.cut(t), x) for t, x in p.get("track") or []]} for p in li[k]]
     if layout == "cam" and not li.get("camcrop") and li.get("face_cx"):
@@ -1393,7 +1511,10 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
 
     # сегменты раскладки (может меняться внутри клипа) — в шкале после вырезания пауз
     segs = []
-    for sg in (li.get("segments") or [{"t0": 0.0, "t1": dur, "layout": layout}]):
+    src_segs = li.get("segments") or [{"t0": 0.0, "t1": dur, "layout": layout}]
+    if li.get("camwide_rect") and li.get("gesture_spans"):
+        src_segs = apply_gestures(src_segs, li["gesture_spans"])
+    for sg in src_segs:
         a, b = tl.cut(sg["t0"]), tl.cut(sg["t1"])
         same = segs and segs[-1]["layout"] == sg["layout"] and segs[-1].get("focus") == sg.get("focus")
         if b - a < 0.5 and segs:
@@ -1417,9 +1538,11 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
         vf += "".join(f"[p{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v0]"
     def sub_layout(sg: dict) -> str:
         lay = sg["layout"]
-        if lay in ("stack", "cam") and li.get("stack"):
+        if lay == "stack" and li.get("full_stack"):
+            return f"stack{len(li['full_stack'])}"
+        if lay in ("cam", "camwide") and li.get("stack"):
             return f"stack{len(li['stack'])}"
-        if lay in ("group", "cam") and li.get("group_rect"):
+        if (lay == "group" and li.get("full_group_rect")) or (lay in ("cam", "camwide") and li.get("group_rect")):
             return "group"
         return lay + ("_focus" if sg.get("focus") and lay == "split" else "")
     segs_final = [{"t0": sg["t0"] / tl.speed, "t1": sg["t1"] / tl.speed, "layout": sub_layout(sg)} for sg in segs]

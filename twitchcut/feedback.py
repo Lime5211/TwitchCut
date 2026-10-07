@@ -186,6 +186,15 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10, quote_c
         if len(durs) >= 2 and sum(v["n"] for _, v in durs) >= 4:
             lines.append("Медиана просмотров по длине клипа: " + ", ".join(
                 f"{k} {_fmt_views(v['median'])} ({v['n']})" for k, v in durs))
+        cal = calibration_line(items if len(posted) >= 8 else allf)
+        if cal:
+            lines.append(cal)
+    noted = [f for f in items if f.get("status") == "posted" and (f.get("note") or "").strip()
+             and not _TECH_NOTE.search(f["note"])]
+    if noted:
+        lines.append("Автор выложил, но отметил недочёты — учитывай при выборе границ и вырезок:")
+        for f in sorted(noted, key=lambda f: -f.get("updated", 0))[:max(3, max_neg // 2)]:
+            lines.append(f"- «{(f.get('title') or '').strip()}»: {f['note'].strip()[:200]}")
     if rejected:
         lines.append("Автор отклонил (не стал выкладывать) — избегай похожего:")
         for f in sorted(rejected, key=lambda f: -f.get("updated", 0))[:max_neg * 2]:
@@ -202,6 +211,57 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10, quote_c
     if len(lines) == 1:
         return ""
     return "\n".join(lines)
+
+
+def _dur_of(f: dict) -> float:
+    return float(f.get("final_duration") or f.get("duration") or 0)
+
+
+def dur_bucket(d: float) -> str:
+    return "<30" if d < 30 else "30-60" if d < 60 else "60-90" if d < 90 else "90+"
+
+
+def channel_priors(login: str | None) -> dict:
+    """Поправки к оценке Claude по реальным просмотрам выложенных роликов: какие типы и какая длина у этого
+    канала набирают больше/меньше обычного. ±6 баллов — подсказка, а не замена оценки по смыслу.
+    Если по каналу мало данных — берётся опыт всех каналов."""
+    import math
+    items = [f for f in load() if f.get("status") == "posted" and f.get("views")]
+    own = [f for f in items if login and f.get("streamer") == login]
+    use = own if len(own) >= 8 else items
+    if len(use) < 6:
+        return {}
+    med = statistics.median(int(f["views"]) for f in use)
+
+    def bonus(group: list[dict]) -> float:
+        if len(group) < 3 or med <= 0:
+            return 0.0
+        m = statistics.median(int(f["views"]) for f in group)
+        return round(max(-6.0, min(6.0, 5.0 * math.log2(max(1, m) / med))), 1)
+    cats: dict[str, list] = {}
+    durs: dict[str, list] = {}
+    for f in use:
+        cats.setdefault(f.get("category") or "other", []).append(f)
+        if _dur_of(f):
+            durs.setdefault(dur_bucket(_dur_of(f)), []).append(f)
+    return {"cat": {k: bonus(v) for k, v in cats.items()}, "dur": {k: bonus(v) for k, v in durs.items()},
+            "n": len(use), "own": use is own}
+
+
+def calibration_line(items: list[dict]) -> str:
+    """Как прошлые оценки Claude соотносились с реальными просмотрами — чтобы он сам поправил шкалу."""
+    posted = [f for f in items if f.get("status") == "posted" and f.get("views") and f.get("score")]
+    if len(posted) < 8:
+        return ""
+    parts = []
+    for lo, hi, name in ((70, 101, "70+"), (60, 70, "60–69"), (0, 60, "<60")):
+        g = [int(f["views"]) for f in posted if lo <= int(f["score"]) < hi]
+        if len(g) >= 2:
+            parts.append(f"оценка {name} → медиана {_fmt_views(statistics.median(g))} просм. ({len(g)})")
+    if len(parts) < 2:
+        return ""
+    return "Твои прошлые оценки и реальные просмотры: " + "; ".join(parts) + \
+        ". Если высокие оценки набирали не больше низких — шкала была перекошена, исправь её по статистике выше."
 
 
 # ------------------------------------------------------------ монтажные замечания

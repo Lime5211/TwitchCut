@@ -30,6 +30,7 @@ FIELDS = {
     "learned_edit": "",     # пожелания к монтажу — выучено по замечаниям автора
     "learned_n": 0,
     "tiktok_account": "",   # open_id аккаунта TikTok, куда отправлять клипы этого стримера
+    "tag_ru": "",           # второй хештег в описании TikTok — как стримера зовут зрители (стинт, тоха, дрейк)
     "learned_at": 0,
 }
 
@@ -166,3 +167,29 @@ def apply_to_config(st: dict, cfg: dict, extra_context: str = "") -> dict:
     lexicon.add_custom("funny", emote_list(st.get("funny_emotes", "")))
     lexicon.add_custom("hype", emote_list(st.get("hype_emotes", "")))
     return cfg
+
+
+GENERIC_TAGS = ("твич", "стрим")
+
+
+def tiktok_caption(login: str, hashtags: list | None, st: dict | None = None) -> str:
+    """Описание для TikTok: «twitch: <ник> #<ник> #<прозвище> + 3 хештега по теме ролика (или #твич #стрим)»."""
+    import re
+    login = (login or "").strip().lower()
+    st = st or get(login) or {}
+    ru = re.sub(r"[#\s]+", "", st.get("tag_ru") or "")
+    head = [t for t in (login, ru) if t]
+    skip = {t.lower() for t in head} | {"twitch", "твич", "стрим", "stream", "стример", "нарезки", "нарезка",
+                                         re.sub(r"\s+", "", (st.get("name") or "")).lower()}
+    extra: list[str] = []
+    for h in hashtags or []:
+        h = re.sub(r"[#\s.,!?]+", "", str(h))
+        if h and h.lower() not in skip and h.lower() not in {e.lower() for e in extra}:
+            extra.append(h)
+    extra = extra[:3]
+    for g in GENERIC_TAGS:
+        if len(extra) >= 3:
+            break
+        if g not in extra:
+            extra.append(g)
+    return (f"twitch: {login} " if login else "") + " ".join("#" + t for t in head + extra)
