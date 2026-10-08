@@ -435,8 +435,22 @@ class Job:
             self.cfg["render"]["stream_cam"] = sc
         clips = self.render_list([item], tr["words"], len(clips) + 1, prev=clips)
         write_json(self.dir / "clips.json", clips)
-        self.update(clips=clips)
+        self._save_clips_state(clips)
         return next((x for x in clips if x.get("candidate") == cid), {})
+
+    def _save_clips_state(self, clips: list) -> None:
+        """Записать клипы в job.json, не затирая статус задачи: Job для ручного монтажа создаётся заранее
+        и мог прочитать job.json задолго до того, как дошла очередь (за это время эфир успевал записать
+        новый кусок или закончиться)."""
+        with self._lock:
+            fresh = read_json(self.dir / "job.json") or self.state
+            fresh["clips"] = clips
+            fresh["updated"] = time.time()
+            self.state = fresh
+            try:
+                write_json(self.dir / "job.json", fresh)
+            except OSError as e:
+                log.debug("Не удалось сохранить статус: %s", e)
 
     def _render(self, meta: dict, cands: list, tr: dict, ranking: dict) -> list[dict]:
         p = self.dir / "clips.json"

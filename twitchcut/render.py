@@ -1571,7 +1571,7 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
         post += (f",scale=w='trunc({W}*{zexpr}/2)*2':h='trunc({H}*{zexpr}/2)*2':eval=frame:flags=bicubic,"
                  f"crop={W}:{H}")
     post += f",{ass_opt}"
-    if r.get("fade_out", True) and D > 3:
+    if r.get("fade_out", False) and D > 3:  # затемнение в конце — по умолчанию выключено
         post += f",fade=t=out:st={D - 0.35:.2f}:d=0.35"
     vf += f";[v0]{post},format=yuv420p[vout]"
 
@@ -1617,7 +1617,11 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
                            f"[a0][bp]amix=inputs=2:duration=first:normalize=0")
         if tl.speed != 1.0:
             af += f",atempo={tl.speed:.4f}"
-        af += f",afade=t=in:d=0.08,afade=t=out:st={max(0, D - 0.45):.2f}:d=0.45[aout]"
+        if r.get("fade_out", False) and D > 3:
+            af += f",afade=t=in:d=0.08,afade=t=out:st={max(0, D - 0.45):.2f}:d=0.45[aout]"
+        else:
+            # без затухания: только 20 мс на самом краю, чтобы в конце не было щелчка (на слух незаметно)
+            af += f",afade=t=in:d=0.02,afade=t=out:st={max(0, D - 0.02):.3f}:d=0.02[aout]"
         graph = vf + ";" + af
     else:
         graph = vf

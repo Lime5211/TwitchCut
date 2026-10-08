@@ -26,6 +26,9 @@ CAT_RU = {"funny": "смешное", "story": "история", "news": "нов�
           "scare": "испуг", "cringe": "кринж", "chat": "чат", "wholesome": "мило", "other": "другое"}
 
 
+_USER_KEYS = ("status", "note", "reasons", "paid", "paid_at", "reached_at")
+
+
 def load() -> list[dict]:
     return read_json(PATH) or []
 
@@ -50,12 +53,78 @@ def upsert(entry: dict) -> dict:
     return rec
 
 
+def set_paid(rec_id: str, paid: bool) -> dict:
+    """«Оплачено»: ролик убирается из списка «К выплате» (и возвращается обратно, если снять)."""
+    with _lock:
+        items = load()
+        rec = next((x for x in items if x.get("id") == rec_id), None)
+        if not rec:
+            from .util import TwitchCutError
+            raise TwitchCutError("Ролик не найден")
+        if paid:
+            rec["paid"], rec["paid_at"] = True, time.time()
+        else:
+            rec.pop("paid", None)
+            rec.pop("paid_at", None)
+        write_json(PATH, items)
+    return rec
+
+
+def payouts() -> dict:
+    """Ролики, набравшие порог выплаты своего стримера: к выплате, оплаченные и 5 ближайших к порогу."""
+    from . import streamers
+    th = {s["login"]: int(s.get("payout_views") or 0) for s in streamers.load_all()}
+    now = time.time()
+    out: dict[str, dict] = {}
+    changed = False
+    with _lock:
+        items = load()
+        for f in items:
+            login = f.get("streamer") or ""
+            t = th.get(login, 0)
+            if f.get("status") != "posted" or t <= 0:
+                continue
+            g = out.setdefault(login, {"threshold": t, "due": [], "paid": [], "near": []})
+            views = int(f.get("views") or 0)
+            row = {k: f.get(k) for k in ("id", "job", "file", "title", "url", "views", "likes", "comments",
+                                         "posted_at", "posted_ts", "paid_at", "reached_at", "note", "stats_at")}
+            if views >= t:
+                if not f.get("reached_at"):
+                    f["reached_at"] = now
+                    row["reached_at"] = now
+                    changed = True
+                (g["paid"] if f.get("paid") else g["due"]).append(row)
+            elif views > 0 and not f.get("paid"):
+                g["near"].append(row)
+        if changed:
+            write_json(PATH, items)
+    for login, t in th.items():
+        if t > 0:
+            out.setdefault(login, {"threshold": t, "due": [], "paid": [], "near": []})
+    for g in out.values():
+        g["due"].sort(key=lambda r: r.get("reached_at") or 0)
+        g["paid"].sort(key=lambda r: -(r.get("paid_at") or 0))
+        g["paid"] = g["paid"][:100]
+        g["near"].sort(key=lambda r: -(r.get("views") or 0))
+        g["near"] = g["near"][:5]
+    return out
+
+
 def replace(rec: dict) -> None:
     """Перезаписать отметку целиком (используется фоновым обновлением статистики)."""
     with _lock:
         items = load()
-        if not any(x.get("id") == rec["id"] for x in items):
+        cur = next((x for x in items if x.get("id") == rec["id"]), None)
+        if cur is None:
             return  # отметку успели снять
+        # поля, которые меняете вы (заметка, «Оплачено», отметка), берём с диска: обновление статистики
+        # идёт минутами и не должно затирать то, что вы успели изменить за это время
+        rec = {**rec}
+        for k in _USER_KEYS:
+            if k in cur:
+                rec[k] = cur[k]
+            else:
+                rec.pop(k, None)
         items = [rec if x.get("id") == rec["id"] else x for x in items]
         write_json(PATH, items)
 

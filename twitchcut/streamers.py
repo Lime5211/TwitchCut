@@ -32,7 +32,11 @@ FIELDS = {
     "tiktok_account": "",   # open_id аккаунта TikTok, куда отправлять клипы этого стримера
     "tag_ru": "",           # второй хештег в описании TikTok — как стримера зовут зрители (стинт, тоха, дрейк)
     "learned_at": 0,
+    "payout_views": 0,      # сколько просмотров нужно ролику, чтобы за него заплатили (0 — не отслеживать)
 }
+
+# пороги выплат по умолчанию (можно поменять на странице «Выплаты»)
+DEFAULT_PAYOUT = {"t2x2": 200_000, "stintik": 200_000, "drakeoffc": 50_000}
 
 
 def normalize_login(s: str) -> str:
@@ -48,7 +52,14 @@ def normalize_login(s: str) -> str:
 
 def load_all() -> list[dict]:
     data = read_json(PATH) or []
-    return [{**FIELDS, **d} for d in data if isinstance(d, dict) and d.get("login")]
+    out = []
+    for d in data:
+        if isinstance(d, dict) and d.get("login"):
+            rec = {**FIELDS, **d}
+            if "payout_views" not in d:
+                rec["payout_views"] = DEFAULT_PAYOUT.get(d["login"], 0)
+            out.append(rec)
+    return out
 
 
 def get(login: str | None) -> dict | None:
@@ -70,6 +81,10 @@ def upsert(data: dict, fetch_profile: bool = True) -> dict:
             rec["max_clips"] = int(rec.get("max_clips") or 0)
         except (TypeError, ValueError):
             rec["max_clips"] = 0
+        try:
+            rec["payout_views"] = max(0, int(str(rec.get("payout_views") or 0).replace(" ", "")))
+        except (TypeError, ValueError):
+            rec["payout_views"] = 0
         if rec.get("cam_rect"):
             parse_cam_rect(rec["cam_rect"])  # валидация
         if fetch_profile and (not cur or not rec.get("avatar")):

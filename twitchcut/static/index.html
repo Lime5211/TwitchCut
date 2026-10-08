@@ -105,6 +105,8 @@ select.lay{width:auto;padding:5px 8px;font-size:12.5px}
 .fbadge{display:flex;align-items:center;gap:6px;font-size:13px;padding:6px 9px;border-radius:var(--r-sm)}
 .fbadge.posted{background:var(--ok-soft);color:var(--ok)}.fbadge.rejected{background:var(--err-soft);color:#ffb3ba}
 .fbadge a{margin-left:auto;font-size:12px}
+.fnote{display:flex;gap:6px;align-items:flex-start;font-size:12.5px;margin:6px 0;padding:6px 9px;border-radius:var(--r-sm);background:var(--warn-soft, rgba(242,180,69,.12));color:var(--text)}
+.fnote span{white-space:pre-wrap}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chips button{background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:99px;padding:4px 10px;font:13px inherit;font-family:inherit;cursor:pointer}
 .chips button.on{background:var(--err-soft);border-color:var(--err);color:#ffb3ba}
@@ -259,6 +261,7 @@ function route(){
   else if (h==="streamers") { S.view="streamers"; renderStreamers(); }
   else if (h==="status") { S.view="status"; renderStatus(); }
   else if (h==="stats") { S.view="stats"; renderStats(); }
+  else if (h==="payouts") { S.view="payouts"; renderPayouts(); }
   else if (h==="best") { S.view="best"; renderBest(); }
   else if (h==="jobs") { S.view="jobs"; renderJobs(); }
   else { S.view="new"; renderNew(); }
@@ -272,6 +275,7 @@ function renderNav(){
     ["streamers","users","Стримеры",`<span class="cnt">${S.streamers.length||""}</span>`],
     ["best","flame","Лучшее",""],
     ["stats","chart-column-increasing","Статистика",""],
+    ["payouts","wallet","Выплаты",S.payDue?`<span class="cnt" style="color:var(--ok);font-weight:650">${S.payDue}</span>`:""],
     ["status","activity","Статус",`<span class="dot ${st? (ok?"ok":"bad") : ""}"></span>`]];
   $("#nav").innerHTML = items.map(([k,ic,t,x]) => `<a href="#/${k}" class="${S.view===k?'on':''}">${icon(ic)}<span>${t}</span>${x}</a>`).join("");
   $("#recent").innerHTML = S.jobs.slice(0,12).map(j => `<div class="ritem ${S.view==='job'&&S.jobId===j.id?'on':''}" onclick="location.hash='#/job/${encodeURIComponent(j.id)}'">
@@ -287,6 +291,7 @@ function statusIcon(s){ return s==="live"? `<span class="live-dot"></span>` : s=
 async function refreshLists(){
   try { S.jobs = await api("/api/jobs"); } catch(e){}
   try { S.streamers = await api("/api/streamers"); } catch(e){}
+  try { const p = await api("/api/payouts"); S.payDue = Object.values(p.streamers||{}).reduce((a,g)=>a+g.due.length,0); } catch(e){}
   renderNav();
 }
 async function refreshStatus(force){
@@ -833,18 +838,25 @@ function fbBlock(c){
       ${f.likes!=null?` · ${icon("thumbs-up","sm")} ${fmtViews(f.likes)}`:""}${f.comments!=null?` · комм. ${fmtViews(f.comments)}`:""}
       ${f.url?`<a href="${esc(f.url)}" target="_blank">ссылка</a>`:""}${f.stats_error?` <span class="dim" title="${esc(f.stats_error)}">· не удалось обновить</span>`:""}</div>`;
   if (f.status==="rejected") badge = `<div class="fbadge rejected">${icon("ban","sm")} Не подходит${(f.reasons||[]).length?": "+f.reasons.map(r=>REASONS[r]||r).join(", "):""}</div>`;
-  if (f.note) badge += `<div class="dim" style="font-size:12.5px;margin:4px 0">${icon("message-square","sm")} ${esc(f.note)}</div>`;
+  if (f.note) badge += `<div class="fnote">${icon("message-square","sm")} <span>${esc(f.note)}</span></div>`;
   return `<div class="fb" id="fb-${c.n}">${badge}
     <div class="row" style="gap:8px">
       <button class="btn ghost sm" onclick="fbForm(${c.n},'rejected')">${icon("thumbs-down","sm")} Не подходит</button>
       <button class="btn ghost sm" onclick="fbForm(${c.n},'posted')">${icon("send","sm")} ${f.status==="posted"?"Просмотры":"Выложил"}</button>
+      <button class="btn ghost sm" style="flex:0 0 auto" onclick="fbForm(${c.n},'note')" title="Заметка к клипу: что не так смонтировано или выбрано. Можно и к уже выложенному — учтётся в следующих нарезках">${icon("message-square","sm")} Заметка</button>
     </div><div id="fbf-${c.n}"></div></div>`;
 }
 function fbForm(n, kind){
   const c = S.clips.find(x=>x.n===n); const f = c.feedback || {}; const box = $("#fbf-"+n);
   if (box.dataset.kind === kind){ box.innerHTML=""; box.dataset.kind=""; return; }
   box.dataset.kind = kind;
-  if (kind==="rejected"){
+  if (kind==="note"){
+    box.innerHTML = `<div class="hint" style="margin:0 0 6px">Что смонтировано или выбрано не так? Например: «обрезано слишком рано», «лицо второго стримера не в кадре», «долгое начало». Отметку «Выложил» это не меняет — заметки учитываются в следующих нарезках этого стримера.</div>
+      <textarea id="fbnote-${n}" style="min-height:64px" placeholder="Заметка к клипу">${esc(f.note||"")}</textarea>
+      <div class="row" style="margin-top:8px"><button class="btn sm" onclick="fbSave(${n},'note')">${icon("check","sm")} Сохранить заметку</button>
+      ${f.note?`<button class="btn ghost sm" onclick="$('#fbnote-${n}').value='';fbSave(${n},'note')">Удалить заметку</button>`:""}</div>`;
+    setTimeout(()=>$("#fbnote-"+n)?.focus(), 0);
+  } else if (kind==="rejected"){
     const sel = new Set(f.status==="rejected" ? (f.reasons||[]) : []);
     box.innerHTML = `<div class="hint" style="margin:0 0 6px">Почему не подходит? Это учтётся в следующих анализах.</div>
       <div class="chips">${Object.entries(REASONS).map(([k,t])=>`<button type="button" class="${sel.has(k)?"on":""}" data-r="${k}" onclick="this.classList.toggle('on')">${t}</button>`).join("")}</div>
@@ -857,7 +869,6 @@ function fbForm(n, kind){
       <details style="margin-top:6px" ${f.url?"":""}><summary class="muted" style="cursor:pointer;font-size:12px">Ввести просмотры вручную</summary>
       <div class="grid g2" style="gap:8px;margin-top:6px"><input type="number" min="0" id="fbv-${n}" placeholder="Просмотры" value="${f.views??""}">
       <input type="number" min="0" id="fbl-${n}" placeholder="Лайки" value="${f.likes??""}"></div></details>
-      <input type="text" id="fbpn-${n}" style="margin-top:8px" placeholder="Заметка: недочёты монтажа или что можно было лучше (необязательно)" value="${esc(f.status==="posted"?f.note||"":"")}">
       <div class="row" style="margin-top:8px"><button class="btn sm" onclick="fbSave(${n},'posted')">${icon("check","sm")} Сохранить</button>
       ${f.status?`<button class="btn ghost sm" onclick="fbSave(${n},'none')">Снять отметку</button>`:""}</div>`;
   }
@@ -866,9 +877,10 @@ async function fbSave(n, status){
   const c = S.clips.find(x=>x.n===n);
   const body = {job:S.jobId, file:c.file, status};
   if (status==="rejected"){ body.reasons = [...document.querySelectorAll(`#fbf-${n} .chips .on`)].map(b=>b.dataset.r); body.note = $("#fbn-"+n).value; }
-  if (status==="posted"){ body.views = $("#fbv-"+n).value; body.likes = $("#fbl-"+n).value; body.url = $("#fbu-"+n).value; body.note = $("#fbpn-"+n).value; }
+  if (status==="posted"){ body.views = $("#fbv-"+n).value; body.likes = $("#fbl-"+n).value; body.url = $("#fbu-"+n).value; }
+  if (status==="note"){ body.note = $("#fbnote-"+n).value; }
   try{ const r = await api("/api/feedback", body);
-    toast(status==="none"?"Отметка снята":r.stats_pending?"Сохранено — загружаю просмотры из TikTok…":"Сохранено — учтётся в следующих анализах");
+    toast(status==="note"?(body.note.trim()?"Заметка сохранена":"Заметка удалена"):status==="none"?"Отметка снята":r.stats_pending?"Сохранено — загружаю просмотры из TikTok…":"Сохранено — учтётся в следующих анализах");
     S.lastJob=""; S.lastClips=""; renderJob();
     if (r.stats_pending) setTimeout(()=>{ if(S.view==="job"){ S.lastJob=""; S.lastClips=""; renderJob(); } }, 15000); }
   catch(e){ toast(e.message,"err"); }
@@ -964,7 +976,7 @@ async function renderStats(){
   const postedRow = (f,i) => `<tr><td>${esc(f.title||"")}<div class="dim" style="font-size:12px">${f.url?`<a href="${esc(f.url)}" target="_blank">ссылка</a>`:"без ссылки"}${f.auto_link?` <span title="Ссылка поставлена автоматически после публикации черновика">· авто</span>`:""}
           ${f.comments!=null?` · комм. ${fmtViews(f.comments)}`:""}${f.shares!=null?` · репостов ${fmtViews(f.shares)}`:""}
           ${f.stats_at?` · обновлено ${new Date(f.stats_at*1000).toLocaleString("ru",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}`:""}
-          ${f.stats_error?` · <span title="${esc(f.stats_error)}">не удалось обновить</span>`:""}${spark(f.history)}</div></td>
+          ${f.stats_error?` · <span title="${esc(f.stats_error)}">не удалось обновить</span>`:""}${spark(f.history)}</div>${f.note?`<div class="dim" style="font-size:12px">${icon("message-square","sm")} ${esc(f.note)}</div>`:""}</td>
         <td>${esc(CATN[f.category]||f.category||"")}</td>
         <td><input type="number" id="sv-${i}" value="${f.views??""}"></td><td><input type="number" id="sl-${i}" value="${f.likes??""}"></td>
         <td><button class="btn ghost sm" onclick='statSave(${JSON.stringify({job:f.job,file:f.file,url:f.url||""})},${i})'>${icon("save","sm")}</button></td></tr>`;
@@ -1017,12 +1029,64 @@ function spark(h){
 async function statRefresh(btn){
   btn.disabled = true;
   try{ const r = await api("/api/feedback/refresh", {}); toast(r.count?`Обновляю ${r.count} роликов…`:"Нет роликов со ссылкой TikTok");
-    if (r.count) setTimeout(()=>{ if(S.view==="stats") renderStats(); }, Math.min(60000, 4000 + r.count*3000)); }
+    if (r.count) setTimeout(()=>{ if(S.view==="stats") renderStats(); else if(S.view==="payouts") renderPayouts(); }, Math.min(60000, 4000 + r.count*3000)); }
   catch(e){ toast(e.message,"err"); }
   btn.disabled = false;
 }
 async function statSave(ref, i){
   try{ await api("/api/feedback", {...ref, status:"posted", views:$("#sv-"+i).value, likes:$("#sl-"+i).value}); toast("Сохранено"); renderStats(); }
+  catch(e){ toast(e.message,"err"); }
+}
+
+/* ---------------------------------------------------------------- payouts */
+/* Ролики, набравшие порог просмотров своего стримера, за который платят. «Оплачено» убирает ролик из списка. */
+async function renderPayouts(){
+  await refreshLists();
+  let d; try{ d = await api("/api/payouts"); }catch(e){ d = {streamers:{}}; }
+  const groups = d.streamers || {};
+  const sobj = l => S.streamers.find(s=>s.login===l) || {login:l, name:l};
+  const logins = Object.keys(groups).sort((a,b)=>groups[b].due.length-groups[a].due.length || (sobj(a).name||a).localeCompare(sobj(b).name||b));
+  const dt = t => t ? new Date(t*1000).toLocaleDateString("ru-RU",{day:"numeric",month:"short"}) : "—";
+  const total = logins.reduce((a,l)=>a+groups[l].due.length,0);
+  const link = r => r.url ? `<a href="${esc(r.url)}" target="_blank">${esc(r.title||"ролик")} ${icon("external-link","sm")}</a>` : esc(r.title||"ролик");
+  const card = l => { const g = groups[l], s = sobj(l);
+    return `<div class="card mt" id="pay-${esc(l)}"><div class="row" style="gap:10px;align-items:center">${ava(s.avatar)}<h3 style="margin:0">${esc(s.name||l)}</h3>
+        <span class="dim">· к выплате: <b style="color:${g.due.length?"var(--ok)":"inherit"}">${g.due.length}</b></span><span class="sp"></span>
+        <span class="dim" style="font-size:12.5px">Порог</span>
+        <input type="number" min="0" step="10000" id="pth-${esc(l)}" value="${g.threshold}" style="width:110px;padding:4px 8px">
+        <span class="dim" style="font-size:12.5px">просм.</span>
+        <button class="btn ghost sm" onclick="payThreshold('${esc(l)}')">${icon("save","sm")}</button></div>
+      ${g.due.length?`<table class="t mt"><tr><th>Ролик</th><th>Просмотры</th><th>Выложен</th><th>Набрал порог</th><th></th></tr>
+        ${g.due.map(r=>`<tr><td>${link(r)}${r.note?`<div class="dim" style="font-size:12px">${icon("message-square","sm")} ${esc(r.note)}</div>`:""}</td>
+          <td><b>${fmtViews(r.views)}</b></td><td class="muted">${dt(r.posted_ts||r.posted_at)}</td><td class="muted">${dt(r.reached_at)}</td>
+          <td style="white-space:nowrap"><button class="btn sm" onclick="payMark(${esc(JSON.stringify(r.id))},true,this)">${icon("check","sm")} Оплачено</button></td></tr>`).join("")}</table>
+        <div class="row mt" style="gap:8px"><button class="btn ghost sm" onclick="copy(${esc(JSON.stringify(g.due.filter(r=>r.url).map(r=>r.url).join("\n")))}, this)">${icon("copy","sm")} Скопировать все ссылки</button></div>`
+        :`<div class="dim mt">Пока нет роликов от ${fmtViews(g.threshold)} просмотров, за которые ещё не заплатили.</div>`}
+      ${g.near.length?`<details class="mt"><summary class="muted" style="cursor:pointer">Ближе всего к порогу</summary>
+        <table class="t mt">${g.near.map(r=>{ const p = Math.min(100, Math.round(100*(r.views||0)/g.threshold));
+          return `<tr><td>${link(r)}</td><td style="width:200px"><div class="bar" style="height:6px;background:var(--line,#2a2a33);border-radius:3px;overflow:hidden"><i style="display:block;height:100%;width:${p}%;background:var(--accent)"></i></div>
+            <div class="dim" style="font-size:12px">${fmtViews(r.views)} из ${fmtViews(g.threshold)} · ${p}%</div></td></tr>`; }).join("")}</table></details>`:""}
+      ${g.paid.length?`<details class="mt"><summary class="muted" style="cursor:pointer">Оплаченные · ${g.paid.length}</summary>
+        <table class="t mt"><tr><th>Ролик</th><th>Просмотры</th><th>Оплачено</th><th></th></tr>${g.paid.map(r=>`<tr><td>${link(r)}</td><td>${fmtViews(r.views)}</td><td class="muted">${dt(r.paid_at)}</td>
+          <td><button class="btn ghost sm" onclick="payMark(${esc(JSON.stringify(r.id))},false,this)" title="Вернуть в «К выплате»">${icon("rotate-ccw","sm")} Вернуть</button></td></tr>`).join("")}</table></details>`:""}
+    </div>`; };
+  $("#main").innerHTML = `<div class="page">
+    <div class="ph"><div><h1>Выплаты</h1><p>Ролики, которые набрали порог просмотров своего стримера. Когда за ролик заплатили — нажмите «Оплачено», и он уйдёт из списка.</p></div></div>
+    <div class="tiles"><div class="tile"><b>${total}</b><span>к выплате</span></div>
+      ${logins.map(l=>`<div class="tile" style="cursor:pointer" onclick="document.getElementById('pay-${esc(l)}').scrollIntoView({behavior:'smooth'})"><b>${groups[l].due.length}</b><span>${esc(sobj(l).name||l)} · от ${fmtViews(groups[l].threshold)}</span></div>`).join("")}</div>
+    <div class="row mt" style="gap:8px"><button class="btn ghost sm" onclick="statRefresh(this)">${icon("refresh-cw","sm")} Обновить просмотры из TikTok</button>
+      <span class="dim" style="font-size:12px">Просмотры обновляются и сами: свежие ролики раз в 3 часа, старше недели — раз в сутки</span></div>
+    ${logins.length?logins.map(card).join(""):`<div class="card mt empty">${icon("wallet")}<div>Добавьте стримеров — у каждого здесь появится свой порог выплаты.</div></div>`}
+    <div class="hint mt">Порог 0 — не отслеживать этого стримера. Учитываются ролики с отметкой «Выложил» и ссылкой на TikTok.</div>
+  </div>`;
+}
+async function payMark(id, paid, btn){
+  btn.disabled = true;
+  try{ await api("/api/payouts/paid", {id, paid}); toast(paid?"Отмечено как оплаченное":"Вернул в «К выплате»"); renderPayouts(); }
+  catch(e){ toast(e.message,"err"); btn.disabled = false; }
+}
+async function payThreshold(login){
+  try{ await api("/api/payouts/threshold", {streamer: login, views: $("#pth-"+login).value}); toast("Порог сохранён"); renderPayouts(); }
   catch(e){ toast(e.message,"err"); }
 }
 

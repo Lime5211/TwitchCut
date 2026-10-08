@@ -168,7 +168,7 @@ class Manager:
     def _relayout_outdated(self) -> None:
         """После обновления программы готовые клипы перемонтируются по новой раскладке — без запросов к
         Claude (всё, что он решил, сохранено). Меняются только клипы, где новая раскладка что-то даёт
-        (например, в кадре несколько человек); уже выложенные в TikTok не трогаются."""
+        (например, в кадре несколько человек); уже выложенные в TikTok и отклонённые («Не подходит») не трогаются."""
         from .pipeline import Job, heavy
         from .render import LAYOUT_VERSION
         from . import feedback
@@ -184,7 +184,10 @@ class Manager:
                 if not st.get("ref") or st.get("status") in ("live", "running", "queued", "awaiting_llm"):
                     continue  # идущую задачу не трогаем: её новые клипы и так монтируются по-новому
                 fb = feedback.for_job(d.name)
-                posted = {c.get("n") for c in clips if (fb.get(c.get("file")) or {}).get("status") == "posted"}
+                # выложенные и отклонённые клипы не трогаем: отклонённый можно перемонтировать вручную
+                # кнопкой «Применить» на его карточке
+                posted = {c.get("n") for c in clips
+                          if (fb.get(c.get("file")) or {}).get("status") in ("posted", "rejected")}
                 cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
                 job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=d.name)
 
@@ -437,12 +440,14 @@ class Manager:
         st = dict(self.live.get(job_id) or read_json(d / "job.json") or {})
         if not st:
             return None
-        if st.get("status") in ("done", "error") or not st.get("clips"):
-            clips = read_json(d / "clips.json")
-            if clips is None:
-                clips = read_json(d / "clips.partial.json")
-            if clips is not None:
-                st["clips"] = clips
+        # клипы всегда берём из clips.json: во время эфира (и пока идёт другая задача) состояние в памяти
+        # не знает о клипах, смонтированных вручную из «Все найденные моменты», — из-за этого они не
+        # появлялись на странице, хотя файлы уже лежали в папке
+        clips = read_json(d / "clips.json")
+        if clips is None:
+            clips = read_json(d / "clips.partial.json")
+        if clips is not None:
+            st["clips"] = clips
         if st.get("clips"):
             from . import feedback
             fb = feedback.for_job(job_id)
@@ -572,6 +577,11 @@ class Manager:
         clips = read_json(d / "clips.json") or []
         c = next((x for x in clips if x.get("file") == file), None)
         if not c:
+            prev = next((x for x in feedback.load() if x.get("id") == f"{job_id}/{file}"), {})
+            if prev and data.get("status") == "note":
+                # задачу уже удалили, а отметка осталась (например, заметка со страницы «Статистика»)
+                return feedback.upsert({"job": job_id, "file": file, "note": (data.get("note") or "").strip()[:500],
+                                        "status": prev.get("status") or "note"})
             raise TwitchCutError("Клип не найден")
         st = read_json(d / "job.json") or {}
         text = c.get("text") or ""
@@ -584,16 +594,32 @@ class Manager:
                 return int(str(v).replace(" ", "").replace(",", "")) if str(v).strip() not in ("", "None") else None
             except ValueError:
                 return None
+        prev = next((x for x in feedback.load() if x.get("id") == f"{job_id}/{file}"), {})
+        status = data.get("status")
+        note = (data.get("note") or "").strip()[:500] if "note" in data else None
+        if status == "note":
+            # только заметка: отметку «Выложил»/«Не подходит» не меняем (заметку можно писать и к выложенному)
+            status = prev.get("status") if prev.get("status") not in (None, "", "none") else "note"
+            if status == "note" and not note:
+                status = "none"  # пустая заметка у клипа без отметки — удаляем запись
+        elif status in ("none", "", None) and (note if note is not None else prev.get("note")):
+            status = "note"  # сняли отметку, а заметка осталась — сохраняем её
         entry = {
             "job": job_id, "file": file, "streamer": st.get("streamer") or (st.get("channel") or "").lower(),
             "title": data.get("title") or c.get("title"), "titles": c.get("titles"), "category": c.get("category"),
             "source": c.get("source"), "topic": c.get("topic"), "score": c.get("score"), "duration": c.get("duration"),
-            "text": text, "status": data.get("status"), "reasons": data.get("reasons") or [],
-            "note": (data.get("note") or "").strip()[:300], "views": num(data.get("views")), "likes": num(data.get("likes")),
-            "url": (data.get("url") or "").strip()[:300], "final_duration": c.get("final_duration"),
+            "text": text, "status": status, "reasons": data.get("reasons") if "reasons" in data else None,
+            "note": note, "views": num(data.get("views")) if "views" in data else None,
+            "likes": num(data.get("likes")) if "likes" in data else None,
+            "url": (data.get("url") or "").strip()[:300] if "url" in data else None, "final_duration": c.get("final_duration"),
             "speed": c.get("speed"), "layout": c.get("layout"), "extra": c.get("extra"),
         }
-        prev = next((x for x in feedback.load() if x.get("id") == f"{job_id}/{file}"), {})
+        if data.get("status") == "note":
+            entry = {k: v for k, v in entry.items() if k in ("job", "file", "streamer", "title", "titles", "category",
+                                                              "source", "topic", "score", "duration", "text",
+                                                              "status", "note", "final_duration", "speed", "layout")}
+        if status == "rejected" and "reasons" not in data:
+            entry["reasons"] = []
         rec = feedback.upsert(entry)
         if fetch and rec.get("url") and (rec.get("url") != prev.get("url") or not rec.get("stats_at") or data.get("refresh")):
             feedback.fetch_stats_async(rec)
@@ -794,6 +820,9 @@ def make_handler(mgr: Manager):
                     return self._json({"items": sorted(items, key=lambda f: -f.get("updated", 0)),
                                        "stats": feedback.stats(login), "reasons": feedback.REASONS,
                                        "by_streamer": {} if login else feedback.stats_by_streamer()})
+                if path == "/api/payouts":
+                    from . import feedback
+                    return self._json({"streamers": feedback.payouts()})
                 if path == "/api/twitch/auth":
                     from .twitch_api import auth_info
                     return self._json(auth_info())
@@ -874,6 +903,18 @@ def make_handler(mgr: Manager):
                     days = float(data.get("days") if data.get("days") is not None else
                                  load_config(mgr.config_path).get("cleanup", {}).get("keep_days", 2))
                     return self._json(cleanup.cleanup(mgr.ws, days, set(mgr.live_jobs)))
+                if path == "/api/payouts/paid":
+                    from . import feedback
+                    feedback.set_paid(data.get("id") or "", bool(data.get("paid", True)))
+                    return self._json({"ok": True})
+                if path == "/api/payouts/threshold":
+                    login = streamers.normalize_login(data.get("streamer") or "")
+                    try:
+                        v = max(0, int(str(data.get("views") or 0).replace(" ", "")))
+                    except ValueError:
+                        raise TwitchCutError("Порог — целое число просмотров")
+                    streamers.set_fields(login, payout_views=v)
+                    return self._json({"ok": True})
                 if path == "/api/feedback/refresh":
                     from . import feedback, tiktok
                     ids = {f["id"] for f in feedback.load() if f.get("status") == "posted" and tiktok.is_tiktok(f.get("url") or "")}
