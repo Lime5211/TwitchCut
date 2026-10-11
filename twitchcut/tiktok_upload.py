@@ -39,6 +39,7 @@ TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 API = "https://open.tiktokapis.com/v2"
 SCOPES = "user.info.basic,video.upload"
 SCOPES_LIST = SCOPES + ",video.list"   # если в приложение добавлен Display API
+SCOPE_PUBLISH = "video.publish"          # Direct Post: публикация сразу с подписью (см. upload_draft)
 UPLOADS_PATH = ROOT_DIR / "data" / "tiktok_uploads.json"  # отправленные черновики, за которыми следим
 _up_lock = threading.Lock()
 _track_lock = threading.Lock()
@@ -53,6 +54,9 @@ ERRORS = {
     "scope_not_authorized": "Приложению не дан доступ video.upload — войдите в TikTok заново и разрешите загрузку видео.",
     "rate_limit_exceeded": "Слишком много запросов к TikTok — подождите минуту.",
     "file_format_check_failed": "TikTok не принял файл: формат не подходит.",
+    "unaudited_client_can_only_post_to_private_accounts": "TikTok разрешает непроверенному приложению публиковать "
+        "только в закрытый аккаунт / как «Только я».",
+    "privacy_level_option_mismatch": "TikTok не принял выбранную приватность публикации.",
 }
 
 
@@ -60,20 +64,30 @@ def app_info() -> dict:
     return read_json(APP_PATH) or {}
 
 
-def save_app(client_key: str, client_secret: str, video_list: bool | None = None) -> None:
+def save_app(client_key: str, client_secret: str, video_list: bool | None = None,
+             direct_post: bool | None = None) -> None:
     old = app_info()
     client_key, client_secret = (client_key or "").strip(), (client_secret or "").strip()
-    if not client_key and not client_secret and old.get("client_key") and video_list is not None:
-        write_json(APP_PATH, {**old, "video_list": bool(video_list)})  # меняем только галочку Display API
+    flags = {k: bool(v) for k, v in (("video_list", video_list), ("direct_post", direct_post)) if v is not None}
+    if not client_key and not client_secret and old.get("client_key") and flags:
+        write_json(APP_PATH, {**old, **flags})  # меняем только галочки
         return
     if not client_key or not client_secret:
         raise TwitchCutError("Укажите Client key и Client secret приложения TikTok")
-    write_json(APP_PATH, {**old, "client_key": client_key, "client_secret": client_secret,
-                          **({"video_list": bool(video_list)} if video_list is not None else {})})
+    write_json(APP_PATH, {**old, "client_key": client_key, "client_secret": client_secret, **flags})
 
 
 def _scopes() -> str:
-    return SCOPES_LIST if app_info().get("video_list") else SCOPES
+    app = app_info()
+    sc = SCOPES_LIST if app.get("video_list") else SCOPES
+    if app.get("direct_post"):
+        sc += "," + SCOPE_PUBLISH
+    return sc
+
+
+def has_publish(open_id: str) -> bool:
+    """Выдан ли этому аккаунту доступ к публикации с подписью (video.publish)."""
+    return SCOPE_PUBLISH in ((_tokens().get(open_id) or {}).get("scope") or "")
 
 
 def has_list(open_id: str) -> bool:
@@ -103,7 +117,8 @@ def accounts() -> list[dict]:
     for oid, t in _tokens().items():
         out.append({"open_id": oid, "name": t.get("display_name") or oid[:10], "avatar": t.get("avatar_url"),
                     "ok": bool(t.get("refresh_token")) and t.get("refresh_expires_at", 0) > time.time(),
-                    "video_list": "video.list" in (t.get("scope") or ""), "streamers": by.get(oid, [])})
+                    "video_list": "video.list" in (t.get("scope") or ""),
+                    "publish": SCOPE_PUBLISH in (t.get("scope") or ""), "streamers": by.get(oid, [])})
     return out
 
 
@@ -113,7 +128,8 @@ def status() -> dict:
     ups = _uploads()
     waiting = sum(1 for u in ups if not u.get("url") and not u.get("gone") and time.time() - u.get("at", 0) < TRACK_DAYS * 86400)
     return {"configured": bool(app.get("client_key")), "connected": any(a["ok"] for a in acc), "accounts": acc,
-            "video_list": bool(app.get("video_list")), "waiting": waiting}
+            "video_list": bool(app.get("video_list")), "direct_post": bool(app.get("direct_post")),
+            "waiting": waiting}
 
 
 def disconnect(open_id: str | None = None) -> None:
@@ -242,20 +258,34 @@ def _chunks(size: int) -> tuple[int, int]:
     return chunk, size // chunk
 
 
-def upload_draft(path: Path, open_id: str, progress=None) -> dict:
-    """Загружает видео во «Входящие» аккаунта TikTok open_id. Возвращает {publish_id, status, account}."""
-    path = Path(path)
-    if not path.is_file():
-        raise TwitchCutError("Файл клипа не найден (возможно, удалён автоочисткой — нажмите «Применить», чтобы смонтировать заново)")
-    size = path.stat().st_size
-    chunk, count = _chunks(size)
-    token = access_token(open_id)
-    h = {"Authorization": "Bearer " + token, "Content-Type": "application/json; charset=UTF-8"}
-    data = _check(requests.post(API + "/post/publish/inbox/video/init/", headers=h, timeout=30, json={
-        "source_info": {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": chunk, "total_chunk_count": count}}))
-    url, pid = data.get("upload_url"), data.get("publish_id")
-    if not url:
-        raise TwitchCutError("TikTok не выдал адрес загрузки")
+def _utf16_cut(text: str, limit: int) -> str:
+    """Обрезка по «рунам UTF-16», как считает TikTok (эмодзи = 2)."""
+    out, n = [], 0
+    for ch in text:
+        k = 2 if ord(ch) > 0xFFFF else 1
+        if n + k > limit:
+            break
+        out.append(ch)
+        n += k
+    return "".join(out)
+
+
+def _privacy(open_id: str, h: dict) -> str:
+    """Приватность для публикации с подписью. Непроверенному приложению TikTok разрешает только «Только я»
+    (SELF_ONLY): ролик публикуется скрытым с готовой подписью, а открыть его всем — в приложении TikTok."""
+    want = (app_info().get("direct_privacy") or "SELF_ONLY").upper()
+    try:
+        d = _check(requests.post(API + "/post/publish/creator_info/query/", headers=h, timeout=20, json={}))
+        opts = d.get("privacy_level_options") or []
+    except TwitchCutError as e:
+        log.info("TikTok: creator_info: %s", e)
+        opts = []
+    if not opts or want in opts:
+        return want
+    return "SELF_ONLY" if "SELF_ONLY" in opts else opts[0]
+
+
+def _put_file(url: str, path: Path, size: int, chunk: int, count: int, progress=None) -> None:
     with open(path, "rb") as f:
         for i in range(count):
             first = i * chunk
@@ -269,8 +299,49 @@ def upload_draft(path: Path, open_id: str, progress=None) -> dict:
                 raise TwitchCutError(f"Загрузка в TikTok прервалась ({r.status_code}): {r.text[:200]}")
             if progress:
                 progress(i + 1, count)
+
+
+def upload_draft(path: Path, open_id: str, progress=None, caption: str | None = None) -> dict:
+    """Отправляет видео в аккаунт TikTok open_id. Возвращает {publish_id, status, account, mode}.
+
+    Обычно — во «Входящие» как черновик (mode="inbox"): TikTok НЕ даёт API заполнить подпись черновика видео,
+    её вставляют в приложении (TwitchCut копирует описание в буфер обмена).
+    Если на странице «Статус» включена «Публикация с подписью» и аккаунт дал доступ video.publish —
+    ролик публикуется сразу с готовой подписью (mode="direct"). Пока приложение TikTok не прошло проверку,
+    такой ролик виден только вам («Только я»): откройте его в TikTok и поменяйте видимость на «Все».
+    Если TikTok откажет в публикации, видео уходит в черновики, как обычно."""
+    path = Path(path)
+    if not path.is_file():
+        raise TwitchCutError("Файл клипа не найден (возможно, удалён автоочисткой — нажмите «Применить», чтобы смонтировать заново)")
+    size = path.stat().st_size
+    chunk, count = _chunks(size)
+    token = access_token(open_id)
+    h = {"Authorization": "Bearer " + token, "Content-Type": "application/json; charset=UTF-8"}
+    src = {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": chunk, "total_chunk_count": count}
+    mode, privacy, fallback = "inbox", None, ""
+    data = None
+    if caption and app_info().get("direct_post") and has_publish(open_id):
+        privacy = _privacy(open_id, h)
+        try:
+            data = _check(requests.post(API + "/post/publish/video/init/", headers=h, timeout=30, json={
+                "post_info": {"title": _utf16_cut(caption.strip(), 2200), "privacy_level": privacy,
+                              "disable_comment": False, "disable_duet": False, "disable_stitch": False,
+                              "video_cover_timestamp_ms": 500},
+                "source_info": src}))
+            mode = "direct"
+        except TwitchCutError as e:
+            log.warning("TikTok: публикация с подписью не прошла (%s) — отправляю в черновики", e)
+            fallback = str(e)
+            data = None
+    if data is None:
+        data = _check(requests.post(API + "/post/publish/inbox/video/init/", headers=h, timeout=30,
+                                    json={"source_info": src}))
+    url, pid = data.get("upload_url"), data.get("publish_id")
+    if not url:
+        raise TwitchCutError("TikTok не выдал адрес загрузки")
+    _put_file(url, path, size, chunk, count, progress)
     st = "PROCESSING_UPLOAD"
-    for _ in range(10):  # ждём, пока TikTok примет файл (обычно секунды)
+    for _ in range(20 if mode == "direct" else 10):  # ждём, пока TikTok примет файл (обычно секунды)
         time.sleep(3)
         try:
             d = _check(requests.post(API + "/post/publish/status/fetch/", headers=h, timeout=20,
@@ -283,9 +354,14 @@ def upload_draft(path: Path, open_id: str, progress=None) -> dict:
             break
         if st == "FAILED":
             raise TwitchCutError("TikTok не принял видео: " + str(d.get("fail_reason") or "неизвестная причина"))
-    log.info("TikTok: %s отправлен в черновики (%s, %s)", path.name, pid, st)
+    log.info("TikTok: %s отправлен (%s, %s, %s%s)", path.name, mode, pid, st, f", {privacy}" if privacy and mode == "direct" else "")
     name = (_tokens().get(open_id) or {}).get("display_name") or open_id[:10]
-    return {"publish_id": pid, "status": st, "at": time.time(), "account": name}
+    res = {"publish_id": pid, "status": st, "at": time.time(), "account": name, "mode": mode}
+    if mode == "direct":
+        res["privacy"] = privacy
+    if fallback:
+        res["direct_error"] = fallback[:200]
+    return res
 
 
 # ------------------------------------------------------------------ слежение за опубликованными черновиками

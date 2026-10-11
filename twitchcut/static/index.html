@@ -244,7 +244,7 @@ async function api(path, body){
 let toastT;
 function toast(msg, kind="ok"){ const t=$("#toast"); t.className="toast on "+kind;
   t.innerHTML = icon(kind==="err"?"circle-alert":"circle-check") + `<span>${esc(msg)}</span>`;
-  clearTimeout(toastT); toastT = setTimeout(()=>t.classList.remove("on"), 3500); }
+  clearTimeout(toastT); toastT = setTimeout(()=>t.classList.remove("on"), Math.max(3500, String(msg).length*55)); }
 function copy(t, btn){ navigator.clipboard.writeText(t); const o=btn.innerHTML; btn.innerHTML=icon("check","sm")+" Скопировано"; setTimeout(()=>btn.innerHTML=o, 1300); }
 function openModal(html){ $("#modalbox").innerHTML = html; $("#modal").classList.add("on"); }
 function closeModal(){ $("#modal").classList.remove("on"); }
@@ -450,14 +450,11 @@ async function renderJob(){
   const clips = st.clips || [];
   S.clips = clips;
   const cardOf = (c) => {
-      const tags = c.caption || (c.hashtags||[]).slice(0,5).map(t=>"#"+t.replace(/\s/g,"")).join(" ");
       const f = `/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.file)}?v=${c.v||0}`;
       const busy = (st.rendering||{})[String(c.n)];
       const rerr = (st.render_errors||{})[String(c.n)];
       const dur = c.final_duration ?? c.duration;
-      const sp = S.edits?.[c.n]?.speed ?? (c.speed || 1);
-      const dirty = Math.abs(sp-(c.speed||1))>0.01;
-      const titles = (c.titles&&c.titles.length?c.titles:[c.title]).filter(Boolean).slice(0,2);
+      const titles = (c.titles&&c.titles.length?c.titles:[c.title]).filter(Boolean).slice(0,1);
       return `<div class="clip ${c.feedback?.status==="rejected"?"rejected":""}" id="clip-${c.n}">
       <div class="vwrap">${c.missing && !busy ? `<img src="/files/${encodeURIComponent(S.jobId)}/${encodeURI(c.thumb)}" style="width:100%;height:100%;object-fit:cover;opacity:.45" onerror="this.style.display='none'">
           <div class="busy">${icon("trash","lg")}<span>Видео удалено автоочисткой.<br>«Применить» смонтирует заново.</span></div>`
@@ -470,15 +467,11 @@ async function renderJob(){
         ${c.content_cut_sec>0?`<span class="chip" title="Claude вырезал лишнее: донат не по теме, повторы, поиск">${icon("scissors","sm")} −${c.content_cut_sec}с воды</span>`:""}
         ${c.director?`<span class="chip" title="${esc((c.director_shots||[]).map(x=>`${fmt(x.t0)}–${fmt(x.t1)}: ${({split:"вебка + экран",cam:"только вебка",screen:"только экран"})[x.layout]||x.layout}${x.focus?" (крупно: "+(x.why||"важное")+")":""}`).join("\n"))}">${icon("clapperboard","sm")} режиссёр</span>`:""}</div>
         <div class="titles">${titles.map(t=>`<div class="tv" onclick="copyTitle(this)" data-t="${esc(t)}" title="Нажмите, чтобы скопировать"><span>${esc(t)}</span>${icon("copy","sm")}</div>`).join("")}</div>
-        ${tags?`<div class="titles"><div class="tv tags" onclick="copyTitle(this)" data-t="${esc(tags)}" title="Описание для TikTok — нажмите, чтобы скопировать"><span>${esc(tags)}</span>${icon("copy","sm")}</div></div>`:""}
         <div class="edit">
-          <div class="seg sm">${[1,1.1,1.25,1.5,2].map(v=>`<button type="button" class="${Math.abs(sp-v)<0.01?'on':''}" onclick="setSpeed(${c.n},${v},this)">${v}×</button>`).join("")}</div>
-          <label class="check" title="Вырезать «мёртвые» паузы, когда стример задумался. Смех, реакции и звук игры не трогаются.">
-            <input type="checkbox" id="trim-${c.n}" ${c.trim_pauses!==false?"checked":""} onchange="markDirty(${c.n})"> без пауз${c.pauses_removed>0?` <span class="dim">(−${c.pauses_removed}с)</span>`:""}</label>
           <select class="lay" id="lay-${c.n}" onchange="markDirty(${c.n})" title="Раскладка кадра">
             ${[["auto","Авто"],["split","Вебка + игра"],["cam","Только вебка"],["screen","Только экран"],["crop","Кадр по лицу"],["blur","Весь кадр"]].map(([k,t])=>`<option value="${k}" ${(c.layout_choice||"auto")===k?"selected":""}>${t}${k==="auto"&&c.layout?" ("+[...new Set(c.layouts||[c.layout])].map(x=>({split:"вебка + игра",cam:"только вебка",crop:"по лицу",blur:"весь кадр",screen:"экран"})[x]).join(" → ")+")":""}</option>`).join("")}
           </select>
-          <button class="btn sm ghost" id="apply-${c.n}" style="${dirty||c.missing?"":"display:none"}" onclick="applyEdit(${c.n})">${icon("refresh-cw","sm")} Применить</button>
+          <button class="btn sm ghost" id="apply-${c.n}" style="${c.missing?"":"display:none"}" onclick="applyEdit(${c.n})">${icon("refresh-cw","sm")} Применить</button>
         </div>
         ${c.missing?"":`<div class="edit" title="Claude оставит только самое сильное: крючок, суть и развязку">
           <span class="dim" style="font-size:12.5px">${icon("scissors","sm")} Ужать до</span>
@@ -486,14 +479,15 @@ async function renderJob(){
           <span class="dim" style="font-size:12.5px">с</span>
           <button class="btn sm ghost" onclick="shortenClip(${c.n})" ${busy?"disabled":""}>Ужать</button>
           ${c.original?`<button class="btn sm ghost" onclick="restoreClip(${c.n})" title="Вернуть границы, какие были до «ужать»" ${busy?"disabled":""}>${icon("rotate-ccw","sm")} Вернуть</button>`:""}
-        </div>${c.shorten_note?`<div class="hint" style="margin:0">${esc(c.shorten_note)}</div>`:""}`}
+        </div>`}
         ${rerr?`<div class="alert err" style="margin:0">${esc(rerr)}</div>`:""}
-        ${c.missing?"":`<div class="acts"><a class="btn sm" href="${f}&download=1">${icon("download","sm")} Скачать</a>
-          <button class="btn ghost sm" id="tt-${c.n}" onclick="toTikTok(${c.n}, this)" title="Отправить во «Входящие» TikTok как черновик — опубликуете в приложении сами">${icon("send","sm")} ${c.tiktok_draft?"Ещё раз в TikTok":"В TikTok"}</button>
-          ${c.tiktok_draft?(c.tiktok_draft.url?`<a class="dim" style="font-size:12px" href="${esc(c.tiktok_draft.url)}" target="_blank">${icon("circle-check","sm")} опубликовано в TikTok</a>`:`<span class="dim" style="font-size:12px" title="Как только опубликуете черновик в приложении TikTok, ссылка поставится сама (проверка каждые 10 минут)">${icon("circle-check","sm")} в черновиках TikTok${c.tiktok_draft.account?" ("+esc(c.tiktok_draft.account)+")":""} · ждём публикации</span>`):""}</div>`}
+        ${c.missing?"":`<div class="acts">
+          <button class="btn sm" id="tt-${c.n}" onclick="toTikTok(${c.n}, this)" title="Отправить в TikTok аккаунта этого стримера (с описанием, если на странице «Статус» включена публикация с подписью)">${icon("send","sm")} ${c.tiktok_draft?"Ещё раз в TikTok":"В TikTok"}</button>
+          ${c.tiktok_draft?(c.tiktok_draft.url?`<a class="dim" style="font-size:12px" href="${esc(c.tiktok_draft.url)}" target="_blank">${icon("circle-check","sm")} опубликовано в TikTok</a>`:(c.tiktok_draft.mode==="direct"?`<span class="dim" style="font-size:12px" title="Ролик опубликован с подписью, видимость «Только я». Откройте его в TikTok → «…» → Настройки конфиденциальности → «Все». Ссылка поставится сама.">${icon("circle-check","sm")} в TikTok с подписью${c.tiktok_draft.account?" ("+esc(c.tiktok_draft.account)+")":""} · виден только вам</span>`
+            :`<span class="dim" style="font-size:12px" title="Как только опубликуете черновик в приложении TikTok, ссылка поставится сама (проверка каждые 10 минут)">${icon("circle-check","sm")} в черновиках TikTok${c.tiktok_draft.account?" ("+esc(c.tiktok_draft.account)+")":""} · ждём публикации</span>`)):""}</div>`}
         ${fbBlock(c)}</div></div>`;
     };
-  const keyOf = (c) => JSON.stringify([c.file,c.score,c.titles,c.feedback,c.v,c.missing,c.layout_choice,c.speed,c.trim_pauses,c.tiktok_draft,
+  const keyOf = (c) => JSON.stringify([c.file,c.score,c.titles,c.feedback,c.v,c.missing,c.layout_choice,c.tiktok_draft,
     (st.rendering||{})[String(c.n)]||null,(st.render_errors||{})[String(c.n)]||null]);
   let bottom = "";
   if (clips.length >= 2 && !["running","queued"].includes(st.status)) bottom += compCard(st);
@@ -604,8 +598,13 @@ async function toTikTok(n, btn){
   btn.disabled = true; const old = btn.innerHTML; btn.innerHTML = `${icon("loader-circle","sm spin")} Загружаю…`;
   const cap = (S.clips.find(x=>x.n===n)||{}).caption || "";
   try{ const r = await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/tiktok`, {});
-    let copied = false; if (cap){ try{ await navigator.clipboard.writeText(cap); copied = true; }catch(e){} }
-    toast(`Отправлено во «Входящие» TikTok (${r.account})`+(copied?" — описание скопировано, вставьте его в подпись":" — допишите подпись в приложении")); S.lastJob=""; renderJob(); }
+    if (r.mode === "direct"){
+      toast(`Опубликовано в TikTok (${r.account}) с описанием — видно только вам. В TikTok откройте ролик и поменяйте видимость на «Все»`);
+    } else {
+      let copied = false; if (cap){ try{ await navigator.clipboard.writeText(cap); copied = true; }catch(e){} }
+      toast(`Отправлено во «Входящие» TikTok (${r.account})`+(r.direct_error?" — с подписью не вышло: "+r.direct_error+".":"")+(copied?" Описание скопировано — вставьте его в подпись":" Допишите подпись в приложении"), r.direct_error?"err":undefined);
+    }
+    S.lastJob=""; renderJob(); }
   catch(e){ toast(e.message,"err"); btn.disabled = false; btn.innerHTML = old; }
 }
 async function toTikTokComp(file, btn){
@@ -618,13 +617,12 @@ async function toTikTokComp(file, btn){
 async function rerun(from){ try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/rerun`, {from}); S.lastJob=""; clearInterval(S.timer); renderJob(); S.timer=setInterval(renderJob,1500); refreshLists(); }catch(e){ toast(e.message,"err"); } }
 async function sendLLM(){ try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/llm`, {text: $("#llmans").value}); S.lastJob=""; toast("Ответ принят"); }catch(e){ toast(e.message,"err"); } }
 S.edits = {};
-function setSpeed(n, v, btn){ btn.parentElement.querySelectorAll("button").forEach(b=>b.classList.toggle("on", b===btn));
-  (S.edits[n] = S.edits[n] || {}).speed = v; markDirty(n); }
-function markDirty(n){ const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
-  const sp = e.speed ?? (c.speed||1), tr = $("#trim-"+n).checked, lay = $("#lay-"+n).value;
-  $("#apply-"+n).style.display = (Math.abs(sp-(c.speed||1))>0.01 || tr !== (c.trim_pauses!==false) || lay !== (c.layout_choice||"auto")) ? "" : "none"; }
-function editBody(n){ const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
-  return {speed: e.speed ?? (c.speed||1), trim: $("#trim-"+n).checked, layout: $("#lay-"+n).value}; }
+/* Паузы вырезаются всегда (кроме тех, где в тишине в кадре что-то важное) — переключателя больше нет.
+   Скорость не меняется: у старых клипов остаётся та, с которой они смонтированы. */
+function markDirty(n){ const c = S.clips.find(x=>x.n===n); const lay = $("#lay-"+n).value;
+  $("#apply-"+n).style.display = (lay !== (c.layout_choice||"auto") || c.missing) ? "" : "none"; }
+function editBody(n){ const c = S.clips.find(x=>x.n===n);
+  return {speed: c.speed||1, trim: true, layout: $("#lay-"+n).value}; }
 async function shortenClip(n){
   const sec = parseFloat($("#short-"+n).value);
   if (!(sec >= 5)) { toast("Укажите длину в секундах","err"); return; }
@@ -636,8 +634,7 @@ async function restoreClip(n){
     S.lastJob=""; renderJob(); toast("Возвращаю прежние границы…"); }
   catch(err){ toast(err.message,"err"); } }
 async function applyEdit(n){
-  const c = S.clips.find(x=>x.n===n); const e = S.edits[n] || {};
-  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/render`, {speed: e.speed ?? (c.speed||1), trim: $("#trim-"+n).checked, layout: $("#lay-"+n).value});
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/render`, editBody(n));
     delete S.edits[n]; S.lastJob=""; S.lastClips=""; renderJob(); toast("Перемонтирую клип…"); }
   catch(err){ toast(err.message,"err"); } }
 function copyTitle(el){ navigator.clipboard.writeText(el.dataset.t); const ic = el.querySelector(".ic"); const o = ic.outerHTML;
@@ -842,7 +839,6 @@ function fbBlock(c){
   return `<div class="fb" id="fb-${c.n}">${badge}
     <div class="row" style="gap:8px">
       <button class="btn ghost sm" onclick="fbForm(${c.n},'rejected')">${icon("thumbs-down","sm")} Не подходит</button>
-      <button class="btn ghost sm" onclick="fbForm(${c.n},'posted')">${icon("send","sm")} ${f.status==="posted"?"Просмотры":"Выложил"}</button>
       <button class="btn ghost sm" style="flex:0 0 auto" onclick="fbForm(${c.n},'note')" title="Заметка к клипу: что не так смонтировано или выбрано. Можно и к уже выложенному — учтётся в следующих нарезках">${icon("message-square","sm")} Заметка</button>
     </div><div id="fbf-${c.n}"></div></div>`;
 }
@@ -1113,6 +1109,9 @@ async function tiktokCard(){
         <div class="muted" style="font-size:13px;margin-top:4px">После «В TikTok» сервис каждые 10 минут проверяет черновик. Когда вы опубликуете его в приложении и TikTok пропустит ролик в общий доступ (обычно до часа), у клипа появится ссылка, отметка «Выложил» и начнут подтягиваться просмотры. Вставлять ссылку руками не нужно.${t.waiting?` Сейчас ждём публикации: <b>${t.waiting}</b>.`:""}</div>
         <label class="row mt" style="gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" ${t.video_list?"checked":""} onchange="ttVideoList(this.checked)" style="width:auto">
           В приложение TikTok добавлен <b>Display API</b> (scope <code>video.list</code>)</label>
+        <label class="row mt" style="gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" ${t.direct_post?"checked":""} onchange="ttDirect(this.checked)" style="width:auto">
+          <b>Публикация с подписью</b> — описание (twitch: ник + хештеги) подставляется в TikTok само</label>
+        <div class="hint">TikTok не даёт программам заполнять подпись <b>черновика</b> — только при публикации (Direct Post). Поэтому с этой галочкой «В TikTok» сразу публикует ролик с готовым описанием, но пока ваше приложение TikTok не прошло их проверку, ролик виден <b>только вам</b>: откройте его в TikTok → «…» → Настройки конфиденциальности → «Все». Как включить: developers.tiktok.com → ваше приложение → Content Posting API → включите <b>Direct Post</b> и scope <b>video.publish</b>, сохраните. Затем поставьте галочку и у каждого стримера нажмите «Войти и привязать» ещё раз. Если TikTok откажет в публикации, ролик уйдёт в черновики, как раньше.${acc.some(a=>!a.publish)&&t.direct_post?` <b style="color:var(--warn,#f5a524)">Войдите заново: ${acc.filter(a=>!a.publish).map(a=>esc(a.name)).join(", ")}.</b>`:""}</div>
         <div class="hint">Необязательно, но надёжнее: ролик найдётся по списку видео аккаунта, даже если TikTok не сообщит номер поста, а просмотры будут браться прямо из API TikTok, а не со страницы ролика. Как включить: developers.tiktok.com → ваше приложение → <b>Add products → Display API</b>, в Scopes включите <b>video.list</b>, сохраните. Затем поставьте галочку здесь и у каждого стримера нажмите «Войти и привязать» ещё раз.</div></div>`:""}
     <details ${t.configured?"":"open"} class="mt"><summary class="muted" style="cursor:pointer;font-size:13px">${t.configured?"Изменить приложение TikTok":"Как подключить (один раз, ~10 минут)"}</summary>
       <ol class="muted" style="font-size:13px;line-height:1.7;margin:8px 0">
@@ -1127,6 +1126,7 @@ async function tiktokCard(){
 }
 async function ttAssign(login, open_id){ try{ await api("/api/tiktok/assign", {streamer:login, open_id}); toast("Сохранено"); tiktokCard(); }catch(e){ toast(e.message,"err"); } }
 async function ttSave(btn){ btn.disabled=true; try{ await api("/api/tiktok/app", {client_key:$("#ttkey").value, client_secret:$("#ttsecret").value}); toast("Сохранено — теперь «Войти в TikTok»"); tiktokCard(); }catch(e){ toast(e.message,"err"); } btn.disabled=false; }
+async function ttDirect(on){ try{ await api("/api/tiktok/app", {direct_post:on}); toast(on?"Теперь войдите в каждый аккаунт ещё раз («Войти и привязать»)":"Выключено — снова черновики без подписи"); tiktokCard(); }catch(e){ toast(e.message,"err"); } }
 async function ttVideoList(on){ try{ await api("/api/tiktok/app", {video_list:on}); toast(on?"Теперь войдите в каждый аккаунт ещё раз («Войти и привязать»)":"Выключено"); tiktokCard(); }catch(e){ toast(e.message,"err"); } }
 async function ttDisconnect(open_id){ if(!confirm("Отключить этот аккаунт TikTok?")) return; await api("/api/tiktok/disconnect", {open_id}); tiktokCard(); }
 async function twitchCard(){

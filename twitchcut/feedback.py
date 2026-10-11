@@ -202,6 +202,15 @@ _TECH_NOTE = __import__("re").compile(
     r"(2|два|двое|двух|втор\w*)\s+(стример|человек|участник)", __import__("re").I)
 
 
+# заметка про картинку, но в ней есть и про смысл/границы — её должен видеть и тот, кто выбирает границы
+_CTX_NOTE = __import__("re").compile(
+    r"обрез|контекст|начал|конц|понятн|затян|воды|вода|корот|длинн|мысл|ужат|скучн|интересн|донат", __import__("re").I)
+
+
+def _for_ranker(note: str) -> bool:
+    return bool(note) and (not _TECH_NOTE.search(note) or bool(_CTX_NOTE.search(note)))
+
+
 def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10, quote_chars: int = 120) -> str:
     """Текст для промпта: что залетело, что нет, что отклонено. Пусто, если отметок ещё нет."""
     allf = load()
@@ -258,8 +267,7 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10, quote_c
         cal = calibration_line(items if len(posted) >= 8 else allf)
         if cal:
             lines.append(cal)
-    noted = [f for f in items if f.get("status") == "posted" and (f.get("note") or "").strip()
-             and not _TECH_NOTE.search(f["note"])]
+    noted = [f for f in items if f.get("status") in ("posted", "note") and _for_ranker((f.get("note") or "").strip())]
     if noted:
         lines.append("Автор выложил, но отметил недочёты — учитывай при выборе границ и вырезок:")
         for f in sorted(noted, key=lambda f: -f.get("updated", 0))[:max(3, max_neg // 2)]:
@@ -272,7 +280,7 @@ def prompt_block(login: str | None, max_pos: int = 6, max_neg: int = 10, quote_c
             why = ", ".join(REASONS.get(r, r) for r in (f.get("reasons") or []))
             note = (f.get("note") or "").strip()
             # заметки про картинку (вебка, раскладка, звук) Claude не помогут — их учитывает монтаж
-            if note and not _TECH_NOTE.search(note):
+            if note and _for_ranker(note):
                 why = (why + "; " if why else "") + note[:220]
             elif not why and note:
                 continue

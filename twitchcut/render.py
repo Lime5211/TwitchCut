@@ -1009,23 +1009,26 @@ def focus_rect(focus: list[float] | None, sw: int, sh: int, aspect: float, max_g
 
 
 def fill_rect(focus: list[float] | None, sw: int, sh: int, aspect: float, avoid: list[float] | None = None,
-              min_w: float = 0.2) -> tuple[int, int, int, int]:
-    """«Приблизить максимально»: кадр ровно нужных пропорций внутри важной области (игра, видео) —
-    лишнее по краям обрезается, без размытых полос. Центр — по центру области; если рядом наложена
-    вебка стримера, кадр сдвигается так, чтобы её не захватить."""
+              min_w: float = 0.2, max_cut: float = 1.0) -> tuple[int, int, int, int]:
+    """«Приблизить»: кадр нужных пропорций внутри важной области (игра, видео) — лишнее по краям обрезается.
+    max_cut — какую долю ширины (высоты) области можно обрезать: из широкого видео квадратная нижняя зона
+    вырезала бы только середину, и то, о чём говорит стример, терялось. Если обрезать пришлось бы больше,
+    кадр берётся шире и показывается целиком, а сверху и снизу — размытый фон.
+    Центр — по центру области; если рядом наложена вебка стримера, кадр сдвигается так, чтобы её не захватить."""
     x, y, w, h = (focus or [0.0, 0.0, 1.0, 1.0])[:4]
     fx, fy, fw, fh = x * sw, y * sh, w * sw, h * sh
+    keep = max(0.0, 1.0 - max_cut)
     if fw / max(1.0, fh) > aspect:
-        cw, ch = fh * aspect, fh
+        cw, ch = max(fh * aspect, fw * keep), fh
     else:
-        cw, ch = fw, fw / aspect
+        cw, ch = fw, max(fw / aspect, fh * keep)
     if cw < min_w * sw:  # слишком сильное увеличение — «мыло»
         k = min_w * sw / cw
         cw, ch = cw * k, ch * k
     if ch > sh:
-        cw, ch = sh * aspect, sh
+        cw, ch = cw * sh / ch, sh
     if cw > sw:
-        cw, ch = sw, sw / aspect
+        cw, ch = sw, ch * sw / cw
     cx, cy = fx + fw / 2, fy + fh / 2
     av = (avoid[0] * sw, avoid[1] * sh, avoid[2] * sw, avoid[3] * sh) if avoid else None
     xs = np.linspace(max(0.0, min(fx, sw - cw)), max(0.0, min(fx + fw - cw, sw - cw)), 9) if cw < fw else \
@@ -1104,9 +1107,11 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
         if focus is not None and len(focus) > 4 and focus[4]:  # показать область целиком
             rect = focus_rect(focus[:4], sw, sh, W / H, max_grow=1.8, min_w=0.3, min_h=0.3, avoid=li.get("cam_box"))
         else:
-            rect = fill_rect(focus, sw, sh, W / H, avoid=li.get("cam_box"), min_w=0.3)
+            rect = fill_rect(focus, sw, sh, W / H, avoid=li.get("cam_box"), min_w=0.3,
+                             max_cut=max(0.45, float(r.get("zoom_max_cut", 0.3))))
         return _fit_panel(inp, rect, W, H, tag, out)
     if layout == "split" and li.get("cam"):
+        max_cut = float(r.get("zoom_max_cut", 0.3))
         top = int(li.get("top_h") or cam_height(cfg))
         x, y, cw, ch = li["cam"]
         bot_h = H - top
@@ -1131,14 +1136,18 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
             if len(focus) > 4 and focus[4]:  # текст доната, чат, переписка — целиком, без обрезки краёв
                 small = 0.12 if (avoid is None and li.get("cam_box")) else None  # предмет в руках на вебке
                 rect = focus_rect(focus[:4], sw, sh, W / bot_h, avoid=avoid, min_w=small or 0.24, min_h=small or 0.2)
-            else:                              # игра, видео — приблизить максимально
-                rect = fill_rect(focus, sw, sh, W / bot_h, avoid=avoid)
+            else:                              # игра, видео — приблизить, но не терять края
+                rect = fill_rect(focus, sw, sh, W / bot_h, avoid=avoid, max_cut=max_cut)
             bottom = _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]")
         else:
-            gw = int(min(sw, sh * W / bot_h)) // 2 * 2
-            gx = int(np.clip(li.get("screen_x", (sw - gw) // 2), 0, sw - gw))
-            bottom = (f"[{tag}b]crop={gw}:{sh}:{gx}:0,scale={W}:{bot_h}:force_original_aspect_ratio=increase:"
-                      f"flags=lanczos,crop={W}:{bot_h}[{tag}d]")
+            gw0 = int(min(sw, sh * W / bot_h)) // 2 * 2
+            gw = int(min(sw, max(gw0, sw * (1.0 - max_cut)))) // 2 * 2
+            # центр — там, где больше всего движения (screen_x посчитан для узкого окна gw0), но с перевесом
+            # к середине экрана: без режиссёра точно не знаем, где главное, а так картинка не «съезжает» вбок
+            cx = li.get("screen_x", (sw - gw0) // 2) + gw0 / 2
+            cx = 0.5 * cx + 0.5 * sw / 2
+            gx = int(np.clip(cx - gw / 2, 0, sw - gw)) // 2 * 2
+            bottom = _fit_panel(f"[{tag}b]", (gx, 0, gw, sh // 2 * 2), W, bot_h, tag, f"[{tag}d]")
         return (f"{inp}split=2[{tag}a][{tag}b];" + top_chain + ";" + bottom + ";"
                 f"[{tag}t][{tag}d]vstack{out}")
     if layout == "cam" and li.get("camcrop") and li.get("cam_box") and \
@@ -1203,10 +1212,8 @@ def text_positions(layout: str, cfg: dict | None = None) -> tuple[int, int]:
     if layout in ("split", "split_focus"):
         top = cam_height(cfg) if cfg else 820
         H = int(cfg["render"]["height"]) if cfg else 1920
-        if layout == "split_focus":
-            # внизу показываем что-то важное крупно (чат, донат, видео) — субтитры на стыке, чтобы не закрывать
-            return top + 8, top
-        return int(top + (H - top) * 0.5), top
+        # субтитры на стыке вебки и экрана: середину экрана (игру, видео, донат) они не закрывают
+        return top + 8, top
     if layout.startswith("stack"):
         # несколько человек полосами: субтитры на стыке полос (на 2 полосах — по центру, на 3 — на нижнем стыке)
         H = int(cfg["render"]["height"]) if cfg else 1920
@@ -1259,9 +1266,13 @@ def build_ass(words: list[dict], hook: str, layout, cfg: dict, prof: ProfanityFi
         if cur:
             groups.append(cur)
 
+        bad_ids = set()
+        if prof and cfg["censor"]["enabled"] and cfg["censor"]["subtitles"]:
+            bad_ids = {id(words[i]) for i in prof.find(words)}
+
         def disp(w: dict) -> str:
             txt = w["w"].strip()
-            if prof and cfg["censor"]["enabled"] and cfg["censor"]["subtitles"] and prof.is_profane(txt):
+            if id(w) in bad_ids:
                 txt = prof.mask(txt)
             return _esc(txt.upper().strip(",."))
 
@@ -1271,7 +1282,8 @@ def build_ass(words: list[dict], hook: str, layout, cfg: dict, prof: ProfanityFi
             if nxt is not None and nxt - g_end < 0.35:
                 g_end = nxt  # без мигания между близкими группами
             else:
-                g_end += 0.25
+                # стример замолчал — фраза висит ещё совсем немного и исчезает (а не до следующих слов)
+                g_end += 0.2
             texts = [disp(w) for w in g]
             for wi, w in enumerate(g):
                 st = w["s"] if wi else g[0]["s"]
@@ -1289,18 +1301,47 @@ def build_ass(words: list[dict], hook: str, layout, cfg: dict, prof: ProfanityFi
 
 
 # -------------------------------------------------------------------- audio
-def censor_intervals(words: list[dict], prof: ProfanityFilter, cfg: dict, dur: float) -> list[tuple[float, float]]:
-    pad = cfg["censor"]["pad_ms"] / 1000
+def censor_intervals(words: list[dict], prof: ProfanityFilter, cfg: dict, dur: float,
+                     pad: float | None = None, merge: bool = True) -> list[tuple[float, float]]:
+    """Отрезки матерных слов (соседние слова мата сливаются, если merge). pad — запас вокруг слова, с."""
+    pad = cfg["censor"]["pad_ms"] / 1000 if pad is None else pad
     iv = []
     for i in prof.find(words):
         s, e = max(0.0, words[i]["s"] - pad), min(dur, words[i]["e"] + pad)
         if e - s < 0.15:  # Whisper иногда даёт слишком короткие слова
             e = min(dur, s + 0.15)
-        if iv and s <= iv[-1][1]:
+        if merge and iv and s <= iv[-1][1] + 0.05:
             iv[-1] = (iv[-1][0], max(iv[-1][1], e))
         else:
             iv.append((s, e))
     return iv
+
+
+def partial_censor(iv: list[tuple[float, float]], cfg: dict) -> list[tuple[float, float]]:
+    """«Частичное» запикивание: начало и конец слова слышны (как «б***ь» в субтитрах), глушится середина.
+    Чем длиннее слово, тем больше букв слышно по краям: короткое глушится на ~60%, длинное — на ~45%,
+    но не меньше 0.1 с, — чтобы было понятно, какое слово сказано, а мат всё равно оставался заглушённым."""
+    c = cfg["censor"]
+    f_short, f_long = float(c.get("partial_short", 0.6)), float(c.get("partial_long", 0.45))
+    out = []
+    for s, e in iv:
+        d = e - s
+        k = float(np.clip((d - 0.3) / 0.5, 0.0, 1.0))      # 0 — короткое (≤0.3 с), 1 — длинное (≥0.8 с)
+        frac = f_short + (f_long - f_short) * k
+        mid = max(0.1, frac * d)
+        if mid >= d:
+            out.append((s, e))
+            continue
+        rest = d - mid
+        head = rest * 0.55                                  # начало чуть длиннее конца: первые буквы важнее
+        out.append((s + head, s + head + mid))
+    merged: list[tuple[float, float]] = []
+    for a, b in sorted(out):
+        if merged and a <= merged[-1][1] + 0.03:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
 
 
 def _gate(iv: list[tuple[float, float]]) -> str:
@@ -1419,6 +1460,103 @@ class Timeline:
         return f"(T-({shift}))/TB"
 
 
+def _clip_rms(src: Path, offset: float, dur: float, sr: int = 16000, hop: int = 320) -> np.ndarray:
+    """Громкость звука клипа (дБ) кадрами по hop сэмплов (по умолчанию 20 мс)."""
+    import subprocess
+    kwargs = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    p = subprocess.run([ffmpeg_bin(), "-v", "error", "-ss", f"{offset:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+                        "-vn", "-ac", "1", "-ar", str(sr), "-af", "highpass=f=120,lowpass=f=4000",
+                        "-f", "s16le", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **kwargs)
+    x = np.frombuffer(p.stdout, dtype=np.int16).astype(np.float32)
+    n = len(x) // hop
+    if n < 10:
+        return np.zeros(0, np.float32)
+    return 20 * np.log10(np.sqrt(np.mean(x[: n * hop].reshape(n, hop) ** 2, axis=1)) / 32768 + 1e-9)
+
+
+def _letters(w: str) -> int:
+    return max(1, sum(ch.isalnum() for ch in w))
+
+
+def refine_word_times(src: Path, offset: float, dur: float, words: list[dict]) -> list[dict]:
+    """Уточняет конец (и начало) слов по звуку. Whisper часто растягивает последнее слово перед паузой до
+    следующей фразы: из-за этого субтитры висели в тишине, а заглушка мата глушила звук до следующего слова.
+    Здесь слово обрезается до места, где голос действительно стих; если звук не помогает (музыка, игра
+    громко) — длина слова ограничивается разумной для его числа букв."""
+    if not words:
+        return words
+    hop_s = 0.02
+    try:
+        rms = _clip_rms(src, offset, dur)
+    except Exception as e:  # уточнение — улучшение, а не обязательный шаг
+        log.warning("Уточнение тайминга слов по звуку не удалось: %s", e)
+        rms = np.zeros(0, np.float32)
+    has_audio = len(rms) > 50
+    if has_audio:
+        floor = float(np.percentile(rms, 10))
+        spans = [rms[int(w["s"] / hop_s):max(int(w["s"] / hop_s) + 1, int(w["e"] / hop_s))] for w in words]
+        speech = np.concatenate([sp for sp in spans if len(sp)] or [rms])
+        speech_lvl = float(np.percentile(speech, 80))
+        thr = max(floor + 6.0, speech_lvl - 16.0)   # «голос звучит»
+        # фон всё время почти как речь (музыка, игра) — по звуку конец слова не найти
+        has_audio = speech_lvl - floor > 9.0
+    out = []
+    changed = 0
+    for i, w in enumerate(words):
+        s_, e_ = float(w["s"]), float(w["e"])
+        n = _letters(w["w"])
+        natural = 0.16 + 0.085 * n                    # обычная длина слова с таким числом букв
+        cap = max(0.35, natural * 1.6)
+        if e_ - s_ > natural * 1.15:
+            if has_audio:
+                a, b = int(s_ / hop_s), int(e_ / hop_s)
+                seg = rms[a:b]
+                act = np.nonzero(seg > thr)[0] if len(seg) else np.zeros(0, int)
+                if len(act):
+                    # голос внутри «слова» с паузой > 0.25 с — слово растянуто на тишину и чужой звук:
+                    # берём самый плотный кусок голоса (само слово), остальное отбрасываем
+                    runs = np.split(act, np.nonzero(np.diff(act) > int(0.25 / hop_s))[0] + 1)
+                    run = max(runs, key=len)
+                    first, last = a + run[0], a + run[-1]
+                    # начало растянуто назад в тишину — двигаем к голосу; конец — к месту, где голос стих
+                    ns = max(s_, first * hop_s - 0.04)
+                    ne = min(e_, (last + 1) * hop_s + 0.06)
+                    if ne - ns >= 0.08:
+                        s_, e_ = ns, ne
+            if e_ - s_ > cap:
+                e_ = s_ + cap
+        if (s_, e_) != (float(w["s"]), float(w["e"])):
+            changed += 1
+        out.append({**w, "s": round(float(s_), 3), "e": round(float(max(e_, s_ + 0.05)), 3)})
+    if changed:
+        log.info("Тайминг слов: уточнено по звуку %d из %d (растянутые паузами слова)", changed, len(words))
+    return out
+
+
+def visual_activity(src: Path, offset: float, dur: float, fps: float = 5.0) -> tuple[np.ndarray, float]:
+    """Насколько «необычно» движется картинка в каждый момент клипа: кадр делится на 4×4 клетки, движение
+    каждой клетки сравнивается с её же обычным движением в этом клипе. Так видно и всплывший донат/видео на
+    экране, и молчаливую реакцию стримера на вебке, а постоянное движение игры не считается событием.
+    Возвращает (массив по кадрам, шаг в секундах)."""
+    import subprocess
+    gw, gh = 64, 36
+    kwargs = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    p = subprocess.run([ffmpeg_bin(), "-v", "error", "-ss", f"{offset:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+                        "-an", "-vf", f"fps={fps},scale={gw}:{gh},format=gray", "-f", "rawvideo", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **kwargs)
+    n = len(p.stdout) // (gw * gh)
+    if n < 4:
+        return np.zeros(0, np.float32), 1.0 / fps
+    fr = np.frombuffer(p.stdout[: n * gw * gh], np.uint8).reshape(n, gh, gw).astype(np.float32)
+    d = np.abs(np.diff(fr, axis=0))                                  # (n-1, gh, gw)
+    cells = d.reshape(n - 1, 4, gh // 4, 4, gw // 4).mean(axis=(2, 4)).reshape(n - 1, 16)
+    base = np.median(cells, axis=0) + 1.5                           # обычное движение клетки (+ шум сжатия)
+    rel = cells / base
+    rel[cells < 4.0] = 0.0                                           # мелкая рябь — не событие
+    act = np.concatenate([[0.0], rel.max(axis=1)]).astype(np.float32)
+    return act, 1.0 / fps
+
+
 def find_pauses(src: Path, offset: float, dur: float, words: list[dict], category: str, cfg: dict) -> list[tuple[float, float]]:
     """Умное вырезание пауз: убираем только «мёртвые» паузы в речи (стример задумался, тишина).
     Не трогаем паузы, где звучит смех, реакция или игра (громко), и короткие комедийные паузы перед панчлайном.
@@ -1447,13 +1585,42 @@ def find_pauses(src: Path, offset: float, dur: float, words: list[dict], categor
 
     speech = np.concatenate([db(w["s"], w["e"]) for w in words if w["e"] > w["s"]] or [rms])
     speech_lvl = float(np.median(speech))
+    # тихо, но в кадре что-то происходит (всплыл донат/видео, стример молча реагирует) — такую паузу не режем
+    vis, vstep = np.zeros(0, np.float32), 0.2
+    if r.get("pause_keep_visual", True):
+        try:
+            vis, vstep = visual_activity(src, offset, dur)
+        except Exception as e:
+            log.warning("Анализ движения в паузах не удался: %s", e)
+    vis_min = float(r.get("pause_visual_thr", 3.0))
+
+    def busy(a: float, b: float) -> bool:
+        if not len(vis):
+            return False
+        i0, i1 = int(a / vstep), max(int(a / vstep) + 1, int(b / vstep) + 1)
+        seg_v = vis[i0:i1]
+        if not len(seg_v):
+            return False
+        # «событие» — в паузе движение заметно сильнее, чем в остальном клипе (в игре всё время что-то
+        # двигается — это не повод оставлять паузу): выше 90% остальных моментов и вдвое выше типичного
+        rest = np.concatenate([vis[:i0], vis[i1:]])
+        thr = vis_min
+        if len(rest) >= 5:
+            thr = max(thr, 2.0 * float(np.median(rest)), float(np.percentile(rest, 90)))
+        hot = int(np.sum(seg_v > thr))
+        # хотя бы ~0.4 с и треть паузы — заметное необычное движение
+        return hot >= max(2, int(0.4 / vstep)) and hot >= 0.3 * len(seg_v)
     cuts: list[tuple[float, float]] = []
+    kept_visual = 0
     # тишина до первого слова
     first = words[0]["s"]
     if first > 0.6:
         seg = db(0.05, first - 0.05)
         if len(seg) and np.percentile(seg, 80) < max(speech_lvl - 14, -55):
-            cuts.append((0.0, first - keep_pad))
+            if busy(0.0, first):
+                kept_visual += 1
+            else:
+                cuts.append((0.0, first - keep_pad))
     for w0, w1 in zip(words, words[1:]):
         gap = w1["s"] - w0["e"]
         if gap < min_gap:
@@ -1465,7 +1632,12 @@ def find_pauses(src: Path, offset: float, dur: float, words: list[dict], categor
         if np.percentile(seg, 85) < speech_lvl - 12 or np.percentile(seg, 85) < -48:
             a, b = w0["e"] + keep_pad, w1["s"] - keep_pad
             if b - a >= 0.3:
-                cuts.append((a, b))
+                if busy(a, b):
+                    kept_visual += 1
+                else:
+                    cuts.append((a, b))
+    if kept_visual:
+        log.info("Паузы: %d оставлено — в тишине в кадре что-то происходит", kept_visual)
     if not cuts:
         return [(0.0, dur)]
     keep, t = [], 0.0
@@ -1588,17 +1760,16 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
             af += f",aselect='{tl.select_expr()}',asetpts=N/SR/TB"
         if r.get("loudnorm"):
             af += ",loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000"
+        mode = cfg["censor"].get("mode", "partial")
         if prof and cfg["censor"]["enabled"]:
-            censored = censor_intervals(words_rel, prof, cfg, dur)
-        cens_cut = [(tl.cut(s), tl.cut(e)) for s, e in censored]
+            # partial — каждое слово отдельно: у каждого слышны свои первые и последние буквы
+            censored = censor_intervals(words_rel, prof, cfg, dur, pad=0.0 if mode == "partial" else None,
+                                        merge=mode != "partial")
+        cens_src = partial_censor(censored, cfg) if mode == "partial" else censored
+        cens_cut = [(tl.cut(s), tl.cut(e)) for s, e in cens_src]
         cens_cut = [(s, e) for s, e in cens_cut if e - s > 0.02]
         if cens_cut:
-            mode = cfg["censor"].get("mode", "partial")
             ramp = 0.015
-            if mode == "partial":
-                # первые ~0.1 с слова звучат как есть — понятно, ЧТО сказано, остальное приглушено
-                cens_cut = [(s + min(max(0.35 * (e - s), 0.07), 0.16), e) for s, e in cens_cut]
-                cens_cut = [(s, e) for s, e in cens_cut if e - s > 0.04]
             env = "+".join(f"clip(min((t-{s - ramp:.3f})/{ramp},({e + ramp:.3f}-t)/{ramp}),0,1)" for s, e in cens_cut) or "0"
             env = f"min(1,{env})"
             if mode in ("partial", "muffle"):

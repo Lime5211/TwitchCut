@@ -38,6 +38,12 @@ WHITELIST = re.compile(
     r"особл|дробл|истребл|блюд|блюз|блок|блог|бланк|блеск|блин|блик|блефе|блефу|блефа|блох|бледн|близ|"
     r"блуд|блюст|блюсти)", re.I)
 
+# Названия и мемы канала, которые звучат как мат, но запикивать их не нужно (не режут охваты, а заглушка
+# только портит шутку): «Еблан сквад». Проверяется по паре «слово + следующее слово» и по слитному написанию.
+SAFE_PHRASE_NEXT = re.compile(r"^(?:сквад|скват|скуад|squad|sqad|скв)", re.I)
+SAFE_PHRASE_HEAD = re.compile(r"^е+бла+н(?:ы|ов|ам|ами|ах)?$", re.I)
+SAFE_PHRASE_WORD = re.compile(r"^е+бла+н\w{0,3}(?:сквад|скват|скуад|squad)", re.I)
+
 _LATIN_TO_CYR = str.maketrans({"a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "x": "х", "y": "у",
                                "k": "к", "m": "м", "t": "т", "b": "в", "h": "н"})
 
@@ -90,6 +96,16 @@ class ProfanityFilter:
             masked = core[0] + "*" * (len(core) - 2) + core[-1]
         return pre + masked + post
 
+    def _safe_phrase(self, words: list[dict], i: int) -> bool:
+        """Слово — часть безопасного названия («Еблан сквад»), его не запикиваем."""
+        w = self.normalize(words[i]["w"]).translate(_LATIN_TO_CYR)
+        if SAFE_PHRASE_WORD.match(w):
+            return True
+        if SAFE_PHRASE_HEAD.match(w) and i + 1 < len(words):
+            nxt = self.normalize(words[i + 1]["w"])
+            return bool(SAFE_PHRASE_NEXT.match(nxt) or SAFE_PHRASE_NEXT.match(nxt.translate(_LATIN_TO_CYR)))
+        return False
+
     def find(self, words: list[dict]) -> list[int]:
-        """Индексы матерных слов в списке {w, s, e}."""
-        return [i for i, wd in enumerate(words) if self.is_profane(wd["w"])]
+        """Индексы матерных слов в списке {w, s, e} (с учётом соседних слов: «Еблан сквад» — не мат)."""
+        return [i for i, wd in enumerate(words) if self.is_profane(wd["w"]) and not self._safe_phrase(words, i)]

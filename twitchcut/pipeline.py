@@ -609,6 +609,9 @@ class Job:
             mid = (w["s"] + w["e"]) / 2
             if c["start"] <= mid <= c["end"]:
                 words_rel.append({"w": w["w"], "s": max(0.0, w["s"] - c["start"]), "e": min(dur, w["e"] - c["start"])})
+        if self.cfg["render"].get("word_refine", True):
+            from .render import refine_word_times
+            words_rel = refine_word_times(src, offset, dur, words_rel)
         keep = None
         if trim:
             try:

@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -19,7 +20,7 @@ import numpy as np
 
 from .util import TwitchCutError, ffmpeg_bin, log, read_json, write_json
 
-VERSION = 5
+VERSION = 6
 TILE_W, TILE_H = 640, 360
 
 DIRECTOR_SYSTEM = """Ты — режиссёр монтажа вертикальных роликов (TikTok, 9:16) из Twitch-стримов. Тебе показаны кадры клипа
@@ -39,8 +40,8 @@ DIRECTOR_SYSTEM = """Ты — режиссёр монтажа вертикаль
   Обязательно укажи focus — прямоугольник [x, y, w, h] в долях кадра вокруг того, что важно: окно видео-плеера,
   колонка чата, плашка доната с текстом, окно игры, переписка. Эта область будет показана крупно.
   И укажи fit — как её показать (нижняя зона почти квадратная):
-    "zoom" (по умолчанию) — приблизить МАКСИМАЛЬНО, края области обрежутся. Для игры и видео: focus — окно
-      игры/плеера, а его центр — там, где главное действие (персонаж, лицо в видео, центр событий).
+    "zoom" (по умолчанию) — приблизить: края области обрежутся (не больше ~30% ширины). Для игры и видео: focus —
+      окно игры/плеера, а его центр — там, где главное действие (персонаж, лицо в видео, центр событий).
     "whole" — показать область целиком, без обрезки краёв: текст доната/сообщения, колонка чата, переписка,
       или видео, где важное и слева, и справа. focus тогда — ПЛОТНО вокруг текста/плашки, без пустого места,
       иначе текст станет мелким.
@@ -73,6 +74,15 @@ DIRECTOR_SYSTEM = """Ты — режиссёр монтажа вертикаль
 - Все участники разговора должны быть в кадре. Если на вебке несколько человек — "cam"/"split" покажут всех
   автоматически. Если стример говорит с кем-то, кого видно на ЭКРАНЕ (созвон, второй стример или гость в окне,
   стрим другого человека), — "split" с focus на этого человека, пока они разговаривают.
+- ГЛАВНАЯ ЖАЛОБА АВТОРА: «экран не показывает то, о чём говорит стример, теряется понимание», «экран съехал
+  влево», «не понятно, что на экране». Поэтому для каждого split-шота сверься с расшифровкой: о чём он говорит
+  в эти секунды (донат, надпись, человек в видео, предмет, место в игре) — и проверь по кадрам с этим временем,
+  что эта вещь ЦЕЛИКОМ внутри focus. Сомневаешься, где она, или важное разбросано по экрану — focus на всё окно
+  видео/игры и fit "whole": лучше показать всё мельче, чем обрезать главное.
+- Кадры, снятые сразу после слов «смотрите», «вот», «пишет», «донат» и т.п., добавлены специально: по ним видно,
+  на что он показывает.
+- Если без экрана непонятно, на что стример реагирует (донат, сообщение, видео), — экран нужен с ПЕРВОЙ секунды
+  этой реакции, а не после.
 - shots покрывают весь клип от 0 до его длины, по порядку, без пропусков.
 Ещё проверь жёлтую рамку вебки: если она не совпадает с картинкой вебки (захватывает чат/экран или обрезает вебку) —
 верни cam_box с правильной рамкой [x, y, w, h]; если всё верно или вебки нет на кадрах — null.
@@ -175,6 +185,29 @@ def tiles(frames: list[np.ndarray], per: int = 4) -> list[bytes]:
 def _img_block(jpg: bytes) -> dict:
     return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
                                         "data": base64.b64encode(jpg).decode()}}
+
+
+# слова, после которых стример обычно говорит о том, что на экране: тут важно, ЧТО именно видно
+CUE_RE = re.compile(r"^(?:смотри|смотрите|гляди|глянь|гляньте|видите|видишь|видно|вот|тут|здесь|читаю|читай|"
+                    r"пишет|написал|написала|донат|задонатил|сообщение|вопрос|показываю|покажу|фото|картинк|"
+                    r"видос|видео|ролик|ценник|цена|написано|look|wait)", re.I)
+
+
+def cue_times(words_rel: list[dict], keep: list[tuple[float, float]] | None, limit: int = 4) -> list[float]:
+    """Моменты, когда стример ссылается на экран («смотрите», «вот это», «пишет…», донат): на кадрах из этих
+    секунд режиссёр видит, о чём речь, и ставит focus туда."""
+    out: list[float] = []
+    for w in words_rel:
+        if CUE_RE.match(re.sub(r"[^\w]", "", w["w"].lower())):
+            t = w["e"] + 0.4
+            if keep and not any(a <= t <= b for a, b in keep):
+                continue
+            if all(abs(t - x) > 4.0 for x in out):
+                out.append(t)
+    if len(out) > limit:  # равномерно по клипу, а не все в начале
+        idx = np.linspace(0, len(out) - 1, limit).round().astype(int)
+        out = [out[i] for i in idx]
+    return out
 
 
 def sample_times(dur: float, keep: list[tuple[float, float]] | None, max_n: int = 16) -> list[float]:
@@ -282,6 +315,22 @@ def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep:
     rc = cfg.get("director") or {}
     box = li.get("cam_box")
     times = sample_times(dur, keep, int(rc.get("max_frames", 12)))
+    # плюс кадры в моменты, когда стример говорит о том, что на экране (заменяют ближайшие равномерные)
+    cues = [t for t in cue_times(words_rel, keep, int(rc.get("cue_frames", 4))) if 0.3 < t < dur - 0.3]
+    extra = [t for t in cues if min(abs(t - x) for x in times) > 1.0]
+    n_add = min(len(extra), 16 - len(times))
+    n_add -= n_add % 4                       # по 4 кадра на картинке
+    fixed = set()
+    for t in extra[:n_add]:
+        times.append(t)
+        fixed.add(t)
+    for t in extra[n_add:]:
+        free = [k for k, x in enumerate(times) if x not in fixed]
+        if free:
+            j = min(free, key=lambda k: abs(times[k] - t))
+            times[j] = t
+            fixed.add(t)
+    times = sorted(times)
     key = hashlib.md5(json.dumps([VERSION, round(dur, 1), [round(t, 1) for t in times], box, about[:200], notes[:400],
                                   rc.get("model")], ensure_ascii=False).encode()).hexdigest()[:12]
     if cache:

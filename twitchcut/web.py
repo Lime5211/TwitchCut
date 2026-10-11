@@ -350,7 +350,9 @@ class Manager:
             c = next((x for x in clips if x.get("n") == n), None)
             if not c:
                 raise TwitchCutError("Клип не найден")
-            res = tiktok_upload.upload_draft(d / c["file"], acc)
+            cap = streamers.tiktok_caption(streamer, c.get("hashtags")) if streamer else ""
+            res = tiktok_upload.upload_draft(d / c["file"], acc, caption=cap)
+            res["caption"] = cap
             tiktok_upload.register(res, acc, "clip", job_id, c["file"], _duration(d / c["file"]), streamer)
             clips = read_json(d / "clips.json") or clips
             for x in clips:
@@ -362,7 +364,9 @@ class Manager:
         c = next((x for x in comps if x.get("file") == file), None)
         if not c:
             raise TwitchCutError("Склейка не найдена")
-        res = tiktok_upload.upload_draft(d / c["file"], acc)
+        cap = streamers.tiktok_caption(streamer, []) if streamer else ""
+        res = tiktok_upload.upload_draft(d / c["file"], acc, caption=cap)
+        res["caption"] = cap
         tiktok_upload.register(res, acc, "compilation", job_id, c["file"], _duration(d / c["file"]), streamer)
         c["tiktok_draft"] = res
         write_json(d / "compilations.json", comps)
@@ -991,7 +995,8 @@ def make_handler(mgr: Manager):
                 if path == "/api/tiktok/app":
                     from . import tiktok_upload
                     tiktok_upload.save_app(data.get("client_key"), data.get("client_secret"),
-                                           data.get("video_list") if "video_list" in data else None)
+                                           data.get("video_list") if "video_list" in data else None,
+                                           data.get("direct_post") if "direct_post" in data else None)
                     return self._json(tiktok_upload.status())
                 if path == "/api/tiktok/check":
                     from . import tiktok_upload
