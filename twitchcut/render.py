@@ -20,20 +20,30 @@ from .util import ROOT_DIR, ffmpeg_bin, ffprobe_video, log, run
 YUNET = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
 # версия логики раскладки: клипы, смонтированные старой версией, после обновления перемонтируются сами
 # (без запросов к Claude). 2 — в кадре показываются все участники (соведущий на вебке, гость, второй стример)
-LAYOUT_VERSION = 3  # 3 — лица из видео на экране больше не принимаются за второго участника
+LAYOUT_VERSION = 4  # 3 — лица из видео на экране больше не принимаются за второго участника
+# 4 — вебка по сценам стримера, фото в HUD не участники, маленькая вебка следит за лицом, смена сцены внутри клипа
 
 
 # ------------------------------------------------------------ face / layout
-def _sample_keyframes(path: Path, offset: float, dur: float, sw: int, sh: int) -> list[tuple[float, np.ndarray]]:
+def _sample_keyframes(path: Path, offset: float, dur: float, sw: int, sh: int,
+                      crop: list[int] | None = None, out_w: int = 640) -> list[tuple[float, np.ndarray]]:
     """Кадры клипа для анализа. Декодируются только ключевые кадры (обычно раз в 2 с) — это быстро даже
-    для 1440p/HEVC. Возвращает [(время от начала клипа, кадр BGR 640px)]."""
+    для 1440p/HEVC. Возвращает [(время от начала клипа, кадр BGR 640px)].
+    crop — [x, y, w, h] в пикселях исходника: только эта область в исходном разрешении (вебка крупно —
+    лицо находится надёжно, даже если стример повернулся боком)."""
     import re as _re
     import subprocess
-    w = 640
+    pre = ""
+    if crop:
+        cx_, cy_, cw_, ch_ = [int(v) // 2 * 2 for v in crop]
+        pre = f"crop={cw_}:{ch_}:{cx_}:{cy_},"
+        sw, sh = cw_, ch_
+        out_w = min(out_w, cw_)
+    w = int(out_w) // 2 * 2
     h = int(round(sh * w / sw / 2)) * 2
     cmd = [ffmpeg_bin(), "-v", "info", "-hide_banner", "-skip_frame", "nokey", "-ss", f"{offset:.3f}",
            "-t", f"{dur:.3f}", "-i", str(path), "-map", "0:v:0", "-vsync", "0",
-           "-vf", f"showinfo,scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+           "-vf", f"showinfo,{pre}scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     kwargs = {"creationflags": 0x08000000} if os.name == "nt" else {}
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
     size = w * h * 3
@@ -50,7 +60,7 @@ def _sample_keyframes(path: Path, offset: float, dur: float, sw: int, sh: int) -
             if any(abs(t - x) < 1.2 for x in have):
                 continue
             q = subprocess.run([ffmpeg_bin(), "-v", "error", "-ss", f"{offset + t:.3f}", "-i", str(path),
-                                "-frames:v", "1", "-vf", f"scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                                "-frames:v", "1", "-vf", f"{pre}scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **kwargs)
             if len(q.stdout) >= size:
                 frames.append((t, np.frombuffer(q.stdout[:size], np.uint8).reshape(h, w, 3)))
@@ -58,25 +68,67 @@ def _sample_keyframes(path: Path, offset: float, dur: float, sw: int, sh: int) -
     return frames
 
 
-def _detect_faces(frames: list[tuple[float, np.ndarray]]) -> list[list[tuple]]:
+def _detect_faces(frames: list[tuple[float, np.ndarray]], thr: float = 0.72, min_px: int = 10) -> list[list[tuple]]:
     """Для каждого кадра: список лиц (cx, cy, w, h, score) в долях кадра."""
     import cv2
     out: list[list[tuple]] = []
     if not frames or not YUNET.exists():
         return [[] for _ in frames]
     h, w = frames[0][1].shape[:2]
-    det = cv2.FaceDetectorYN.create(str(YUNET), "", (w, h), 0.72, 0.3, 50)
+    det = cv2.FaceDetectorYN.create(str(YUNET), "", (w, h), thr, 0.3, 50)
     for _, fr in frames:
         _, res = det.detect(fr)
         faces = []
         if res is not None:
             for f in res:
                 x, y, fw, fh = [float(v) for v in f[:4]]
-                if fw < 10:  # совсем мелкие лица (толпа, превью) не интересны
+                if fw < min_px:  # совсем мелкие лица (толпа, превью) не интересны
                     continue
                 faces.append(((x + fw / 2) / w, (y + fh / 2) / h, fw / w, fh / h, float(f[-1])))
         out.append(faces)
     return out
+
+
+# --------------------------------------------------------- «живое» ли лицо
+# Фото игроков в HUD трансляции, аватарки, постер на стене, лицо на заставке — неподвижная картинка.
+# У человека на вебке картинка лица меняется от кадра к кадру (мимика, повороты, моргание). Разница
+# соседних кадров в области лица (среднее по пикселям, 0..255): фото — 0–5, живой человек — 6 и больше.
+LIVE_DIFF = 6.0
+
+
+def face_liveness(frames: list, cx: float, cy: float, fw: float, fh: float | None = None,
+                  idx: list[int] | None = None) -> float:
+    """Насколько меняется картинка в области лица (cx, cy, fw — доли кадра) между соседними кадрами:
+    медиана средней разницы пикселей. idx — номера кадров, где это лицо найдено (по умолчанию все)."""
+    import cv2
+    if len(frames) < 2:
+        return 0.0
+    h, w = frames[0][1].shape[:2]
+    fh = fh if fh else fw * w / h * 1.2
+    x0, x1 = int(max(0, (cx - 0.6 * fw) * w)), int(min(w, (cx + 0.6 * fw) * w))
+    y0, y1 = int(max(0, (cy - 0.7 * fh) * h)), int(min(h, (cy + 0.7 * fh) * h))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return 0.0
+    sel = sorted(set(idx)) if idx else list(range(len(frames)))
+    ps = [cv2.resize(frames[i][1][y0:y1, x0:x1].mean(axis=2).astype(np.float32), (24, 24),
+                     interpolation=cv2.INTER_AREA) for i in sel]
+    if len(ps) < 2:
+        return 0.0
+    d = [float(np.abs(ps[k] - ps[k - 1]).mean()) for k in range(1, len(ps))]
+    return float(np.median(d))
+
+
+def is_live(live: float, jitter: float) -> bool:
+    """Живой человек: картинка лица заметно меняется, или меняется чуть меньше, но лицо двигается."""
+    return live >= LIVE_DIFF or (live >= 4.0 and jitter >= 0.04)
+
+
+def _jitter(pts: list[tuple]) -> float:
+    """Разброс положения лица по кадрам в ширинах лица (у фото в HUD — почти 0)."""
+    if len(pts) < 2:
+        return 0.0
+    fw = float(np.median([p[2] for p in pts])) or 1e-6
+    return float(np.std([p[0] for p in pts]) / fw)
 
 
 def _track_camera(times: list[float], faces: list[list[tuple]], crop_w_frac: float,
@@ -238,6 +290,40 @@ class _EdgeStack:
         gx = gx | np.roll(gx, 1, axis=2) | np.roll(gx, -1, axis=2)
         self.cy = np.concatenate([np.zeros(gy.shape[:2] + (1,), np.int16), np.cumsum(gy, axis=2, dtype=np.int16)], axis=2)
         self.cx = np.concatenate([np.zeros((gx.shape[0], 1, gx.shape[2]), np.int16), np.cumsum(gx, axis=1, dtype=np.int16)], axis=1)
+        # как меняется каждый пиксель во времени: у картинки вебки (комната + человек) — своё «поведение»,
+        # у экрана рядом — своё (видео/игра меняются сильно, страница сайта стоит). На настоящей границе
+        # вебки поведение по разные стороны линии разное, а на линии ВНУТРИ вебки (край полки) — одинаковое.
+        self.std = np.stack(grays).std(axis=0) if len(grays) >= 3 else None
+
+    def contrast(self, side: str, L: int, T: int, R: int, B: int, k: int = 4) -> float:
+        """Насколько по-разному меняется картинка по разные стороны стороны рамки (0 — одинаково, 1+ — разное).
+        Край кадра — 1."""
+        S = self.std
+        if S is None:
+            return 0.5
+        h, w = S.shape
+        L, R, T, B = max(0, L), min(w, R), max(0, T), min(h, B)
+        if side == "T":
+            if T <= 1:
+                return 1.0
+            a, b, ax = S[T:T + k, L:R], S[max(0, T - k):T, L:R], 0
+        elif side == "B":
+            if B >= h - 1:
+                return 1.0
+            a, b, ax = S[max(0, B - k):B, L:R], S[B:B + k, L:R], 0
+        elif side == "L":
+            if L <= 1:
+                return 1.0
+            a, b, ax = S[T:B, L:L + k], S[T:B, max(0, L - k):L], 1
+        else:
+            if R >= w - 1:
+                return 1.0
+            a, b, ax = S[T:B, max(0, R - k):R], S[T:B, R:R + k], 1
+        if a.size == 0 or b.size == 0:
+            return 0.0
+        ia, ib = a.mean(axis=ax), b.mean(axis=ax)
+        n = min(len(ia), len(ib))
+        return float(np.median(np.abs(np.log((ia[:n] + 1.0) / (ib[:n] + 1.0)))))
 
     def h_score(self, y: int, x0: float, x1: float) -> float:
         """Доля длины горизонтальной линии y на [x0, x1], «типичная» по кадрам. Край кадра = 1."""
@@ -258,6 +344,10 @@ class _EdgeStack:
 
     def box_score(self, L: int, T: int, R: int, B: int) -> tuple[float, list[float]]:
         sides = [self.h_score(T, L, R), self.h_score(B, L, R), self.v_score(L, T, B), self.v_score(R, T, B)]
+        if self.std is not None:
+            # линия, по обе стороны которой картинка «живёт» одинаково, — скорее край предмета внутри вебки
+            con = [self.contrast(s, L, T, R, B) for s in "TBLR"]
+            sides = [e * (0.45 + 0.55 * min(1.0, c / 0.7)) for e, c in zip(sides, con)]
         return min(sides) + 0.25 * float(np.mean(sides)), sides
 
 
@@ -285,24 +375,31 @@ def cam_rect_from_edges(frames: list, cx: float, cy: float, fw: float, es: "_Edg
     px, py, f = cx * w, cy * h, fw * w
     span = 1.3 * f
 
-    def cands(lo, hi, fn, lim):
+    def cands(lo, hi, fn, lim, con):
         out = []
         for v in range(int(max(1, lo)), int(min(lim - 1, hi))):
             sc = fn(v)
             if sc > 0.6:
-                out.append((sc, v))
+                # линии внутри картинки вебки (полки, края мебели) тоже стоят на месте — отличаем их по тому,
+                # что по обе стороны картинка меняется одинаково
+                out.append((sc * (0.45 + 0.55 * min(1.0, con(v) / 0.7)), v))
         out.sort(reverse=True)
         picked: list[int] = []
         for sc, v in out:
-            if all(abs(v - p) > 2 for p in picked):
+            if all(abs(v - p) > 4 for p in picked):  # одна линия рамки — не несколько соседних пикселей
                 picked.append(v)
-            if len(picked) >= 8:
+            if len(picked) >= 12:
                 break
         return picked
-    tops = [0] + cands(py - 6 * f, py - 0.9 * f, lambda y: es.h_score(y, px - span, px + span), h)
-    bots = [h] + cands(py + 0.9 * f, py + 7 * f, lambda y: es.h_score(y, px - span, px + span), h)
-    lefts = [0] + cands(px - 7 * f, px - 0.9 * f, lambda x: es.v_score(x, py - span, py + span), w)
-    rights = [w] + cands(px + 0.9 * f, px + 7 * f, lambda x: es.v_score(x, py - span, py + span), w)
+    x0s, x1s, y0s, y1s = int(px - span), int(px + span), int(py - span), int(py + span)
+    tops = [0] + cands(py - 6 * f, py - 0.9 * f, lambda y: es.h_score(y, px - span, px + span), h,
+                       lambda y: es.contrast("T", x0s, y, x1s, h))
+    bots = [h] + cands(py + 0.9 * f, py + 7 * f, lambda y: es.h_score(y, px - span, px + span), h,
+                       lambda y: es.contrast("T", x0s, y, x1s, h))
+    lefts = [0] + cands(px - 7 * f, px - 0.9 * f, lambda x: es.v_score(x, py - span, py + span), w,
+                        lambda x: es.contrast("L", x, y0s, w, y1s))
+    rights = [w] + cands(px + 0.9 * f, px + 7 * f, lambda x: es.v_score(x, py - span, py + span), w,
+                         lambda x: es.contrast("L", x, y0s, w, y1s))
     best = None
     for T, B, L, R in itertools.product(tops, bots, lefts, rights):
         bw, bh = R - L, B - T
@@ -327,89 +424,172 @@ def cam_rect_from_edges(frames: list, cx: float, cy: float, fw: float, es: "_Edg
     return (box, sc) if with_score else box
 
 
-def stream_cam(samples: list[tuple[list, list]], prior: dict | None = None) -> dict | None:
-    """Где вебка стримера — по ВСЕМ клипам стрима сразу. Вебка стоит на одном месте весь стрим, а лица
-    из роликов, которые стример смотрит, в разных клипах разные. samples: [(кадры, лица по кадрам)] на клип.
-    prior — вебка, найденная у этого стримера раньше (небольшой бонус, если совпадает)."""
-    n = len(samples)
-    if not n:
-        return None
+def prior_scenes(prior: dict | None) -> list[dict]:
+    """Сцены стримера (где у него вебка в разных сценах OBS), найденные раньше. Старый формат — одна вебка."""
+    if not prior:
+        return []
+    if prior.get("scenes"):
+        return [s for s in prior["scenes"] if s.get("face")]
+    if prior.get("face"):
+        return [{"face": prior["face"], "box": prior.get("box"), "verified": bool(prior.get("verified"))}]
+    return []
+
+
+def match_scene(scenes: list[dict], cx: float, cy: float, fw: float | None = None) -> int | None:
+    """Номер сцены, у которой вебка там же, где это лицо (или None)."""
+    best = None
+    for i, s in enumerate(scenes):
+        fx, fy, ff = s["face"][:3]
+        box = s.get("box")
+        inside = box and box[0] <= cx <= box[0] + box[2] and box[1] <= cy <= box[1] + box[3]
+        near = abs(fx - cx) < 0.05 and abs(fy - cy) < 0.08
+        if not (near or inside) or (fw is not None and not 0.5 < fw / max(ff, 1e-6) < 2.0):
+            continue
+        d = abs(fx - cx) + abs(fy - cy)
+        if best is None or d < best[0]:
+            best = (d, i)
+    return best[1] if best else None
+
+
+def _face_clusters(samples: list[tuple[list, list]], max_fw: float = 0.12) -> list[dict]:
+    """Небольшие лица, стоящие на одном месте, — по всем клипам. Для каждого: в какой доле кадров
+    каждого клипа оно есть и живое ли оно там (фото в HUD/на постере — неживое)."""
     clusters: list[dict] = []
     for ci, (_frames, faces) in enumerate(samples):
-        for fs in faces:
+        for fi, fs in enumerate(faces):
             for f in fs:
-                if f[2] >= 0.12:
+                if f[2] >= max_fw:
                     continue
                 for cl in clusters:
                     if abs(cl["cx"] - f[0]) < 0.035 and abs(cl["cy"] - f[1]) < 0.06 and 0.6 < f[2] / cl["fw"] < 1.6:
                         k = cl["n"]
-                        cl["cx"], cl["cy"], cl["fw"] = ((cl["cx"] * k + f[0]) / (k + 1), (cl["cy"] * k + f[1]) / (k + 1),
-                                                        (cl["fw"] * k + f[2]) / (k + 1))
+                        cl["cx"], cl["cy"] = (cl["cx"] * k + f[0]) / (k + 1), (cl["cy"] * k + f[1]) / (k + 1)
+                        cl["fw"], cl["fh"] = (cl["fw"] * k + f[2]) / (k + 1), (cl["fh"] * k + f[3]) / (k + 1)
                         cl["n"] += 1
-                        cl["per"][ci] = cl["per"].get(ci, 0) + 1
+                        cl["per"].setdefault(ci, []).append((fi, f))
                         break
                 else:
-                    clusters.append({"cx": f[0], "cy": f[1], "fw": f[2], "n": 1, "per": {ci: 1}})
-    if not clusters:
-        return None
-    best, best_score = None, -1.0
+                    clusters.append({"cx": f[0], "cy": f[1], "fw": f[2], "fh": f[3], "n": 1, "per": {ci: [(fi, f)]}})
     for cl in clusters:
-        present = sum(1 for ci, cnt in cl["per"].items() if cnt >= max(1, 0.1 * len(samples[ci][1])))
-        score = present + 0.002 * cl["n"]
-        if prior and abs(prior["face"][0] - cl["cx"]) < 0.04 and abs(prior["face"][1] - cl["cy"]) < 0.06:
-            score += max(1.0, 0.5 * n)
-            cl["prior"] = True
-        cl["present"] = present
-        if score > best_score:
-            best, best_score = cl, score
-    need = 2 if n >= 2 else 1
-    if best["present"] < max(need, 0.5 * n) and not best.get("prior"):
+        cl["share"], cl["live"], cl["liveness"] = {}, {}, {}
+        for ci, hits in cl["per"].items():
+            frames = samples[ci][0]
+            nf = max(1, len(frames))
+            cl["share"][ci] = len({fi for fi, _ in hits}) / nf
+            if len(hits) >= 2:
+                lv = face_liveness(frames, cl["cx"], cl["cy"], cl["fw"], cl["fh"], [fi for fi, _ in hits])
+                cl["liveness"][ci] = round(lv, 1)
+                cl["live"][ci] = is_live(lv, _jitter([f for _, f in hits]))
+            else:
+                cl["live"][ci] = False
+    return clusters
+
+
+def stream_cam(samples: list[tuple[list, list]], prior: dict | None = None) -> dict | None:
+    """Где вебка стримера — по ВСЕМ клипам стрима сразу, с учётом СЦЕН: у стримера вебка может быть в разных
+    местах (начало эфира, игра, «просто общение»), поэтому для каждого клипа своё положение.
+    samples: [(кадры, лица по кадрам)] на клип. prior — сцены этого стримера с прошлых стримов.
+    Лицо стримера — живое (не фото в HUD трансляции и не постер), стоит на одном месте почти весь клип.
+    Возвращает {"scenes": [{face, box, clips, verified, cands}], ...главная сцена в старых полях face/box}."""
+    import time as _time
+    n = len(samples)
+    if not n:
         return None
-    if n == 1 and not best.get("prior") and best["n"] < 0.3 * len(samples[0][1]):
+    known = prior_scenes(prior)
+    clusters = _face_clusters(samples)
+    picks: dict[int, dict] = {}
+    for ci in range(n):
+        cand = [cl for cl in clusters if cl["share"].get(ci, 0) >= 0.35 and cl["live"].get(ci)]
+        if not cand:
+            continue
+
+        def key(cl):
+            k = match_scene(known, cl["cx"], cl["cy"], cl["fw"])
+            ver = k is not None and bool(known[k].get("verified"))
+            # стример — обычно самое крупное живое лицо, которое есть почти весь клип (игрок в трансляции
+            # и люди из роликов мельче или появляются ненадолго)
+            return (ver, k is not None, cl["share"][ci] + 12.0 * cl["fw"])
+        picks[ci] = max(cand, key=key)
+    if not picks:
         return None
-    frames = [fr for fs, _ in samples for fr in fs[:: max(1, len(fs) // 24)]][:72]
-    box = None
-    try:
-        es = _EdgeStack(frames)
-        box, sc = cam_rect_from_edges(frames, best["cx"], best["cy"], best["fw"], es=es, with_score=True)
-        if prior and best.get("prior") and prior.get("box"):
-            # рамка, найденная раньше, — если она по-прежнему лучше совпадает с линиями в кадре, оставляем её
-            px_, py_, _ = best["cx"], best["cy"], best["fw"]
-            pb = prior["box"]
-            if pb[0] <= px_ <= pb[0] + pb[2] and pb[1] <= py_ <= pb[1] + pb[3]:
-                sp = _box_score_rel(es, pb)
-                if box is None or sp >= sc - 0.05:
-                    box = pb
-    except Exception as e:
-        log.warning("Рамка вебки не найдена: %s", e)
-        if prior and best.get("prior") and prior.get("box"):
-            box = prior["box"]
-    res = {"face": [round(best["cx"], 4), round(best["cy"], 4), round(best["fw"], 4)],
-           "box": [round(v, 4) for v in box] if box else None, "clips": best["present"], "of": n,
-           "updated": __import__("time").time()}
-    # второй участник со СВОЕЙ вебкой (второй стример, гость): маленькое лицо на одном месте почти во всех
-    # клипах, вне рамки главной вебки. Лица из роликов на экране так не держатся — в разных клипах они разные
-    others = []
-    if n >= 2:
+    # сцены: одинаковое положение вебки в разных клипах — одна сцена
+    scenes: list[dict] = []
+    for ci, cl in picks.items():
+        for sc in scenes:
+            if abs(sc["cx"] - cl["cx"]) < 0.04 and abs(sc["cy"] - cl["cy"]) < 0.06:
+                sc["clips"].append(ci)
+                sc["cl"].append(cl)
+                break
+        else:
+            scenes.append({"cx": cl["cx"], "cy": cl["cy"], "clips": [ci], "cl": [cl]})
+    out = []
+    for sc in sorted(scenes, key=lambda s: -len(s["clips"])):
+        cls = sc["cl"]
+        cx = float(np.median([c["cx"] for c in cls]))
+        cy = float(np.median([c["cy"] for c in cls]))
+        fw = float(np.median([c["fw"] for c in cls]))
+        frames = [fr for ci in sc["clips"] for fr in samples[ci][0][:: max(1, len(samples[ci][0]) // 24)]][:72]
+        box, verified, others = None, False, []
+        k = match_scene(known, cx, cy, fw)
+        try:
+            es = _EdgeStack(frames)
+            box, score = cam_rect_from_edges(frames, cx, cy, fw, es=es, with_score=True)
+            if k is not None and known[k].get("box"):
+                pb = known[k]["box"]
+                if pb[0] <= cx <= pb[0] + pb[2] and pb[1] <= cy <= pb[1] + pb[3]:
+                    sp = _box_score_rel(es, pb)
+                    # рамка, проверенная раньше (Claude или автором), — пока линии кадра ей не противоречат
+                    if box is None or sp >= score - (0.25 if known[k].get("verified") else 0.05):
+                        box, verified = pb, bool(known[k].get("verified"))
+                        others = list(known[k].get("others") or [])
+        except Exception as e:
+            log.warning("Рамка вебки не найдена: %s", e)
+            if k is not None and known[k].get("box"):
+                box, verified = known[k]["box"], bool(known[k].get("verified"))
+        # другие живые лица в клипах этой сцены — возможно, второй участник со своей вебкой (проверит Claude)
+        cands = []
         for cl in clusters:
-            if cl is best or cl.get("present", 0) < max(2, 0.6 * n) or not (0.5 < cl["fw"] / best["fw"] < 2.0):
+            if any(cl is c for c in cls):
+                continue
+            pres = [ci for ci in sc["clips"] if cl["share"].get(ci, 0) >= 0.5 and cl["live"].get(ci)]
+            if len(pres) < max(1, 0.6 * len(sc["clips"])) or not (0.5 < cl["fw"] / max(fw, 1e-6) < 2.0):
                 continue
             if box and box[0] - 0.01 <= cl["cx"] <= box[0] + box[2] + 0.01 and box[1] - 0.01 <= cl["cy"] <= box[1] + box[3] + 0.01:
-                continue  # сидит на той же вебке — его найдёт раскладка клипа
-            if any(abs(cl["cx"] - o["face"][0]) < 0.05 and abs(cl["cy"] - o["face"][1]) < 0.08 for o in others):
-                continue
-            ob = None
-            try:
-                ob = cam_rect_from_edges(frames, cl["cx"], cl["cy"], cl["fw"])
-            except Exception:
-                pass
-            others.append({"face": [round(cl["cx"], 4), round(cl["cy"], 4), round(cl["fw"], 4)],
-                           "box": [round(v, 4) for v in ob] if ob else None, "clips": cl["present"]})
-    if others:
-        res["others"] = others[:2]
-        log.info("Ещё вебки участников: %s", [o["face"] for o in res["others"]])
-    log.info("Вебка стримера: лицо %s, рамка %s (в %d из %d клипов)", res["face"], res["box"], best["present"], n)
+                continue  # на той же вебке — его найдёт раскладка клипа
+            cands.append({"face": [round(cl["cx"], 4), round(cl["cy"], 4), round(cl["fw"], 4)]})
+        out.append({"face": [round(cx, 4), round(cy, 4), round(fw, 4)],
+                    "box": [round(v, 4) for v in box] if box else None,
+                    "clips": sorted(sc["clips"]), "verified": verified, "others": others, "cands": cands[:4]})
+    main = out[0]
+    res = {"scenes": out, "face": main["face"], "box": main["box"], "clips": len(main["clips"]), "of": n,
+           "verified": main["verified"], "updated": _time.time()}
+    for s in out:
+        log.info("Вебка стримера: лицо %s, рамка %s (клипов: %d из %d)%s", s["face"], s["box"], len(s["clips"]), n,
+                 " — проверена" if s["verified"] else "")
     return res
+
+
+def merge_scenes(old: dict | None, new: dict | None, keep: int = 6) -> dict | None:
+    """Сцены стримера для следующих стримов: новые сцены дополняют/обновляют найденные раньше."""
+    import time as _time
+    scenes = [dict(s) for s in prior_scenes(old)]
+    for s in (new or {}).get("scenes") or prior_scenes(new):
+        s = {k: v for k, v in s.items() if k not in ("clips", "cands")}
+        s["seen"] = _time.time()
+        k = match_scene(scenes, s["face"][0], s["face"][1], s["face"][2])
+        if k is None:
+            scenes.append(s)
+        elif s.get("verified") or not scenes[k].get("verified"):
+            scenes[k] = {**scenes[k], **s}
+        else:
+            scenes[k]["seen"] = s["seen"]
+    if not scenes:
+        return old
+    scenes.sort(key=lambda s: -float(s.get("seen") or 0))
+    scenes = scenes[:keep]
+    main = scenes[0]
+    return {"scenes": scenes, "face": main["face"], "box": main.get("box"), "verified": bool(main.get("verified")),
+            "updated": _time.time()}
 
 
 def sample_for_cam(path: Path, offset: float, dur: float) -> tuple[list, list]:
@@ -545,6 +725,64 @@ def _screen_focus(mot: list[dict], sw: int, gw: int) -> int:
     return int(np.clip(k / w * sw, 0, sw - gw)) // 2 * 2
 
 
+def _in_box(f: tuple, box: list[float] | None, pad: float = 0.01) -> bool:
+    if not box:
+        return False
+    x, y, w, h = box[:4]
+    return x - pad <= f[0] <= x + w + pad and y - pad <= f[1] <= y + h + pad
+
+
+def _on_scene(f: tuple, sc: dict) -> bool:
+    """Лицо сидит на вебке этой сцены (внутри её рамки или рядом с её лицом, размер похож)."""
+    fx, fy, ff = sc["face"][:3]
+    if not 0.5 < f[2] / max(ff, 1e-6) < 2.0:
+        return False
+    if sc.get("box"):
+        return _in_box(f, sc["box"], 0.005)
+    return abs(f[0] - fx) < 0.06 and abs(f[1] - fy) < 0.09
+
+
+def _refine_cam_faces(path: Path, offset: float, dur: float, sw: int, sh: int, box: list[float],
+                      times: list[float], faces: list[list[tuple]]) -> list[list[tuple]]:
+    """Лица внутри вебки по её картинке в исходном разрешении (ключевые кадры). Найденные лица
+    заменяют то, что нашлось в этой области на уменьшенном кадре."""
+    bx, by, bw, bh = box
+    pad_x, pad_y = 0.04 * bw, 0.04 * bh
+    X0, Y0 = max(0.0, bx - pad_x), max(0.0, by - pad_y)
+    X1, Y1 = min(1.0, bx + bw + pad_x), min(1.0, by + bh + pad_y)
+    crop = [int(X0 * sw), int(Y0 * sh), int((X1 - X0) * sw), int((Y1 - Y0) * sh)]
+    if crop[2] < 64 or crop[3] < 64:
+        return faces
+    cf = _sample_keyframes(path, offset, dur, sw, sh, crop=crop, out_w=640)
+    if not cf:
+        return faces
+    det = _detect_faces(cf, thr=0.6, min_px=18)
+    out = [list(fs) for fs in faces]
+    region = [X0, Y0, X1 - X0, Y1 - Y0]
+    for (t, _), fs in zip(cf, det):
+        if not times:
+            break
+        i = min(range(len(times)), key=lambda j: abs(times[j] - t))
+        if abs(times[i] - t) > 0.6:
+            continue
+        mapped = [(X0 + f[0] * (X1 - X0), Y0 + f[1] * (Y1 - Y0), f[2] * (X1 - X0), f[3] * (Y1 - Y0), f[4]) for f in fs]
+        out[i] = [f for f in out[i] if not _in_box(f, region, 0.0)] + mapped
+    return out
+
+
+def _small_cam_window(box: list[float], sw: int, sh: int, cfg: dict) -> list[int] | None:
+    """Маленькая вебка (лицо на весь экран будет «мылом»): окно во всю её высоту с пропорциями
+    cam_small_aspect (≈квадрат) — показывается по центру кадра, сверху и снизу размытый фон."""
+    r = cfg["render"]
+    H = int(r["height"])
+    bx, by, bw, bh = box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh
+    if H / max(1.0, bh) <= float(r.get("cam_max_upscale", 4.5)):
+        return None  # вебка достаточно большая — обычный кадр 9:16 по лицу
+    a = float(r.get("cam_small_aspect", 1.0))
+    ww = min(bw, bh * a)
+    return [int(bx) // 2 * 2, int(by) // 2 * 2, int(ww) // 2 * 2, int(bh) // 2 * 2]
+
+
 def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[dict] | None = None,
                   hint: dict | None = None) -> dict:
     """Раскладка кадра — по каждому ключевому кадру клипа, поэтому внутри одного клипа она может меняться.
@@ -568,43 +806,76 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
     times = [t for t, _ in frames]
     res["face_frames"] = f"{sum(1 for f in faces if f)}/{n}"
 
-    # --- вебка поверх экрана: маленькое лицо, стоящее на одном месте
+    # --- вебка поверх экрана: маленькое ЖИВОЕ лицо, стоящее на одном месте
     cam_face = None
     box = None
+    scene: dict | None = None
     scam = r.get("stream_cam") if not r.get("cam_rect") else None
-    if r.get("cam_rect"):
-        x, y, w, h = r["cam_rect"]
+    fixed = r.get("force_cam_box") or r.get("cam_rect")
+    if fixed:
+        # рамка задана: автором в карточке стримера или исправлена ИИ-режиссёром для этого клипа
+        x, y, w, h = fixed
         box = [x, y, w, h]
         cam_face = (x + w / 2, y + h * 0.45, w / 5.6)
         inside = [f for fs in faces for f in fs if x <= f[0] <= x + w and y <= f[1] <= y + h]
         if inside:
             cam_face = (float(np.median([f[0] for f in inside])), float(np.median([f[1] for f in inside])),
                         float(np.median([f[2] for f in inside])))
-    elif scam:
-        cam_face = tuple(scam["face"])
-        box = scam.get("box")
+        if scam:
+            k = match_scene(prior_scenes(scam), cam_face[0], cam_face[1])
+            scene = prior_scenes(scam)[k] if k is not None else None
     else:
-        flat = [(i, f) for i, fs in enumerate(faces) for f in fs if f[2] < 0.11]
-        best, support = None, 0
-        for i, f in flat:
-            sup = {j for j, g in flat if abs(g[0] - f[0]) < 0.05 and abs(g[1] - f[1]) < 0.07 and 0.6 < g[2] / f[2] < 1.6}
-            if len(sup) > support:
-                best, support = f, len(sup)
-        if best is not None and support >= max(2, 0.3 * n):
-            cl = [g for _, g in flat if abs(g[0] - best[0]) < 0.05 and abs(g[1] - best[1]) < 0.07]
-            cx, cy = float(np.median([g[0] for g in cl])), float(np.median([g[1] for g in cl]))
-            fw = float(np.median([g[2] for g in cl]))
-            if (cx < 0.33 or cx > 0.67) or (cy < 0.3 or cy > 0.7):
-                cam_face = (cx, cy, fw)
-                try:
-                    box = cam_rect_from_edges(frames, cx, cy, fw) or cam_box(frames, cx, cy)
-                except Exception:
-                    box = None
+        # сцены стримера (где вебка в разных сценах OBS): в этом клипе — та, где его лицо есть чаще всего
+        scenes = prior_scenes(scam)
+        scenes = scenes + [s for s in prior_scenes(r.get("cam_prior"))
+                           if match_scene(scenes, s["face"][0], s["face"][1], s["face"][2]) is None]
+        if scenes and n:
+            hits = [[i for i, fs in enumerate(faces) if any(_on_scene(f, sc) for f in fs)] for sc in scenes]
+            k = max(range(len(scenes)), key=lambda i: (len(hits[i]), bool(scenes[i].get("verified"))))
+            if len(hits[k]) >= max(2, 0.25 * n) or (n <= 3 and hits[k]):
+                scene = scenes[k]
+                pts = [f for i in hits[k] for f in faces[i] if _on_scene(f, scene)]
+                cam_face = (float(np.median([f[0] for f in pts])), float(np.median([f[1] for f in pts])),
+                            float(np.median([f[2] for f in pts])))
+                box = scene.get("box")
+                res["scene"] = scenes.index(scene)
+                if not box:
+                    try:
+                        box = cam_rect_from_edges(frames, *cam_face)
+                    except Exception:
+                        box = None
+        if cam_face is None and n:
+            # сцену не узнали — ищем вебку в самом клипе: живое небольшое лицо почти во всех кадрах у края
+            cls = [c for c in _face_clusters([(frames, faces)], max_fw=0.11)
+                   if c["share"].get(0, 0) >= 0.3 and c["live"].get(0)]
+            if cls:
+                best = max(cls, key=lambda c: c["share"][0] + 12.0 * c["fw"])
+                pts = [f for _, f in best["per"][0]]
+                cx, cy = float(np.median([g[0] for g in pts])), float(np.median([g[1] for g in pts]))
+                fw = float(np.median([g[2] for g in pts]))
+                if (cx < 0.33 or cx > 0.67) or (cy < 0.3 or cy > 0.7):
+                    cam_face = (cx, cy, fw)
+                    try:
+                        box = cam_rect_from_edges(frames, cx, cy, fw) or cam_box(frames, cx, cy)
+                    except Exception:
+                        box = None
     cam_rel = None
     if cam_face:
         cx, cy, fw = cam_face
         if not box:
             box = _default_cam_box(cx, cy, fw, sw, sh)
+        # лица на вебке — ещё раз, по картинке вебки в исходном разрешении: на кадре 640 px лицо в маленькой
+        # вебке — 25 px, и стоит стримеру повернуться боком, детектор его теряет (а кадр — уезжает)
+        try:
+            faces = _refine_cam_faces(path, offset, dur, sw, sh, box, times, faces)
+        except Exception as e:
+            log.warning("Лица на вебке крупно не найдены: %s", e)
+        on_box = [f for fs in faces for f in fs if _in_box(f, box, 0.0)]
+        if on_box and not fixed:
+            cx = float(np.median([f[0] for f in on_box]))
+            cy = float(np.median([f[1] for f in on_box]))
+            fw = float(np.median([f[2] for f in on_box]))
+            cam_face = (cx, cy, fw)
         if r.get("cam_center", True):
             # лицо — по центру зоны вебки и крупно (как в «кадре по лицу»), камера следит за лицом
             top = cam_height(cfg)
@@ -620,12 +891,17 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         res["cam_box"] = box
         res["cam_lim"] = [int(box[0] * sw), int((box[0] + box[2]) * sw)]
         res.update(_cam_params(sw, sh, cx, cy, fw, box))
-        cam_faces = [[f for f in fs if abs(f[0] - cx) < 0.08 and abs(f[1] - cy) < 0.1] for fs in faces]
+        cam_faces = [[f for f in fs if _in_box(f, box, 0.02)] for fs in faces]
         res["cam_track"] = _track_camera(times, cam_faces, res["camcrop"][2] / sw) or [(0.0, cx)]
         # отдельное, более чуткое слежение для зоны вебки в «вебка + экран»: лицо держим ровно по центру
         res["split_track"] = _track_camera(times, cam_faces, res["cam"][2] / sw, dead_frac=0.07) or [(0.0, cx)]
+        # маленькая вебка в «только вебка»: окно во всю высоту вебки, по центру кадра, следит за лицом
+        sm = _small_cam_window(box, sw, sh, cfg)
+        if sm:
+            res["cam_small"] = sm
+            res["small_track"] = _track_camera(times, cam_faces, sm[2] / sw, dead_frac=0.12) or [(0.0, cx)]
         try:
-            _people_on_cam(res, times, faces, box, cam_face, scam, sw, sh, cfg)
+            _people_on_cam(res, times, faces, box, cam_face, scene, sw, sh, cfg, frames)
         except Exception as e:  # не должно ломать монтаж
             log.warning("Поиск второго человека на вебке не удался: %s", e)
         try:
@@ -648,7 +924,7 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
     # --- режим для каждого кадра
     if cam_rel:
         cx, cy, _ = cam_face
-        on_cam = [any(abs(f[0] - cx) < 0.06 and abs(f[1] - cy) < 0.09 for f in fs) for fs in faces]
+        on_cam = [any(_in_box(f, box, 0.01) and f[2] < 0.11 for f in fs) for fs in faces]
         scene_full_cam = n and sum(on_cam) < 0.3 * n and sum(1 for bf in big_faces if bf and
                                                               max(f[2] for f in bf) >= 0.11) >= 0.6 * n
         res["scene_full_cam"] = bool(scene_full_cam and res.get("crop"))
@@ -660,6 +936,30 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
         else:
             modes, act = _cam_modes(times, frames, faces, cam_rel, cam_face, words, dur, cfg, hint)
             res.update(act)
+            if res.get("crop"):
+                # стример посреди клипа переключил сцену на вебку во весь экран (маленькой вебки нет, его лицо
+                # крупно) — эти секунды показываем кадром по лицу, а не пустым местом, где была вебка
+                fullf = ["full" if (not on_cam[i] and any(f[2] >= 0.11 for f in big_faces[i])) else "x"
+                         for i in range(n)]
+                spans = [[sg["t0"], sg["t1"]] for sg in _smooth_modes(times, fullf, dur, min_len=3.0)
+                         if sg["layout"] == "full"]
+                if spans:
+                    # границы — точно по моменту переключения сцены (ключевые кадры — только раз в ~2 с)
+                    for sp in spans:
+                        for j in (0, 1):
+                            if 0.3 < sp[j] < dur - 0.3:
+                                try:
+                                    c = visual_cut_near(path, offset, sp[j])
+                                except Exception:
+                                    c = None
+                                if c is not None:
+                                    sp[j] = c
+                    spans = [sp for sp in spans if sp[1] - sp[0] >= 1.5]
+                if spans:
+                    res["fullcam_spans"] = [[round(a, 2), round(b, 2)] for a, b in spans]
+                    full = res.get("full_mode") or "crop"
+                    modes = [full if any(a <= times[i] <= b for a, b in spans) else m for i, m in enumerate(modes)]
+                    log.info("Сцена «вебка во весь экран» внутри клипа: %s", res["fullcam_spans"])
         gw = int(min(sw, sh * W / (H - res["top_h"]))) // 2 * 2
         try:
             res["screen_x"] = _screen_focus(_screen_motion(frames, cam_rel), sw, gw)
@@ -740,16 +1040,17 @@ def _camwide(res: dict, times: list, frames: list, box: list[float], cam_face: t
         # хотя бы два соседних кадра подряд — не случайное движение
         if a and ((i > 0 and act[i - 1]) or (i + 1 < len(act) and act[i + 1])):
             t0, t1 = max(0.0, times[i] - 1.0), times[i] + 1.0
-            if spans and t0 <= spans[-1][1] + 2.0:
+            if spans and t0 <= spans[-1][1] + 4.0:
                 spans[-1][1] = t1
             else:
                 spans.append([t0, t1])
-    spans = [sp for sp in spans if sp[1] - sp[0] >= 4.0]
+    # короткие всплески не в счёт: кадр не должен «дышать» туда-сюда каждые несколько секунд
+    spans = [sp for sp in spans if sp[1] - sp[0] >= 6.0]
     if spans:
         res["gesture_spans"] = [[round(a, 2), round(b, 2)] for a, b in spans]
 
 
-def apply_gestures(segments: list[dict], spans: list | None, min_len: float = 4.0) -> list[dict]:
+def apply_gestures(segments: list[dict], spans: list | None, min_len: float = 6.0) -> list[dict]:
     """Куски «только вебка», где стример жестикулирует или что-то показывает, — общим планом (camwide).
     Короткие куски (< min_len) не создаём: кадр не должен дёргаться."""
     if not spans:
@@ -781,6 +1082,57 @@ def apply_gestures(segments: list[dict], spans: list | None, min_len: float = 4.
     return out
 
 
+def visual_cut_near(path: Path, offset: float, t: float, win: float = 2.2, region: list[float] | None = None,
+                    fps: int = 15) -> float | None:
+    """Точный момент резкой смены картинки (переключение сцены, открыл другое окно, пришёл донат) рядом с t
+    (секунды от начала клипа). region — где смотреть [x, y, w, h] в долях кадра. None — явной смены нет."""
+    import subprocess
+    a = max(0.0, t - win)
+    crop = ""
+    if region:
+        x, y, w, h = region
+        crop = f"crop=iw*{w:.4f}:ih*{h:.4f}:iw*{x:.4f}:ih*{y:.4f},"
+    kwargs = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    p = subprocess.run([ffmpeg_bin(), "-v", "error", "-ss", f"{offset + a:.3f}", "-t", f"{2 * win:.3f}", "-i", str(path),
+                        "-an", "-vf", f"fps={fps},{crop}scale=160:90,format=gray", "-f", "rawvideo", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **kwargs)
+    n = len(p.stdout) // (160 * 90)
+    if n < 4:
+        return None
+    g = np.frombuffer(p.stdout[:n * 160 * 90], np.uint8).reshape(n, 90, 160).astype(np.int16)
+    d = np.abs(np.diff(g, axis=0)).mean(axis=(1, 2))
+    k = int(np.argmax(d))
+    if d[k] < max(6.0, 3.0 * float(np.median(d))):
+        return None
+    return round(a + (k + 1) / fps, 2)
+
+
+def apply_fullcam(segments: list[dict], spans: list, full: str = "crop") -> list[dict]:
+    """Где стример переключил сцену на вебку во весь экран, — кадр по его лицу, какой бы ни была раскладка
+    (маленькой вебки в эти секунды в кадре просто нет)."""
+    out: list[dict] = []
+    for sg in segments:
+        t = sg["t0"]
+        for a, b in sorted(spans):
+            a, b = max(a, sg["t0"]), min(b, sg["t1"])
+            if b - a < 0.5:
+                continue
+            if a > t:
+                out.append({**sg, "t0": t, "t1": a})
+            out.append({**sg, "t0": a, "t1": b, "layout": full, "focus": None})
+            t = b
+        if sg["t1"] - t > 0.05:
+            out.append({**sg, "t0": t, "t1": sg["t1"]})
+    # крошечные остатки (< 1 с) прилепляем к соседу
+    res: list[dict] = []
+    for sg in out:
+        if res and (sg["t1"] - sg["t0"] < 1.0 or (res[-1]["layout"] == sg["layout"] and res[-1].get("focus") == sg.get("focus"))):
+            res[-1]["t1"] = sg["t1"]
+        else:
+            res.append(dict(sg))
+    return res
+
+
 def people_shown(li: dict) -> int:
     """Сколько человек раскладка клипа реально показывает (для отчёта и перемонтажа)."""
     segs = li.get("segments") or [{"layout": li.get("layout")}]
@@ -793,8 +1145,8 @@ def people_shown(li: dict) -> int:
     return n
 
 
-def _people_on_cam(res: dict, times: list, faces: list, box: list[float], cam_face: tuple, scam: dict | None,
-                   sw: int, sh: int, cfg: dict) -> None:
+def _people_on_cam(res: dict, times: list, faces: list, box: list[float], cam_face: tuple, scene: dict | None,
+                   sw: int, sh: int, cfg: dict, frames: list | None = None) -> None:
     """На вебке не один человек (соведущий сидит рядом) или у второго участника своя вебка —
     показываем всех: в «вебка + экран» зона вебки берёт всех людей; в «только вебка» — каждый в своей
     полосе (stack) или общий кадр всех (group_rect)."""
@@ -804,12 +1156,21 @@ def _people_on_cam(res: dict, times: list, faces: list, box: list[float], cam_fa
         return
     W, H = int(r["width"]), int(r["height"])
     fw = cam_face[2]
+    def alive(p: dict) -> bool:
+        # фото/постер/фигурка с лицом на фоне комнаты — не участник
+        if not frames:
+            return True
+        idx = [i for i, t in enumerate(times) if any(abs(t - q[0]) < 1e-6 for q in p["pts"])]
+        return is_live(face_liveness(frames, p["cx"], p["cy"], p["w"], p["h"], idx), _jitter([q[1:] for q in p["pts"]]))
     grp = [p for p in pp.find_people(times, faces, region=box, min_share=0.2) if 0.5 < p["w"] / max(fw, 1e-6) < 2.0]
+    grp = [p for p in grp if alive(p)]
     bounds: list = [box] * len(grp)
-    for o in (scam or {}).get("others") or []:
+    # второй участник со своей вебкой — только если Claude подтвердил, что это участник разговора
+    # (а не игрок в трансляции матча и не человек из ролика на экране)
+    for o in (scene or {}).get("others") or []:
         ox, oy, ofw = o["face"]
         ob = o.get("box") or _default_cam_box(ox, oy, ofw, sw, sh)
-        mine = pp.find_people(times, faces, region=ob, min_share=0.2)
+        mine = [p for p in pp.find_people(times, faces, region=ob, min_share=0.2) if alive(p)]
         if mine:
             grp.append(max(mine, key=lambda p: p["share"]))
             bounds.append(ob)
@@ -961,6 +1322,12 @@ def _crop_x_expr(keys: list, sw: int, cw: int, lo: float = 0.0, hi: float | None
     return expr
 
 
+def _iou(a: list, b: list) -> float:
+    inter = _overlap(tuple(a[:4]), tuple(b[:4]))
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
 def _overlap(a: tuple, b: tuple) -> float:
     ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
     iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
@@ -1051,7 +1418,7 @@ def fill_rect(focus: list[float] | None, sw: int, sh: int, aspect: float, avoid:
 def _fit_panel(src_label: str, rect: tuple, PW: int, PH: int, tag: str, out: str) -> str:
     """Показать область rect в панели PW×PH целиком (без обрезки): по центру, а свободное место —
     размытой копией той же области."""
-    x, y, w, h = rect
+    x, y, w, h = rect  # x может быть выражением ffmpeg (камера следит за лицом)
     if abs(w / h - PW / PH) < 0.04:  # пропорции совпали — просто масштаб
         return f"{src_label}crop={w}:{h}:{x}:{y},scale={PW}:{PH}:flags=lanczos{out}"
     return (f"{src_label}crop={w}:{h}:{x}:{y},split=2[{tag}fa][{tag}fb];"
@@ -1150,18 +1517,14 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
             bottom = _fit_panel(f"[{tag}b]", (gx, 0, gw, sh // 2 * 2), W, bot_h, tag, f"[{tag}d]")
         return (f"{inp}split=2[{tag}a][{tag}b];" + top_chain + ";" + bottom + ";"
                 f"[{tag}t][{tag}d]vstack{out}")
-    if layout == "cam" and li.get("camcrop") and li.get("cam_box") and \
-            H / max(1, li["camcrop"][3]) > float(r.get("cam_max_upscale", 4.5)):
-        # вебка маленькая: если растянуть её лицо на весь экран — будет «мыло». Показываем вебку целиком
-        # (в ширину кадра), а сверху и снизу — её же размытую копию
-        up = float(r.get("cam_max_upscale", 4.5))
-        bx, by, bw, bh = li["cam_box"]
-        ph = min(H, int(bh * sh * up))           # высота «окна» с лицом при допустимом увеличении
-        fx = li.get("face_cx", (bx + bw / 2) * sw) / sw
-        fy = li.get("face_cy", (by + bh / 2) * sh) / sh
-        x, y, w, h = _fit_aspect(li["cam_box"], (fx, fy), sw, sh, W / ph)
-        rect = (int(x * sw) // 2 * 2, int(y * sh) // 2 * 2, int(w * sw) // 2 * 2, int(h * sh) // 2 * 2)
-        return _fit_panel(inp, rect, W, H, tag, out)
+    if layout == "cam" and li.get("cam_small"):
+        # вебка маленькая: если растянуть её лицо на весь экран — будет «мыло». Показываем окно во всю
+        # высоту вебки (≈квадрат) по центру кадра, сверху и снизу — его же размытая копия; окно следит за лицом
+        x0, y0, ww, wh = li["cam_small"]
+        bx, bw = li.get("cam_bounds", [0, sw])
+        xexpr = _crop_x_expr(li.get("small_track") or li.get("cam_track") or [(0.0, (x0 + ww / 2) / sw)], sw, ww,
+                             lo=bx, hi=max(bx, bx + bw - ww), t_shift=t_shift)
+        return _fit_panel(inp, (f"'{xexpr}'", y0, ww, wh), W, H, tag, out)
     if layout == "cam" and li.get("camcrop"):
         x0, y0, cw, ch = li["camcrop"]
         bx, bw = li.get("cam_bounds", [0, sw])
@@ -1672,7 +2035,7 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
         r = cfg["render"]
     sw, sh = li["src_w"], li["src_h"]
     # движение камеры — в шкале после вырезания пауз
-    for k in ("track", "cam_track", "split_track"):
+    for k in ("track", "cam_track", "split_track", "small_track"):
         if li.get(k):
             li[k] = [(tl.cut(t), x) for t, x in li[k]]
     for k in ("stack", "top_panels", "full_stack"):
@@ -1686,6 +2049,8 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     src_segs = li.get("segments") or [{"t0": 0.0, "t1": dur, "layout": layout}]
     if li.get("camwide_rect") and li.get("gesture_spans"):
         src_segs = apply_gestures(src_segs, li["gesture_spans"])
+    if li.get("fullcam_spans") and li.get("crop"):
+        src_segs = apply_fullcam(src_segs, li["fullcam_spans"], li.get("full_mode") or "crop")
     for sg in src_segs:
         a, b = tl.cut(sg["t0"]), tl.cut(sg["t1"])
         same = segs and segs[-1]["layout"] == sg["layout"] and segs[-1].get("focus") == sg.get("focus")

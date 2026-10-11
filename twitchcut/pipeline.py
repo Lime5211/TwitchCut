@@ -637,7 +637,10 @@ class Job:
                 static_talk = (rc.get("skip_static_talk", True) and c.get("visual") == "talk"
                                and float(li.get("screen_active", 1.0)) <= 0.1)
                 cache = self.dir / "segments" / f"{c.get('cand') or c.get('candidate')}.director.json"
-                planned = director.cached_plan(cache, dur) if director_mode != "new" else None
+                # «перемонтировать» по кнопке — только решения новой версии режиссёра (старые копировали координаты
+                # из примера и «съезжали» влево); автоматический перемонтаж после обновления — любые сохранённые
+                planned = director.cached_plan(cache, dur, 0 if reuse_only else director.VERSION) \
+                    if director_mode != "new" else None
                 if li.get("cam") and planned:
                     dplan = planned  # перемонтаж: режиссёр уже решал по этому клипу — токены не тратим
                 elif li.get("cam") and not reuse_only and not static_talk:  # есть вебка — решаем, глядя на кадры
@@ -661,6 +664,8 @@ class Job:
                 elif li.get("cam") and static_talk and not reuse_only:
                     log.info("Клип %s: рассказ при неподвижном экране — только вебка, без режиссёра",
                              c.get("cand") or c.get("candidate"))
+                if dplan and dplan.get("cam_box") and li.get("cam_box"):
+                    li = self._apply_director_cam(dplan["cam_box"], li, src, offset, dur, words_rel, hint)
                 if dplan:
                     if dplan["cuts"]:
                         keep = subtract_intervals(keep or [(0.0, dur)], [tuple(x) for x in dplan["cuts"]])
@@ -682,6 +687,48 @@ class Job:
         info["content_cut_sec"] = round(sum(b - a for a, b in cuts), 1)
         info["pauses_removed"] = round(max(0.0, info.get("pauses_removed", 0) - info["content_cut_sec"]), 1)
         return info, words_rel
+
+    def _apply_director_cam(self, nb: list, li: dict, src: Path, offset: float, dur: float, words_rel: list,
+                            hint: dict) -> dict:
+        """ИИ-режиссёр увидел, что рамка вебки неверная (захватывает чат/экран или обрезает камеру), и дал
+        правильную — монтируем по ней и запоминаем для этой сцены (следующие клипы и стримы)."""
+        from .render import _iou, match_scene, prior_scenes
+        from . import director
+        old = li["cam_box"]
+        fx, fy = li.get("face_cx", 0) / max(1, li["src_w"]), li.get("face_cy", 0) / max(1, li["src_h"])
+        if _iou(old, nb) >= 0.8 or not (nb[0] <= fx <= nb[0] + nb[2] and nb[1] <= fy <= nb[1] + nb[3]):
+            return li
+        try:
+            from .render import _EdgeStack, _box_score_rel, _sample_keyframes
+            frames = _sample_keyframes(src, offset, dur, li["src_w"], li["src_h"])
+            nb = director._snap_box(nb, frames)
+            es = _EdgeStack(frames)
+            s_new, s_old = _box_score_rel(es, nb), _box_score_rel(es, old)
+            if s_new < s_old - 0.1:
+                # по линиям в кадре старая рамка заметно правдоподобнее — Claude, скорее всего, ошибся с координатами
+                log.info("Рамку вебки от режиссёра не беру: %s хуже совпадает с кадром (%.2f < %.2f)", nb, s_new, s_old)
+                return li
+        except Exception:
+            pass
+        log.info("Рамка вебки исправлена режиссёром: %s → %s", [round(v, 3) for v in old], nb)
+        r = self.cfg["render"]
+        r["force_cam_box"] = nb
+        try:
+            li2 = detect_layout(src, offset, dur, self.cfg, words_rel, hint)
+        finally:
+            r.pop("force_cam_box", None)
+        sc = read_json(self.dir / "stream_cam.json")
+        if sc:
+            scenes = prior_scenes(sc)
+            k = match_scene(scenes, fx, fy)
+            if k is not None:
+                scenes[k].update(box=[round(v, 4) for v in nb], verified=True, corrected=True)
+                sc["scenes"] = scenes
+                if k == 0:
+                    sc.update(box=scenes[0]["box"], verified=True)
+                write_json(self.dir / "stream_cam.json", sc)
+                r["stream_cam"] = sc
+        return li2
 
     def shorten_clip(self, n: int, target: float, speed: float, trim: bool, layout: str | None = None) -> dict:
         """«Ужать до N с»: Claude оставляет только самое сильное (новые границы + вырезки), затем клип
@@ -794,9 +841,9 @@ class Job:
                     offset = float(c["start"]) - float(seg_meta["t0"])
                     li = detect_layout(src, offset, float(c["end"]) - float(c["start"]), self.cfg)
                     from .render import people_shown
-                    # перемонтируем, если сейчас в кадре несколько человек или прошлый монтаж ошибочно
-                    # показывал нескольких (например, лицо из видео на экране)
-                    if people_shown(li) >= 2 or int(c.get("people") or 1) >= 2:
+                    # версия 4 меняет кадр почти у всех клипов (рамка вебки по сцене, слежение за лицом) —
+                    # перемонтируем все непросмотренные; раньше — только если менялось число людей в кадре
+                    if int(c.get("layout_v") or 1) < 4 or people_shown(li) >= 2 or int(c.get("people") or 1) >= 2:
                         if on_clip:
                             on_clip(c)
                         log.info("Перемонтаж клипа %s (%s) по новой раскладке", c.get("n"), self.dir.name)
@@ -902,11 +949,12 @@ class Job:
         return clips
 
     def _prepare_stream_cam(self, chosen: list, srcs: dict) -> None:
-        """Ищет вебку стримера сразу по всем клипам и запоминает её (для перемонтажа и следующих стримов)."""
+        """Ищет вебку стримера сразу по всем клипам — по СЦЕНАМ (у стримера вебка в разных сценах в разных
+        местах) — и запоминает их (для перемонтажа, следующих кусков эфира и следующих стримов)."""
         from . import streamers
-        from .render import sample_for_cam, stream_cam
+        from .render import merge_scenes, prior_scenes, sample_for_cam, stream_cam
         r = self.cfg["render"]
-        if r.get("cam_rect") or r.get("layout") not in ("auto", "split", "cam"):
+        if r.get("cam_rect") or r.get("layout") not in ("auto", "split", "cam", "crop"):
             return
         self.progress("render", 0.3, "Ищу вебку стримера по всем клипам")
         samples = []
@@ -918,37 +966,44 @@ class Job:
                 except Exception as e:
                     log.warning("Кадры для поиска вебки: %s", e)
         prev = read_json(self.dir / "stream_cam.json")
-        prior = prev or r.get("cam_prior")
+        # что уже известно: сцены этого стрима (прошлые куски эфира) + сцены стримера с прошлых стримов
+        prior = merge_scenes(r.get("cam_prior"), prev) if (prev or r.get("cam_prior")) else None
         cam = stream_cam(samples, prior) if samples else None
+        if cam:
+            from . import director
+            if director.enabled(self.cfg) and (self.cfg.get("director") or {}).get("verify_cam", True):
+                name = self.cfg["llm"].get("streamer_login") or ""
+                checked = 0
+                for i, sc in enumerate(cam["scenes"]):
+                    if sc.get("verified") or checked >= 3:
+                        continue
+                    frames = [fr for ci in sc["clips"] for fr in samples[ci][0]]
+                    try:
+                        self.progress("render", 0.32, "Claude проверяет вебку стримера")
+                        usage = self.state.get("director_usage") or {}
+                        cam["scenes"][i] = director.verify_scene(frames, sc, self.cfg, self.dir, usage, name)
+                        self.update(director_usage=usage)
+                        checked += 1
+                        log.info("Сцена %d: рамка %s, участники со своей вебкой: %d", i, cam["scenes"][i].get("box"),
+                                 len(cam["scenes"][i].get("others") or []))
+                    except Exception as e:
+                        log.warning("Проверка вебки не удалась: %s", e)
+            main = cam["scenes"][0]
+            cam.update(face=main["face"], box=main.get("box"), verified=bool(main.get("verified")))
+        # сцены прошлых кусков эфира, которых в этих клипах не было, не теряем
+        if prev and cam:
+            for s0 in prior_scenes(prev):
+                from .render import match_scene
+                if match_scene(cam["scenes"], *s0["face"][:3]) is None:
+                    cam["scenes"].append({k: v for k, v in s0.items() if k not in ("clips", "cands")})
         if cam is None and prev:
             cam = prev
-        if cam and cam.get("box") and not cam.get("verified"):
-            # ИИ-режиссёр один раз смотрит на рамку вебки: не захватывает ли чат/экран, не обрезает ли камеру
-            from . import director
-            pr = r.get("cam_prior") or {}
-            same_as_verified = pr.get("verified") and pr.get("box") and \
-                max(abs(a - b) for a, b in zip(pr["box"], cam["box"])) < 0.01
-            if same_as_verified:
-                cam["verified"] = True
-            elif director.enabled(self.cfg) and (self.cfg.get("director") or {}).get("verify_cam", True):
-                frames = [fr for fs, _ in samples for fr in fs[:: max(1, len(fs) // 3)]][:48]
-                try:
-                    self.progress("render", 0.32, "Claude проверяет рамку вебки")
-                    usage = self.state.get("director_usage") or {}
-                    res = director.verify_cam(frames, cam["box"], self.cfg, self.dir, usage)
-                    self.update(director_usage=usage)
-                    if res["box"]:
-                        log.info("Рамка вебки исправлена: %s → %s", cam["box"], res["box"])
-                        cam.update(box=res["box"], corrected=True)
-                    cam["verified"] = bool(res["ok"] or res["box"])
-                except Exception as e:
-                    log.warning("Проверка рамки вебки не удалась: %s", e)
         if cam:
             r["stream_cam"] = cam
             write_json(self.dir / "stream_cam.json", cam)
             login = self.cfg["llm"].get("streamer_login")
-            if login and (cam.get("verified") or cam.get("clips", 0) >= 3 or (cam.get("clips", 0) >= 2 and cam.get("box"))):
-                streamers.set_cam_auto(login, cam)
+            if login:
+                streamers.set_cam_auto(login, merge_scenes(r.get("cam_prior"), cam))
 
 
 def subtract_intervals(keep: list, cuts: list) -> list[tuple[float, float]]:

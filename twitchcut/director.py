@@ -20,7 +20,7 @@ import numpy as np
 
 from .util import TwitchCutError, ffmpeg_bin, log, read_json, write_json
 
-VERSION = 6
+VERSION = 7  # 7 — без «подсказки» координат в примере ответа (модель их копировала), рамки уточняются по кадрам
 TILE_W, TILE_H = 640, 360
 
 DIRECTOR_SYSTEM = """Ты — режиссёр монтажа вертикальных роликов (TikTok, 9:16) из Twitch-стримов. Тебе показаны кадры клипа
@@ -67,6 +67,16 @@ DIRECTOR_SYSTEM = """Ты — режиссёр монтажа вертикаль
   на кадрах нет. Всплывающий донат виден секунды — если на кадрах его нет, focus на основное окно (игра/видео).
 - Если вебка стримера наложена поверх игры/видео (она уже показана сверху), focus выбирай так, чтобы её в нём
   не было или было минимум; не включай колонку чата, если речь не о чате.
+- Колонку чата крупно — только на те несколько секунд (обычно до 8 с), пока он читает/выбирает конкретное
+  сообщение. Чат просто «бежит», а он рассказывает или реагирует — это "cam", а не split с чатом.
+- Стример показывает в камеру телефон/фото/предмет — "camwide" (вебка целиком, видно, что в руках); если на
+  телефоне текст/картинка, которую надо разглядеть, — "split" с focus плотно на телефоне на вебке и fit "whole".
+- Фото игроков в интерфейсе трансляции матча, лица в ролике, который он смотрит, камеры игроков на турнире —
+  НЕ участники разговора, их не показывай отдельно.
+- Если стример переключил сцену и его вебка на кадрах во весь экран (лицо крупно на весь кадр) — для этих секунд
+  ставь "cam": кадр по лицу подставится сам.
+- КООРДИНАТЫ focus и cam_box меряй по делениям по краям кадра (каждое деление — 0.1) для КАЖДОГО клипа заново:
+  у разных окон и разных стримов они разные. Не бери «типовые» числа.
 - Не дёргай кадр: каждый шот не короче 5 с; обычно 1–3 шота на клип. Меняй кадр, только когда меняется то, что важно.
 - Если в начале клипа приходит донат/сообщение, на которое стример отвечает, — первые секунды "split" с focus на донат.
 - Донаты и всплывашки НЕ по теме момента не показывай (кадр не переключай ради них). Если они мешают — верни их в cuts.
@@ -110,7 +120,8 @@ DIRECTOR_TOOL = {
 DIRECTOR_JSON = """
 
 ФОРМАТ ОТВЕТА: строго один JSON-объект без пояснений и без markdown:
-{"shots":[{"from":0,"to":9.5,"layout":"split","focus":[0.02,0.12,0.28,0.16],"fit":"whole","why":"донат, на который он отвечает"},{"from":9.5,"to":30.0,"layout":"split","focus":[0.0,0.0,0.62,0.64],"fit":"zoom","why":"играет и комментирует"},{"from":30.0,"to":41.2,"layout":"cam","focus":null,"why":"рассказывает"}],"cuts":[],"cam_box":null}"""
+{"shots":[{"from":<с>,"to":<с>,"layout":"split","focus":[<x>,<y>,<w>,<h>],"fit":"whole","why":"…"},{"from":<с>,"to":<с>,"layout":"cam","focus":null,"why":"…"}],"cuts":[],"cam_box":null}
+Вместо <…> — числа, измеренные по ЭТИМ кадрам (x, y — левый верхний угол области, w, h — ширина и высота, в долях кадра)."""
 
 CAMCHECK_SYSTEM = """Ты проверяешь разметку кадров стрима. На каждом кадре жёлтая рамка должна ТОЧНО обводить картинку
 веб-камеры стримера (прямоугольник с видео с его камеры): не захватывать чат, экран, плашки вокруг и не обрезать саму
@@ -297,10 +308,13 @@ def normalize_plan(data: dict, dur: float, min_len: float = 4.0) -> dict:
     return {"shots": merged, "cuts": cuts, "cam_box": _valid_rect(data.get("cam_box")) if data.get("cam_box") else None}
 
 
-def cached_plan(cache: Path | None, dur: float) -> dict | None:
-    """Готовое решение режиссёра из прошлого монтажа (для перемонтажа без запросов к Claude)."""
+def cached_plan(cache: Path | None, dur: float, min_version: int = 0) -> dict | None:
+    """Готовое решение режиссёра из прошлого монтажа (для перемонтажа без запросов к Claude).
+    min_version — не брать решения старее этой версии режиссёра (старые копировали координаты из примера)."""
     old = read_json(cache) if cache else None
     if not old or not old.get("plan") or not old["plan"].get("shots"):
+        return None
+    if int(old.get("v") or 6) < min_version:
         return None
     if abs(float(old.get("dur") or old["plan"]["shots"][-1]["t1"]) - dur) > 1.0:
         return None  # клип с тех пор ужали/расширили — старый план не подходит
@@ -337,10 +351,12 @@ def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep:
         old = read_json(cache)
         if old and old.get("key") == key:
             return old["plan"]
-    frames = []
+    frames, raw, got = [], [], []
     for t in times:
         fr = grab_frame(src, offset + t)
         if fr is not None:
+            raw.append(fr)
+            got.append(t)
             frames.append(annotate(fr, f"t={t:.1f}s", box))
     if len(frames) < 2:
         return None
@@ -366,7 +382,7 @@ def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep:
         extra = "\nПОЖЕЛАНИЯ АВТОРА ПО МОНТАЖУ ЭТОГО КАНАЛА (по его прошлым замечаниям):\n" + notes.strip()[:1500]
     system = DIRECTOR_SYSTEM.format(extra=extra)
     text = (f"Клип длиной {dur:.1f} с. {about}{cut_txt}\n"
-            f"Кадры по порядку: {', '.join(f't={t:.1f}' for t in times[:len(frames)])} (по 4 на картинке: "
+            f"Кадры по порядку: {', '.join(f't={t:.1f}' for t in got)} (по 4 на картинке: "
             f"слева направо, сверху вниз).\n\nРасшифровка:\n" + ("\n".join(lines) or "(речи нет)"))
     blocks = [_img_block(j) for j in imgs] + [{"type": "text", "text": text}]
     data = llm_vision(system, blocks, cfg, usage, workdir, DIRECTOR_TOOL, DIRECTOR_JSON,
@@ -374,8 +390,77 @@ def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep:
     plan = normalize_plan(data, dur, float(rc.get("min_shot_seconds", 4.0)))
     if not plan["shots"]:
         return None
+    try:
+        refine_plan(plan, src, offset, dur, words_rel, list(zip(got, raw)), box)
+    except Exception as e:  # уточнение — не обязательный шаг
+        log.warning("Уточнение плана режиссёра не удалось: %s", e)
     if cache:
-        write_json(cache, {"key": key, "plan": plan, "dur": round(dur, 2)})
+        write_json(cache, {"key": key, "plan": plan, "dur": round(dur, 2), "v": VERSION})
+    return plan
+
+
+def _snap_focus(focus: list[float], frames: list) -> list[float]:
+    """Рамка области от Claude — к настоящим краям окна (плеер, окно игры, плашка доната) в пределах ±3 % кадра.
+    Внутрь сдвигаем не больше чем на 1.5 % — лучше показать чуть больше, чем обрезать важное."""
+    if len(frames) < 3 or focus[2] > 0.97 and focus[3] > 0.97:
+        return focus
+    snapped = _snap_box(list(focus[:4]), frames)
+    x, y, w, h = focus[:4]
+    sx, sy, sw_, sh_ = snapped
+    L, T, R, B = x, y, x + w, y + h
+    sL, sT, sR, sB = sx, sy, sx + sw_, sy + sh_
+    L = sL if sL <= L + 0.015 else L
+    T = sT if sT <= T + 0.015 else T
+    R = sR if sR >= R - 0.015 else R
+    B = sB if sB >= B - 0.015 else B
+    out = [round(L, 3), round(T, 3), round(R - L, 3), round(B - T, 3)]
+    return out + list(focus[4:])
+
+
+def _word_gap_near(words: list[dict], t: float, win: float = 1.5) -> float | None:
+    """Ближайшая к t пауза между фразами (кадр лучше менять между словами, а не посреди слова)."""
+    best = None
+    for a, b in zip(words, words[1:]):
+        gap = b["s"] - a["e"]
+        if gap < 0.2:
+            continue
+        mid = (a["e"] + b["s"]) / 2
+        if abs(mid - t) <= win:
+            score = abs(mid - t) - (0.5 if a["w"].rstrip().endswith((".", "!", "?")) else 0) - min(gap, 1.0) * 0.3
+            if best is None or score < best[0]:
+                best = (score, mid)
+    return best[1] if best else None
+
+
+def refine_plan(plan: dict, src: Path, offset: float, dur: float, words: list[dict], frames: list,
+                cam_box: list | None) -> dict:
+    """Точнее, ЧТО и КОГДА показывать: области экрана — по настоящим краям окон; смена кадра — в момент,
+    когда на экране что-то появилось (переход на экран), или в паузе между фразами (переход на вебку)."""
+    from .render import visual_cut_near
+    shots = plan["shots"]
+    for s in shots:
+        if s.get("focus") and s["layout"] in ("split", "screen"):
+            fr = [(t, f) for t, f in frames if s["t0"] - 0.5 <= t <= s["t1"] + 0.5]
+            if len(fr) < 3:
+                fr = frames
+            s["focus"] = _snap_focus(s["focus"], fr)
+    for i in range(1, len(shots)):
+        t = shots[i]["t0"]
+        lo, hi = shots[i - 1]["t0"] + 2.0, shots[i]["t1"] - 2.0
+        new = None
+        if shots[i]["layout"] in ("split", "screen") and shots[i - 1]["layout"] not in ("split", "screen"):
+            # на экране появилось то, о чём речь (донат, окно, видео) — переключаем ровно в этот момент
+            reg = shots[i].get("focus")
+            try:
+                new = visual_cut_near(src, offset, t, 2.5, region=list(reg[:4]) if reg else None)
+            except Exception:
+                new = None
+            if new is not None:
+                new = max(0.0, new - 0.3)  # на долю секунды раньше: зритель видит, как оно появляется
+        if new is None:
+            new = _word_gap_near(words, t)
+        if new is not None and lo <= new <= hi:
+            shots[i - 1]["t1"] = shots[i]["t0"] = round(new, 2)
     return plan
 
 
@@ -450,6 +535,96 @@ def verify_cam(frames: list, box: list[float], cfg: dict, workdir: Path, usage: 
     if nb:
         nb = _snap_box(nb, frames)
     return {"ok": False, "box": nb}
+
+
+SCENE_SYSTEM = """Ты проверяешь разметку кадров Twitch-стрима (одна сцена OBS, 4 кадра из разных моментов).
+Жёлтая рамка — где, по мнению программы, ВЕБ-КАМЕРА САМОГО СТРИМЕРА (владельца канала{name}). Деления по краям — доли
+кадра 0.1…0.9. Голубые рамки с номерами — другие живые лица, которые программа нашла на этих кадрах.
+1) Если жёлтая рамка ТОЧНО обводит картинку камеры стримера (не захватывает чат/экран/плашки, не обрезает камеру) —
+   ok=true, box=null. Иначе ok=false и box — правильная рамка его камеры [x, y, w, h] в долях кадра (если камера
+   стримера на кадрах вообще есть; если её нет — box=null).
+2) others — номера голубых рамок, которые являются ОТДЕЛЬНЫМИ веб-камерами других участников разговора со
+   стримером (второй стример, гость, соведущий в своём окне). НЕ участники: игроки в трансляции матча (камеры
+   игроков, фото в интерфейсе), люди в видео/стриме, который он смотрит, реклама, аватарки. Сомневаешься — не включай."""
+
+SCENE_JSON = """
+
+ФОРМАТ ОТВЕТА: строго один JSON-объект: {"ok":true,"box":null,"others":[]}"""
+
+SCENE_TOOL = {
+    "name": "submit_scene",
+    "description": "Проверка вебки стримера в сцене",
+    "input_schema": {"type": "object", "properties": {
+        "ok": {"type": "boolean"}, "box": {"type": ["array", "null"], "items": {"type": "number"}},
+        "others": {"type": "array", "items": {"type": "integer"}}}, "required": ["ok"]},
+}
+
+
+def verify_scene(frames: list, scene: dict, cfg: dict, workdir: Path, usage: dict, name: str = "") -> dict:
+    """Один запрос на НОВУЮ сцену стримера (положение вебки, которого раньше не видели): верна ли рамка вебки
+    и кто из других живых лиц — участник разговора. Возвращает сцену с исправленной рамкой, verified и others."""
+    from .llm import llm_vision
+    from .render import cam_rect_from_edges
+    import cv2
+    pick = frames[:: max(1, len(frames) // 4)][:4]
+    if len(pick) < 2:
+        return scene
+    box = scene.get("box")
+    cands = scene.get("cands") or []
+    shown = []
+    for i, (_, fr) in enumerate(pick):
+        im = annotate(cv2.resize(fr, (TILE_W, TILE_H), interpolation=cv2.INTER_AREA), f"#{i + 1}", box)
+        for k, c in enumerate(cands, 1):
+            cx, cy, fw = c["face"]
+            x0, y0 = int((cx - 1.2 * fw) * TILE_W), int((cy - 1.2 * fw * 16 / 9) * TILE_H)
+            x1, y1 = int((cx + 1.2 * fw) * TILE_W), int((cy + 1.2 * fw * 16 / 9) * TILE_H)
+            cv2.rectangle(im, (x0, y0), (x1, y1), (255, 220, 0), 2)
+            cv2.putText(im, str(k), (x0 + 2, max(14, y0 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+            cv2.putText(im, str(k), (x0 + 2, max(14, y0 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 220, 0), 1)
+        shown.append(im)
+    rc = cfg.get("director") or {}
+    system = SCENE_SYSTEM.format(name=f": {name}" if name else "")
+    blocks = [_img_block(j) for j in tiles(shown)] + [{"type": "text", "text": "Проверь рамку вебки стримера и голубые рамки."}]
+    data = llm_vision(system, blocks, cfg, usage, workdir, SCENE_TOOL, SCENE_JSON,
+                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
+    out = dict(scene)
+    if not data.get("ok"):
+        nb = _valid_rect(data.get("box"))
+        if nb:
+            nb = _snap_box(nb, frames)
+            if box and len(frames) >= 4:
+                from .render import _EdgeStack, _box_score_rel
+                es = _EdgeStack(frames)
+                if _box_score_rel(es, nb) < _box_score_rel(es, box) - 0.1:
+                    # по линиям кадра найденная рамка правдоподобнее — координаты Claude неточные, оставляем свою
+                    out["verified"] = True
+                    nb = "keep"
+        if nb == "keep":
+            pass
+        elif nb:
+            out["box"] = [round(v, 4) for v in nb]
+            out["corrected"] = True
+            fx, fy = scene["face"][:2]
+            if not (nb[0] <= fx <= nb[0] + nb[2] and nb[1] <= fy <= nb[1] + nb[3]):
+                # программа приняла за стримера другое лицо — центр сцены переносим в его настоящую вебку
+                out["face"] = [round(nb[0] + nb[2] / 2, 4), round(nb[1] + nb[3] * 0.45, 4), round(nb[2] / 5.6, 4)]
+        elif box:
+            out["box"] = None
+    others = []
+    for k in data.get("others") or []:
+        try:
+            c = cands[int(k) - 1]
+        except (ValueError, IndexError, TypeError):
+            continue
+        ob = None
+        try:
+            ob = cam_rect_from_edges(frames, *c["face"])
+        except Exception:
+            pass
+        others.append({"face": c["face"], "box": [round(v, 4) for v in ob] if ob else None})
+    out["others"] = others
+    out["verified"] = bool(data.get("ok") or out.get("verified") or out.get("corrected"))
+    return out
 
 
 def enabled(cfg: dict) -> bool:
