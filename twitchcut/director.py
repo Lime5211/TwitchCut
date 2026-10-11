@@ -472,7 +472,7 @@ def apply_plan(li: dict, plan: dict) -> dict:
         lay = s["layout"]
         if lay in ("cam", "camwide", "split") and not li.get("cam"):
             lay = "screen"
-        if lay == "camwide" and not li.get("camwide_rect"):
+        if lay == "camwide" and not li.get("camwide_rect") and not li.get("cam_small"):
             lay = "cam"  # вебка и так показывается целиком
         if lay == "cam" and not li.get("camcrop"):
             lay = "split"
@@ -547,6 +547,49 @@ SCENE_SYSTEM = """Ты проверяешь разметку кадров Twitch
    стримером (второй стример, гость, соведущий в своём окне). НЕ участники: игроки в трансляции матча (камеры
    игроков, фото в интерфейсе), люди в видео/стриме, который он смотрит, реклама, аватарки. Сомневаешься — не включай."""
 
+SCENE_ZOOM = """
+Последнее изображение — УВЕЛИЧЕННЫЙ участок вокруг жёлтой рамки с мелкой сеткой: линии через 0.02, подписи — доли
+ВСЕГО кадра. По нему проверь края камеры: верхний край картинки камеры, нижний, левый, правый (не рамка-украшение,
+не надпись над камерой, а сама картинка с камеры). Если хоть один край жёлтой рамки отличается больше чем на 0.01 —
+ok=false и box с точными краями по этой сетке."""
+
+def _zoom_view(fr, box: list[float], out_w: int = 960) -> bytes | None:
+    """Увеличенный участок вокруг рамки вебки с сеткой через 0.02 в долях всего кадра."""
+    import cv2
+    h, w = fr.shape[:2]
+    x, y, bw, bh = box[:4]
+    X0, Y0 = max(0.0, x - 0.5 * bw), max(0.0, y - 0.5 * bh)
+    X1, Y1 = min(1.0, x + 1.5 * bw), min(1.0, y + 1.5 * bh)
+    crop = fr[int(Y0 * h):int(Y1 * h), int(X0 * w):int(X1 * w)]
+    if crop.size == 0:
+        return None
+    k = out_w / crop.shape[1]
+    im = cv2.resize(crop, (out_w, max(1, int(crop.shape[0] * k))), interpolation=cv2.INTER_CUBIC)
+    H = im.shape[0]
+
+    def px(vx, vy):
+        return int((vx - X0) / (X1 - X0) * out_w), int((vy - Y0) / (Y1 - Y0) * H)
+    v = np.ceil(X0 / 0.02) * 0.02
+    while v < X1:
+        xx, _ = px(v, Y0)
+        cv2.line(im, (xx, 0), (xx, H), (255, 255, 255), 1)
+        cv2.putText(im, f"{v:.2f}", (xx + 2, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
+        cv2.putText(im, f"{v:.2f}", (xx + 2, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        v += 0.02
+    v = np.ceil(Y0 / 0.02) * 0.02
+    while v < Y1:
+        _, yy = px(X0, v)
+        cv2.line(im, (0, yy), (out_w, yy), (255, 255, 255), 1)
+        cv2.putText(im, f"{v:.2f}", (2, yy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
+        cv2.putText(im, f"{v:.2f}", (2, yy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        v += 0.02
+    a, b = px(x, y)
+    c, d = px(x + bw, y + bh)
+    cv2.rectangle(im, (a, b), (c, d), (0, 230, 255), 2)
+    ok, buf = cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    return buf.tobytes() if ok else None
+
+
 SCENE_JSON = """
 
 ФОРМАТ ОТВЕТА: строго один JSON-объект: {"ok":true,"box":null,"others":[]}"""
@@ -583,15 +626,24 @@ def verify_scene(frames: list, scene: dict, cfg: dict, workdir: Path, usage: dic
             cv2.putText(im, str(k), (x0 + 2, max(14, y0 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 220, 0), 1)
         shown.append(im)
     rc = cfg.get("director") or {}
-    system = SCENE_SYSTEM.format(name=f": {name}" if name else "")
-    blocks = [_img_block(j) for j in tiles(shown)] + [{"type": "text", "text": "Проверь рамку вебки стримера и голубые рамки."}]
+    system = SCENE_SYSTEM.format(name=f": {name}" if name else "") + SCENE_ZOOM
+    blocks = [_img_block(j) for j in tiles(shown)]
+    if box:
+        z = _zoom_view(pick[len(pick) // 2][1], box)
+        if z:
+            blocks.append(_img_block(z))
+    blocks.append({"type": "text", "text": "Проверь рамку вебки стримера и голубые рамки."})
     data = llm_vision(system, blocks, cfg, usage, workdir, SCENE_TOOL, SCENE_JSON,
                       cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
     out = dict(scene)
     if not data.get("ok"):
         nb = _valid_rect(data.get("box"))
         if nb:
+            from .render import plausible_cam_box
             nb = _snap_box(nb, frames)
+            if not plausible_cam_box(nb):
+                nb = "keep"  # «вебка» на пол-экрана или вытянутая — Claude ошибся, оставляем найденную рамку
+        if nb and nb != "keep":
             if box and len(frames) >= 4:
                 from .render import _EdgeStack, _box_score_rel
                 es = _EdgeStack(frames)

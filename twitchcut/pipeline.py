@@ -600,8 +600,32 @@ class Job:
         прошлого монтажа (перемонтаж по кнопке), cache_only — вообще без запросов к Claude."""
         reuse_only = director_mode == "cache_only"
         from .render import find_pauses
+        from . import editor
+        all_words = words
         dur = c["end"] - c["start"]
-        words = self._synced_words(c, slice_words(words, c["start"] - 15, c["end"] + 15), src, offset)
+        # ИИ-монтажёр смотрит клип целиком (кадры + речь) и решает границы, вырезки и кадр
+        eplan = None
+        if editor.enabled(self.cfg) and not reuse_only:
+            try:
+                eplan = self._edit(c, all_words, src, offset, director_mode)
+            except Exception as e:  # монтажёр — улучшение: без него работает прежняя схема
+                log.warning("ИИ-монтажёр не сработал для клипа %s: %s", c.get("cand") or c.get("candidate"), e)
+                eplan = None
+        elif reuse_only:
+            eplan = editor.cached(self.dir / "segments" / f"{c.get('cand') or c.get('candidate')}.editor.json")
+        if eplan and not eplan.get("fixed"):
+            # новые границы и вырезки — от монтажёра (время в плане — от прежнего начала клипа)
+            st0 = float(c["start"])
+            offset = offset + eplan["start"]
+            c["start"], c["end"] = round(st0 + eplan["start"], 2), round(st0 + eplan["end"], 2)
+            c["content_cuts"] = [[round(st0 + a, 2), round(st0 + b, 2)] for a, b in eplan["cuts"]]
+            sh_ = -eplan["start"]
+            eplan = {**eplan, "fixed": True, "start": 0.0, "end": round(eplan["end"] - eplan["start"], 2),
+                     "cuts": [[a + sh_, b + sh_] for a, b in eplan["cuts"]],
+                     "keep": [[a + sh_, b + sh_] for a, b in eplan["keep"]],
+                     "shots": [{**x, "t0": round(x["t0"] + sh_, 2), "t1": round(x["t1"] + sh_, 2)} for x in eplan["shots"]]}
+            dur = c["end"] - c["start"]
+        words = self._synced_words(c, slice_words(all_words, c["start"] - 15, c["end"] + 15), src, offset)
         if self.cfg["render"].get("subtitle_retime", True):
             words = self._retimed_words(c, words, src, offset)
         words_rel = []
@@ -615,7 +639,9 @@ class Job:
         keep = None
         if trim:
             try:
-                keep = find_pauses(src, offset, dur, words_rel, c.get("category") or "other", self.cfg)
+                # с монтажёром: паузы, где на экране важное, не трогаем; длинную тишину он решил сам (вырезал или нет)
+                keep = find_pauses(src, offset, dur, words_rel, c.get("category") or "other", self.cfg,
+                                   protect=(eplan or {}).get("keep"), max_gap=2.5 if eplan else None)
             except Exception as e:
                 log.warning("Поиск пауз не удался: %s", e)
         cuts = [(a - c["start"], b - c["start"]) for a, b in (c.get("content_cuts") or [])]
@@ -628,7 +654,21 @@ class Job:
                 "spans": [(a - c["start"], b - c["start"]) for a, b in (c.get("screen_spans") or [])]}
         li, dplan = None, None
         from . import director
-        if self.cfg["render"].get("layout") == "auto" and director.enabled(self.cfg):
+        if eplan and self.cfg["render"].get("layout") == "auto":
+            try:
+                li = detect_layout(src, offset, dur, self.cfg, words_rel, hint)
+                if li.get("cam"):
+                    dplan = {"shots": [{"t0": x["t0"], "t1": x["t1"], "layout": x["layout"], "focus": x.get("focus"),
+                                        "why": x.get("why", "")} for x in eplan["shots"]], "cuts": [], "cam_box": None}
+                    li = director.apply_plan(li, dplan)
+                    li["gesture_spans"] = None  # кадр решил монтажёр — сами «общий план» не включаем
+                else:
+                    # вебки нет: экран/кадр по лицу — как определила раскладка
+                    dplan = None
+            except Exception as e:
+                log.warning("Раскладка по плану монтажёра не удалась: %s", e)
+                li, dplan = None, None
+        elif self.cfg["render"].get("layout") == "auto" and director.enabled(self.cfg) and not eplan:
             try:
                 li = detect_layout(src, offset, dur, self.cfg, words_rel, hint)
                 rc = self.cfg.get("director") or {}
@@ -664,8 +704,6 @@ class Job:
                 elif li.get("cam") and static_talk and not reuse_only:
                     log.info("Клип %s: рассказ при неподвижном экране — только вебка, без режиссёра",
                              c.get("cand") or c.get("candidate"))
-                if dplan and dplan.get("cam_box") and li.get("cam_box"):
-                    li = self._apply_director_cam(dplan["cam_box"], li, src, offset, dur, words_rel, hint)
                 if dplan:
                     if dplan["cuts"]:
                         keep = subtract_intervals(keep or [(0.0, dur)], [tuple(x) for x in dplan["cuts"]])
@@ -679,6 +717,12 @@ class Job:
         info = render_clip(src, offset, dur, words_rel, hook, out, self.cfg, prof, layout_info=li,
                            zooms=self.reaction_peaks(c["start"], c["end"]), keep=keep, speed=speed, layout_hint=hint)
         info["director"] = bool(dplan)
+        info["editor"] = bool(eplan)
+        if eplan:
+            info["editor_note"] = eplan.get("note", "")
+        # границы могли измениться (монтажёр) — запоминаем их в карточке клипа
+        info.update(start=round(c["start"], 2), end=round(c["end"], 2), duration=round(c["end"] - c["start"], 1),
+                    content_cuts=c.get("content_cuts") or [])
         info["layout_v"] = LAYOUT_VERSION
         from .render import people_shown
         info["people"] = people_shown(li) if li else 1
@@ -687,6 +731,50 @@ class Job:
         info["content_cut_sec"] = round(sum(b - a for a, b in cuts), 1)
         info["pauses_removed"] = round(max(0.0, info.get("pauses_removed", 0) - info["content_cut_sec"]), 1)
         return info, words_rel
+
+    def _edit(self, c: dict, words: list[dict], src: Path, offset: float, director_mode: str) -> dict | None:
+        """План ИИ-монтажёра для клипа. Видео доступно с запасом до/после (фрагмент скачан шире клипа)."""
+        from . import editor, feedback
+        from .util import ffprobe_duration
+        cand = c.get("cand") or c.get("candidate")
+        cache = self.dir / "segments" / f"{cand}.editor.json"
+        dur = float(c["end"]) - float(c["start"])
+        try:
+            fdur = float(ffprobe_duration(src) or 0)
+        except Exception:
+            fdur = 0.0
+        lo = max(-float((self.cfg.get("editor") or {}).get("pre_seconds", 25)), -offset)
+        hi = min(dur + float((self.cfg.get("editor") or {}).get("post_seconds", 20)), (fdur - offset) if fdur else dur)
+        hi = max(hi, dur if not fdur else min(dur, fdur - offset))
+        # «перемонтировать»/«ужать»: границы выбрал автор (или прошлый монтаж) — монтажёр решает только кадр
+        fixed = director_mode != "new"
+        if fixed:
+            old = editor.cached(cache)
+            if old and abs(float(old.get("end", 0)) - dur) < 0.6 and old.get("fixed"):
+                return old
+        li = detect_layout(src, offset + lo, hi - lo, self.cfg)
+        words_rel = [{"w": w["w"], "s": round(w["s"] - c["start"], 2), "e": round(w["e"] - c["start"], 2)}
+                     for w in slice_words(words, c["start"] + lo, c["start"] + hi)]
+        usage = self.state.get("director_usage") or {}
+        notes = feedback.edit_notes(self.cfg["llm"].get("streamer_login"))
+        self.update(message=f"ИИ-монтажёр смотрит клип «{c.get('title') or cand}»")
+        plan = editor.edit_clip(src, offset, lo, hi, dur, c, words_rel, li, self.cfg, self.dir, usage,
+                                notes=notes, cache=None, fixed=fixed)
+        self.update(director_usage=usage)
+        if not plan:
+            return None
+        plan["fixed"] = fixed
+        if fixed:
+            write_json(cache, {"plan": plan, "v": editor.VERSION})
+        else:
+            # в кэш — уже в шкале нового клипа (для перемонтажа по кнопке)
+            sh_ = -plan["start"]
+            write_json(cache, {"plan": {**plan, "fixed": True, "start": 0.0, "end": round(plan["end"] - plan["start"], 2),
+                                        "cuts": [[a + sh_, b + sh_] for a, b in plan["cuts"]],
+                                        "keep": [[a + sh_, b + sh_] for a, b in plan["keep"]],
+                                        "shots": [{**x, "t0": round(x["t0"] + sh_, 2), "t1": round(x["t1"] + sh_, 2)}
+                                                  for x in plan["shots"]]}, "v": editor.VERSION})
+        return plan
 
     def _apply_director_cam(self, nb: list, li: dict, src: Path, offset: float, dur: float, words_rel: list,
                             hint: dict) -> dict:
@@ -878,8 +966,15 @@ class Job:
         for k, c in enumerate(todo):
             self.progress("render", 0.3 * k / max(1, len(todo)), f"Скачиваю видео клипа {k + 1}/{len(todo)}")
             try:
-                srcs[c["cand"]] = self.source.fetch_segment(c["start"], c["end"], seg_dir / f"{c['cand']}.mkv",
-                                                            int(self.cfg["render"]["quality"]))
+                # с запасом до и после: монтажёр может начать раньше (повод, донат) или закончить позже (развязка)
+                from . import editor as _ed
+                ec = self.cfg.get("editor") or {}
+                pre = float(ec.get("pre_seconds", 25)) if _ed.enabled(self.cfg) else 0.0
+                post = float(ec.get("post_seconds", 20)) if _ed.enabled(self.cfg) else 0.0
+                a = max(0.0, c["start"] - pre)
+                path, off = self.source.fetch_segment(a, c["end"] + post, seg_dir / f"{c['cand']}.mkv",
+                                                      int(self.cfg["render"]["quality"]))
+                srcs[c["cand"]] = (path, off + (c["start"] - a))
             except Exception as e:
                 log.warning("Не удалось скачать видео момента %s: %s", c["cand"], e)
                 failed[c["cand"]] = f"скачивание: {e}"[:300]
@@ -998,6 +1093,17 @@ class Job:
                     cam["scenes"].append({k: v for k, v in s0.items() if k not in ("clips", "cands")})
         if cam is None and prev:
             cam = prev
+        # фон каждой сцены (страница браузера, подложка, рамки) — копится из кадров разных клипов: по нему
+        # потом видно, где на экране «своё» окно с видео/игрой
+        try:
+            from . import screen
+            login = self.cfg["llm"].get("streamer_login") or ""
+            for sc in (cam or {}).get("scenes") or []:
+                frs = [fr for ci in sc.get("clips") or [] if ci < len(samples) for fr in samples[ci][0][::2]]
+                if len(sc.get("clips") or []) >= 1 and frs:
+                    screen.update_bg(login, sc["face"], frs)
+        except Exception as e:
+            log.debug("Фон сцены не обновлён: %s", e)
         if cam:
             r["stream_cam"] = cam
             write_json(self.dir / "stream_cam.json", cam)
