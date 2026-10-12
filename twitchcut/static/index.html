@@ -472,6 +472,7 @@ async function renderJob(){
             ${[["auto","Авто"],["split","Вебка + игра"],["cam","Только вебка"],["screen","Только экран"],["crop","Кадр по лицу"],["blur","Весь кадр"]].map(([k,t])=>`<option value="${k}" ${(c.layout_choice||"auto")===k?"selected":""}>${t}${k==="auto"&&c.layout?" ("+[...new Set(c.layouts||[c.layout])].map(x=>({split:"вебка + игра",cam:"только вебка",crop:"по лицу",blur:"весь кадр",screen:"экран"})[x]).join(" → ")+")":""}</option>`).join("")}
           </select>
           <button class="btn sm ghost" id="apply-${c.n}" style="${c.missing?"":"display:none"}" onclick="applyEdit(${c.n})">${icon("refresh-cw","sm")} Применить</button>
+          ${c.missing?"":`<button class="btn sm ghost" onclick="remontage(${c.n})" ${busy?"disabled":""} title="Смонтировать этот момент заново новой версией монтажа: кадр вебки и экрана, когда что показывать. Границы клипа те же, стрим заново не анализируется.">${icon("clapperboard","sm")} Перемонтировать</button>`}
         </div>
         ${c.missing?"":`<div class="edit" title="Claude оставит только самое сильное: крючок, суть и развязку">
           <span class="dim" style="font-size:12.5px">${icon("scissors","sm")} Ужать до</span>
@@ -567,7 +568,7 @@ function momentsCard(st){
   return `<div class="card mt"><details ${S.momOpen?"open":""} ontoggle="S.momOpen=this.open">
     <summary style="cursor:pointer"><h3 style="display:inline;margin:0">${icon("list-video")} Все найденные моменты</h3>
       <span class="dim"> · ${ms.length}, смонтировано ${done}</span></summary>
-    <div class="hint">Всё, что Claude нашёл и оценил в этом стриме, в том числе не прошедшее порог. Если кажется, что момент недооценён, — «Смонтировать»: клип соберётся по уже готовой оценке, без нового анализа.</div>
+    <div class="hint">Всё, что Claude нашёл и оценил в этом стриме, в том числе не прошедшее порог. Если кажется, что момент недооценён, — «Смонтировать»: клип соберётся по уже готовой оценке, без нового анализа. Момент «без оценки Claude» (Claude тогда не ответил) сначала оценит Claude.</div>
     <div class="row" style="gap:6px;margin:8px 0"><span class="dim" style="font-size:12.5px">Сортировка:</span>
       <div class="seg sm"><button type="button" class="${sort==="score"?"on":""}" onclick="S.momSort='score';S.lastJob='';renderJob()">по оценке</button>
       <button type="button" class="${sort==="time"?"on":""}" onclick="S.momSort='time';S.lastJob='';renderJob()">по времени</button></div></div>
@@ -579,7 +580,7 @@ function momentsCard(st){
           <div class="dim" style="font-size:12px">${esc(m.reason||"")}</div>${e?`<div style="color:var(--err);font-size:12px">${esc(e)}</div>`:""}</td>
         <td style="white-space:nowrap">${m.clip!=null?`<a href="#clip-${m.clip}" onclick="document.getElementById('clip-${m.clip}')?.scrollIntoView({behavior:'smooth'});return false">клип ${m.clip}</a>`
           : b?`<span class="dim">${icon("loader-circle","sm spin")} монтирую…</span>`
-          : `<button class="btn ghost sm" onclick="renderMoment('${esc(m.id)}', this)">${icon("scissors","sm")} Смонтировать</button>`}</td></tr>`; }).join("")}
+          : `<button class="btn ghost sm" onclick="renderMoment('${esc(m.id)}', this)">${icon("scissors","sm")} ${m.heuristic?"Оценить и смонтировать":"Смонтировать"}</button>`}</td></tr>`; }).join("")}
     </table></details></div>`;
 }
 async function renderMoment(id, btn){
@@ -632,6 +633,10 @@ async function shortenClip(n){
 async function restoreClip(n){
   try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/restore`, editBody(n));
     S.lastJob=""; renderJob(); toast("Возвращаю прежние границы…"); }
+  catch(err){ toast(err.message,"err"); } }
+async function remontage(n){
+  try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/remontage`, {speed: (S.clips.find(x=>x.n===n)||{}).speed||1, trim: true});
+    S.lastJob=""; S.lastClips=""; renderJob(); toast("Монтирую клип заново (Claude смотрит кадры)…"); }
   catch(err){ toast(err.message,"err"); } }
 async function applyEdit(n){
   try{ await api(`/api/jobs/${encodeURIComponent(S.jobId)}/clips/${n}/render`, editBody(n));

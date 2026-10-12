@@ -70,8 +70,11 @@ class Job:
     def __init__(self, ref: str, cfg: dict, chat_file: Optional[str] = None,
                  on_update: Optional[Callable[[dict], None]] = None,
                  wait_manual: Optional[Callable[[Path, Path], None]] = None,
-                 options: Optional[dict] = None, job_id: Optional[str] = None):
+                 options: Optional[dict] = None, job_id: Optional[str] = None, side: bool = False):
         self.cfg = cfg
+        # side — вспомогательная работа над уже существующей задачей (перемонтаж клипа, монтаж момента): статус
+        # задачи (идёт/готово, этап, сообщение) принадлежит основной задаче и здесь не пишется
+        self.side = side
         self.options = options or {}
         self.source = Source(ref)
         self.id = job_id or self.source.job_id()
@@ -91,6 +94,9 @@ class Job:
         """Обновление состояния. Вызывается в том числе из потоков загрузчика — поэтому под замком
         и без исключений наружу (ошибка записи статуса не должна ломать скачивание)."""
         with self._lock:
+            if self.side:
+                self._side_update(kw)
+                return
             important = ("status" in kw) or (kw.get("stage") and kw.get("stage") != self.state.get("stage"))
             self.state.update(kw)
             self.state["updated"] = time.time()
@@ -107,6 +113,24 @@ class Job:
                 self.on_update(snapshot)
             except Exception:
                 pass
+
+    SIDE_SKIP = {"status", "stage", "stage_progress", "message", "error", "live", "next_check"}
+
+    def _side_update(self, kw: dict) -> None:
+        """Вспомогательная работа (Job создан заранее и ждал очереди — его self.state мог устареть: за это время
+        эфир успевал обработать новый кусок или закончиться). Пишем в job.json только свои поля поверх свежего
+        состояния, иначе устаревшая копия затирала его («эфир не заканчивается», пропадали куски)."""
+        self.state.update(kw)
+        own = {k: v for k, v in kw.items() if k not in self.SIDE_SKIP}
+        if not own:
+            return
+        fresh = read_json(self.dir / "job.json") or {}
+        fresh.update(own)
+        fresh["updated"] = time.time()
+        try:
+            write_json(self.dir / "job.json", fresh)
+        except OSError as e:
+            log.debug("Не удалось сохранить статус: %s", e)
 
     def progress(self, stage: str, frac: float, msg: str = "") -> None:
         self.update(stage=stage, stage_progress=round(frac, 3), message=msg)
@@ -425,6 +449,27 @@ class Job:
         if meta:
             self._apply_streamer(meta)
         tr = read_json(self.dir / "transcript.json") or {"words": []}
+        if r.get("heuristic") and self.cfg["llm"]["backend"] in ("api", "claude-cli"):
+            # Claude тогда не ответил (не был авторизован, лимит) — без его оценки нет ни названия, ни границ по
+            # смыслу: оцениваем этот момент сейчас
+            from .llm import rank_candidates
+            self.progress("llm", 0.0, "Claude оценивает момент")
+            if "chat" not in c:  # в списке моментов чат не хранится — берём его из общего файла
+                chat = read_json(self.dir / "chat.json") or []
+                c = {**c, "chat": [m for m in chat if c["start"] <= m[0] <= c["end"] + 10][:300]}
+            fresh, u = rank_candidates(meta, [c], tr["words"], self.cfg, self.dir)
+            r2 = fresh.get(cid)
+            if not r2 or r2.get("heuristic"):
+                raise TwitchCutError(f"Claude не оценил момент: {u.get('warning') or 'нет ответа'}")
+            r = r2
+            if (self.dir / "live_ranking.json").exists():
+                allr = read_json(self.dir / "live_ranking.json") or {}
+                allr[cid] = r
+                write_json(self.dir / "live_ranking.json", allr)
+            else:
+                rk = read_json(self.dir / "ranking.json") or {}
+                rk.setdefault("ranking", {})[cid] = r
+                write_json(self.dir / "ranking.json", rk)
         item = self.candidate_item(c, r, tr["words"], self._priors())
         item["manual"] = True
         clips = read_json(self.dir / "clips.json") or []
@@ -610,6 +655,9 @@ class Job:
                 eplan = self._edit(c, all_words, src, offset, director_mode)
             except Exception as e:  # монтажёр — улучшение: без него работает прежняя схема
                 log.warning("ИИ-монтажёр не сработал для клипа %s: %s", c.get("cand") or c.get("candidate"), e)
+                if director_mode == "fresh":
+                    # «Перемонтировать» по кнопке без Claude — это не то, что просили: сообщаем, а не монтируем по-старому
+                    raise TwitchCutError(f"Claude не ответил, клип не перемонтирован: {e}") from e
                 eplan = None
         elif reuse_only:
             eplan = editor.cached(self.dir / "segments" / f"{c.get('cand') or c.get('candidate')}.editor.json")
@@ -639,9 +687,13 @@ class Job:
         keep = None
         if trim:
             try:
-                # с монтажёром: паузы, где на экране важное, не трогаем; длинную тишину он решил сам (вырезал или нет)
+                # с монтажёром: паузы, где на экране важное, не трогаем; длинную тишину он решил сам (вырезал или нет);
+                # пока стример играет / смотрит видео, его молчание — это время игры/ролика, паузы не режем
+                protect = list((eplan or {}).get("keep") or [])
+                if eplan and not (self.cfg.get("editor") or {}).get("cut_on_screen", False):
+                    protect += [[x["t0"], x["t1"]] for x in eplan["shots"] if editor.on_screen(x)]
                 keep = find_pauses(src, offset, dur, words_rel, c.get("category") or "other", self.cfg,
-                                   protect=(eplan or {}).get("keep"), max_gap=2.5 if eplan else None)
+                                   protect=protect or None, max_gap=2.5 if eplan else None)
             except Exception as e:
                 log.warning("Поиск пауз не удался: %s", e)
         cuts = [(a - c["start"], b - c["start"]) for a, b in (c.get("content_cuts") or [])]
@@ -748,7 +800,7 @@ class Job:
         hi = max(hi, dur if not fdur else min(dur, fdur - offset))
         # «перемонтировать»/«ужать»: границы выбрал автор (или прошлый монтаж) — монтажёр решает только кадр
         fixed = director_mode != "new"
-        if fixed:
+        if fixed and director_mode != "fresh":
             old = editor.cached(cache)
             if old and abs(float(old.get("end", 0)) - dur) < 0.6 and old.get("fixed"):
                 return old
@@ -863,6 +915,12 @@ class Job:
 
     def rerender_clip(self, n: int, speed: float, trim: bool, layout: str | None = None,
                       director_mode: str = "cache") -> dict:
+        """director_mode: cache — решения монтажёра из прошлого монтажа; fresh — монтажёр заново решает кадр
+        (границы клипа те же, анализ стрима не повторяется); cache_only — без запросов к Claude."""
+        return self._rerender_clip(n, speed, trim, layout, director_mode)
+
+    def _rerender_clip(self, n: int, speed: float, trim: bool, layout: str | None = None,
+                       director_mode: str = "cache") -> dict:
         """Перемонтировать один готовый клип: другое ускорение и/или вырезание пауз. Решение режиссёра
         берётся из прошлого монтажа (если клип не ужимали) — Claude заново не спрашиваем."""
         p = self.dir / "clips.json"

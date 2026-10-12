@@ -953,15 +953,20 @@ def detect_layout(path: Path, offset: float, dur: float, cfg: dict, words: list[
             cy = float(np.median([f[1] for f in on_box]))
             fw = float(np.median([f[2] for f in on_box]))
             cam_face = (cx, cy, fw)
-        if str(r.get("split_cam", "whole")) != "whole" and r.get("cam_center", True):
-            # (старый вариант) лицо — по центру зоны вебки и крупно, камера следит за лицом
+        mode = str(r.get("split_cam", "track"))
+        if mode == "whole":
+            # вебка целиком, зона вебки под её пропорции (маленькая)
+            top = top_height(box, sw, sh, cfg)
+            cam_rel = _fit_aspect(box, cam_face, sw, sh, W / top)
+        elif mode == "face":
+            # (старый вариант) лицо крупно по центру
             top = cam_height(cfg)
             cam_rel = _split_cam_crop(box, cam_face, sw, sh, W / top, float(r.get("cam_zoom", 1.0)))
         else:
-            # вебка ЦЕЛИКОМ — от верхнего до нижнего края, зона вебки под её пропорции (автор: «вебка слишком
-            # приближена, голова выходит за кадр»)
-            top = top_height(box, sw, sh, cfg)
-            cam_rel = _fit_aspect(box, cam_face, sw, sh, W / top)
+            # большая зона вебки (cam_height), в ней — вебка от верхнего до нижнего края, а по горизонтали кадр
+            # следит за головой стримера (по вертикали не двигается и за край вебки не выходит)
+            top = cam_height(cfg)
+            cam_rel = _track_cam_crop(box, cam_face, sw, sh, W / top)
         x, y, w, h = cam_rel
         res["cam"] = [int(x * sw), int(y * sh), int(w * sw) // 2 * 2, int(h * sh) // 2 * 2]
         res["top_h"] = top
@@ -1188,11 +1193,16 @@ def visual_cut_near(path: Path, offset: float, t: float, win: float = 2.2, regio
     return round(a + (k + 1) / fps, 2)
 
 
-def apply_fullcam(segments: list[dict], spans: list, full: str = "crop") -> list[dict]:
+def apply_fullcam(segments: list[dict], spans: list, full: str = "crop", only_cam: bool = False) -> list[dict]:
     """Где стример переключил сцену на вебку во весь экран, — кадр по его лицу, какой бы ни была раскладка
-    (маленькой вебки в эти секунды в кадре просто нет)."""
+    (маленькой вебки в эти секунды в кадре просто нет). only_cam — кадр решал монтажёр, видевший кадры: если он
+    велел показывать экран, крупное лицо — почти всегда человек из ролика/игры на экране, а не стример
+    (автор: «выбрана не вебка, а лицо человека из видео», «переход на весь экран, а нужно вебка+экран»)."""
     out: list[dict] = []
     for sg in segments:
+        if only_cam and sg.get("layout") != "cam":
+            out.append(sg)
+            continue
         t = sg["t0"]
         for a, b in sorted(spans):
             a, b = max(a, sg["t0"]), min(b, sg["t1"])
@@ -1200,7 +1210,8 @@ def apply_fullcam(segments: list[dict], spans: list, full: str = "crop") -> list
                 continue
             if a > t:
                 out.append({**sg, "t0": t, "t1": a})
-            out.append({**sg, "t0": a, "t1": b, "layout": full, "focus": None})
+            foc = sg.get("focus") if (sg.get("focus") and len(sg["focus"]) >= 9 and sg.get("layout") == "cam") else None
+            out.append({**sg, "t0": a, "t1": b, "layout": full, "focus": foc})
             t = b
         if sg["t1"] - t > 0.05:
             out.append({**sg, "t0": t, "t1": sg["t1"]})
@@ -1342,6 +1353,19 @@ def _split_cam_crop(box: list[float], face: tuple, sw: int, sh: int, aspect: flo
     return [x / sw, y / sh, cw / sw, ch / sh]
 
 
+def _track_cam_crop(box: list[float], face: tuple, sw: int, sh: int, aspect: float) -> list[float]:
+    """Кадр вебки для «вебка + экран»: во всю высоту вебки, ширина — под зону; по горизонтали — по лицу.
+    Если вебка у́же зоны — во всю ширину, а по высоте по лицу (чуть выше центра)."""
+    bx, by, bw, bh = box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh
+    fx, fy = face[0] * sw, face[1] * sh
+    ch, cw = bh, bh * aspect
+    if cw > bw:
+        cw, ch = bw, bw / aspect
+    x = float(np.clip(fx - cw / 2, bx, bx + bw - cw))
+    y = float(np.clip(fy - ch * 0.42, by, by + bh - ch))
+    return [x / sw, y / sh, cw / sw, ch / sh]
+
+
 def _fit_aspect(box: list[float], face: tuple, sw: int, sh: int, aspect: float) -> list[float]:
     """Наибольший кадр с нужным соотношением сторон ВНУТРИ рамки вебки, лицо — ближе к центру."""
     bx, by, bw, bh = box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh
@@ -1456,6 +1480,53 @@ def focus_rect(focus: list[float] | None, sw: int, sh: int, aspect: float, max_g
     return int(x0) // 2 * 2, int(y0) // 2 * 2, int(w) // 2 * 2, int(h) // 2 * 2
 
 
+def screen_rect(focus: list[float] | None, sw: int, sh: int, aspect: float) -> tuple[int, int, int, int]:
+    """Что показать в зоне экрана. focus = [x, y, w, h, целиком?, ax, ay, aw, ah]: окно (видео/игра/страница) и,
+    если есть, область, где сейчас главное действие.
+    - Широкое окно (игра, видео) ЗАПОЛНЯЕТ зону: по высоте от верхнего до нижнего края окна, лишнее по бокам
+      обрезается; по центру окна или по центру главного действия, если оно сбоку.
+    - Если главное действие шире зоны — кадр отдаляется ровно настолько, чтобы его вместить (сверху/снизу фон).
+    - Узкое окно (вертикальное видео, страница) — целиком, по бокам размытый фон.
+    - «Целиком» (чат, донат) — область целиком."""
+    f = list(focus or [0.0, 0.0, 1.0, 1.0])
+    x, y, w, h = f[:4]
+    whole = len(f) > 4 and f[4] == 1
+    zoom = len(f) > 4 and f[4] == 2          # монтажёр: «приблизить этот момент»
+    act = f[5:9] if len(f) >= 9 else None
+    fx, fy, fw, fh = x * sw, y * sh, w * sw, h * sh
+    if whole:
+        return int(fx) // 2 * 2, int(fy) // 2 * 2, int(fw) // 2 * 2, int(fh) // 2 * 2
+    cw, ch = fh * aspect, fh
+    if cw > fw:  # окно у́же зоны — показываем целиком
+        if act:   # главное — часть окна: приблизить к ней по высоте, но не уже окна
+            ax, ay, aw, ah = act[0] * sw, act[1] * sh, act[2] * sw, act[3] * sh
+            ch = float(np.clip(max(ah * 1.15, fw / aspect), fw / aspect, fh))
+            cy = float(np.clip(ay + ah / 2 - ch / 2, fy, fy + fh - ch))
+            return int(fx) // 2 * 2, int(cy) // 2 * 2, int(fw) // 2 * 2, int(ch) // 2 * 2
+        return int(fx) // 2 * 2, int(fy) // 2 * 2, int(fw) // 2 * 2, int(fh) // 2 * 2
+    if act:
+        # главное в окне (ролик во всплывающем окне, персонаж, надпись): кадр — по нему, с небольшим запасом;
+        # лишнее сверху/снизу/по бокам окна обрезается, чтобы главное было крупно (не мельче 30 % высоты кадра —
+        # иначе «мыло»)
+        ax, ay, aw, ah = act[0] * sw, act[1] * sh, act[2] * sw, act[3] * sh
+        ch = max(ah * 1.08, aw * 1.08 / aspect, 0.3 * sh)
+        ch = min(ch, sh)
+        cw = ch * aspect
+        if cw > sw:
+            cw, ch = sw, sw / aspect
+        acx, acy = ax + aw / 2, ay + ah / 2
+        # по возможности внутри окна, иначе — внутри кадра
+        lo_x, hi_x = (fx, fx + fw - cw) if cw <= fw else (0.0, sw - cw)
+        lo_y, hi_y = (fy, fy + fh - ch) if ch <= fh else (0.0, sh - ch)
+        x0 = float(np.clip(acx - cw / 2, lo_x, hi_x))
+        y0 = float(np.clip(acy - ch / 2, lo_y, hi_y))
+        return int(x0) // 2 * 2, int(y0) // 2 * 2, int(cw) // 2 * 2, int(ch) // 2 * 2
+    cx, cy = fx + fw / 2, fy + fh / 2
+    x0 = float(np.clip(cx - cw / 2, fx, fx + fw - cw))
+    y0 = float(np.clip(cy - ch / 2, fy, fy + fh - ch))
+    return int(x0) // 2 * 2, int(y0) // 2 * 2, int(cw) // 2 * 2, int(ch) // 2 * 2
+
+
 def fill_height_rect(focus: list[float] | None, sw: int, sh: int, aspect: float,
                      max_cut: float = 0.15) -> tuple[int, int, int, int]:
     """Окно видео/игры ЦЕЛИКОМ, ровно по его краям (от верхней до нижней границы, от левой до правой) и по
@@ -1544,6 +1615,31 @@ def _panels_chain(inp: str, panels: list[dict], PW: int, PH: int, horizontal: bo
     return ";".join(parts)
 
 
+def _object_rect(act: list[float], li: dict, cfg: dict) -> tuple[int, int, int, int]:
+    """Область вокруг того, что стример показывает в камеру (телефон, фото, предмет), с небольшим запасом.
+    Внутри маленькой вебки — окно её пропорций (как «только вебка»), в сцене «вебка во весь экран» — кадр 9:16."""
+    r = cfg["render"]
+    W, H = int(r["width"]), int(r["height"])
+    sw, sh = li["src_w"], li["src_h"]
+    ax, ay, aw, ah = act[0] * sw, act[1] * sh, act[2] * sw, act[3] * sh
+    acx, acy = ax + aw / 2, ay + ah / 2
+    box = li.get("cam_box")
+    in_cam = box and box[0] <= acx / sw <= box[0] + box[2] and box[1] <= acy / sh <= box[1] + box[3]
+    if in_cam:
+        rx, ry, rw, rh = box[0] * sw, box[1] * sh, box[2] * sw, box[3] * sh
+        aspect = float(r.get("cam_small_aspect", 1.0)) if li.get("cam_small") else W / H
+    else:
+        rx, ry, rw, rh = 0.0, 0.0, float(sw), float(sh)
+        aspect = W / H
+    ch = min(rh, max(ah * 1.12, aw * 1.12 / aspect, 0.25 * rh))
+    cw = ch * aspect
+    if cw > rw:
+        cw, ch = rw, rw / aspect
+    x0 = float(np.clip(acx - cw / 2, rx, rx + rw - cw))
+    y0 = float(np.clip(acy - ch / 2, ry, ry + rh - ch))
+    return int(x0) // 2 * 2, int(y0) // 2 * 2, int(cw) // 2 * 2, int(ch) // 2 * 2
+
+
 def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str, t_shift: float = 0.0,
                   focus: list[float] | None = None) -> str:
     """Цепочка фильтров одной раскладки: inp → кадр 1080×1920 → out.
@@ -1551,6 +1647,9 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
     r = cfg["render"]
     W, H = int(r["width"]), int(r["height"])
     sw, sh = li["src_w"], li["src_h"]
+    # --- стример показывает что-то в камеру: кадр по лицу сдвигается/отдаляется так, чтобы показанное было целиком
+    if layout in ("cam", "camwide", "crop") and focus is not None and len(focus) >= 9:
+        return _fit_panel(inp, _object_rect(focus[5:9], li, cfg), W, H, tag, out)
     # --- несколько человек: каждый в своей полосе / общий кадр всех
     stack = li.get("full_stack") if layout == "stack" else li.get("stack") if layout in ("cam", "camwide") else None
     if stack and not (layout == "camwide" and focus):
@@ -1564,14 +1663,11 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
     if layout == "camwide":
         if li.get("camwide_rect"):
             return _fit_panel(inp, tuple(li["camwide_rect"]), W, H, tag, out)
-        if li.get("cam_small") and li.get("cam_box"):
-            # вебка поверх экрана, стример что-то показывает в камеру — вебка целиком, по центру кадра
-            bx, by, bw, bh = li["cam_box"][:4]
-            return _fit_panel(inp, (int(bx * sw) // 2 * 2, int(by * sh) // 2 * 2, int(bw * sw) // 2 * 2,
-                                    int(bh * sh) // 2 * 2), W, H, tag, out)
+        # вебка поверх экрана: её окно «только вебка» и так широкое (видно руки и то, что в руках);
+        # вебка целиком в маленьком размере — «ничего не видно» (автор)
         layout = "cam"
     if layout == "screen":
-        if focus is not None and len(focus) > 4 and focus[4]:  # показать область целиком
+        if focus is not None and len(focus) > 4 and focus[4] == 1:  # показать область целиком
             rect = focus_rect(focus[:4], sw, sh, W / H, max_grow=1.8, min_w=0.3, min_h=0.3, avoid=li.get("cam_box"))
         else:
             # только экран: окно целиком по ширине (во весь вертикальный кадр его не растянуть без потерь)
@@ -1601,16 +1697,15 @@ def _layout_chain(layout: str, li: dict, cfg: dict, inp: str, out: str, tag: str
             avoid = li.get("cam_box")
             if avoid and _overlap(tuple(focus[:4]), tuple(avoid)) >= 0.6 * focus[2] * focus[3]:
                 avoid = None  # стример показывает что-то в камеру (телефон, предмет) — это и есть важное
-            if len(focus) > 4 and focus[4]:  # текст доната, чат, переписка — целиком, без обрезки краёв
+            if len(focus) > 4 and focus[4] == 1:  # текст доната, чат, переписка — целиком, без обрезки краёв
                 small = 0.12 if (avoid is None and li.get("cam_box")) else None  # предмет в руках на вебке
                 rect = focus_rect(focus[:4], sw, sh, W / bot_h, avoid=avoid, min_w=small or 0.24, min_h=small or 0.2)
-            else:                              # игра, видео — от верхнего до нижнего края окна, по его центру
-                rect = fill_height_rect(focus, sw, sh, W / bot_h, float(r.get("zoom_max_cut", 0.10)))
+            else:                              # игра, видео, страница — заполняет зону, по центру/по действию
+                rect = screen_rect(focus, sw, sh, W / bot_h)
             bottom = _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]")
         else:
-            # что показывать, не решал никто — экран целиком, по центру (не «съезжаем» за движением вбок)
-            rect = fill_height_rect(li.get("screen_rect") or [0.0, 0.0, 1.0, 1.0], sw, sh, W / bot_h,
-                                    float(r.get("zoom_max_cut", 0.10)))
+            # что показывать, не решал никто — экран по центру, заполняет зону (не «съезжаем» за движением вбок)
+            rect = screen_rect(li.get("screen_rect") or [0.0, 0.0, 1.0, 1.0], sw, sh, W / bot_h)
             bottom = _fit_panel(f"[{tag}b]", rect, W, bot_h, tag, f"[{tag}d]")
         return (f"{inp}split=2[{tag}a][{tag}b];" + top_chain + ";" + bottom + ";"
                 f"[{tag}t][{tag}d]vstack{out}")
@@ -2154,7 +2249,8 @@ def render_clip(src: Path, offset: float, dur: float, words_rel: list[dict], hoo
     if li.get("camwide_rect") and li.get("gesture_spans"):
         src_segs = apply_gestures(src_segs, li["gesture_spans"])
     if li.get("fullcam_spans") and li.get("crop"):
-        src_segs = apply_fullcam(src_segs, li["fullcam_spans"], li.get("full_mode") or "crop")
+        src_segs = apply_fullcam(src_segs, li["fullcam_spans"], li.get("full_mode") or "crop",
+                                 only_cam=bool(li.get("director")))
     for sg in src_segs:
         a, b = tl.cut(sg["t0"]), tl.cut(sg["t1"])
         same = segs and segs[-1]["layout"] == sg["layout"] and segs[-1].get("focus") == sg.get("focus")

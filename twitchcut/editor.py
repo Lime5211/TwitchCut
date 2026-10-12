@@ -21,7 +21,7 @@ import numpy as np
 
 from .util import log, read_json, write_json
 
-VERSION = 1
+VERSION = 4  # 4 — «показывает в камеру»; 3 — кадр по главному (action) крупно; 2 — экран заполняет зону, «главное» и «приблизить момент», чат только коротко
 TW, TH = 426, 240          # плитка обзорного листа (3×3 на картинке)
 BW, BH = 960, 540          # крупный кадр для кадрировщика
 
@@ -42,24 +42,45 @@ EDITOR_SYSTEM = """Ты — опытный монтажёр вертикальн
 
 ДЛИНА — главная претензия автора: «почти всегда хочется ужать в 1.5–2 раза». Итоговая длина = end − start − вырезки.
 Шутка/реакция 15–35 с, мнение 20–45 с, история/новость 30–60 с. Больше 70 с — только если КАЖДЫЕ 5 секунд новое.
-- cuts — что вырезать внутри: подводки и «короче, щас», повторы той же мысли, поиски («щас найду», листает,
-  грузится), отвлечения на чат/донаты не по теме, уточнения без которых смысл не теряется, долгие «эээ».
-  Режь целыми фразами по таймкодам. Не трогай крючок, повод (донат/то, что на экране), ядро, развязку и реакцию.
+- cuts — режь там, где стример ДОЛГО ГОВОРИТ сам: рассказ, рассуждение, ответ чату. Вырезай подводки и «короче,
+  щас», повторы той же мысли, поиски («щас найду», листает, грузится), отвлечения на чат/донаты не по теме,
+  уточнения без которых смысл не теряется, долгие «эээ». Режь целыми фразами по таймкодам. Не трогай крючок,
+  повод (донат/то, что на экране), ядро, развязку и реакцию.
+- Пока стример СМОТРИТ ВИДЕО или ИГРАЕТ — внутри почти никогда не режь: в видео/игре в любую секунду может быть
+  важное (автор: «обрезает видео, весь контекст и смысл обрезается»). Длину там регулируй границами start/end,
+  а не вырезками (программа всё равно не режет внутри кадра "split" с what "video"/"game").
 - keep — НЕЛЬЗЯ вырезать, хотя стример молчит: на экране/вебке в эти секунды происходит что-то важное или смешное
   (в игре что-то выскочило/сломалось, в видео панчлайн, стример молча корчится/смеётся, что-то показывает).
   Паузы в речи программа вырезает сама — перечисли такие места, иначе их выкинут. Сверяйся с кадрами в паузах.
 
-КАДР (shots — покрывают от start до end по порядку):
-- "split" — вебка сверху + экран снизу: смысл связан с тем, что на экране (реакция на видео/картинку/статью, игра,
-  донат или сообщение на экране, товар, переписка). what — что на экране главное: "video", "game", "page" (сайт,
-  статья, картинка, магазин), "chat", "donation", "other".
-- "cam" — только вебка: стример рассказывает о своём, а экран для смысла не нужен (статичный, посторонний, пустой).
-- "camwide" — только вебка общим планом: он показывает что-то в камеру (телефон, предмет) или активно жестикулирует.
-- "screen" — только экран, без лица: редко, только когда стример молчит, а смотреть надо на экран.
-- Пока смысл в экране — держи "split" ВСЁ это время, а не только первые секунды. Не переключай на "cam", если зритель
-  после этого перестанет понимать, о чём речь. В конце клипа не уходи с экрана, если реакция всё ещё на него.
-- Меняй кадр только когда меняется то, что важно; кадр не короче 6 с; обычно 1–3 кадра на клип. Не делай «вебка →
-  экран → вебка» без явной причины. Если весь клип он рассказывает о своём — один кадр "cam".
+КАДР (shots — покрывают от start до end по порядку). В клипе два вида кадра:
+- "split" — вебка стримера сверху (крупно) + экран снизу (заполняет свою часть кадра). Нужен, когда зритель ДОЛЖЕН
+  ВИДЕТЬ экран, чтобы понять или посмеяться: стример играет; смотрит видео/стрим/картинку и реагирует на неё;
+  читает вслух текст с экрана (статья, новость, донат, переписка, статистика, товар).
+  what — что на экране главное: "game", "video", "page" (сайт, статья, картинка, статистика, магазин), "donation"
+  (плашка доната/сообщения), "chat" (колонка чата), "other".
+  important — коротко, ЧТО именно зритель должен видеть на экране в этом кадре («реклама с его лицом справа»,
+  «персонаж падает сквозь пол», «КД игрока в таблице»).
+- "cam" — только вебка, лицо крупно. Когда стример рассказывает о своём, рассуждает, спорит с чатом, отвечает
+  на вопрос, а экран для смысла не нужен: статичная страница, посторонний ролик/игра фоном, чат, пустой экран.
+  Если он показывает что-то в камеру (телефон, фото, предмет) — тоже "cam", а в shows — что именно показывает
+  («телефон с фото»): на эти секунды кадр по лицу сдвинется и отдалится так, чтобы показанное было видно целиком.
+  Это отдельный кадр "cam" только на время показа; до и после — обычный "cam" без shows.
+- "screen" — только экран, без лица: почти никогда.
+Правила:
+- Решай по смыслу речи + кадрам: о чём он говорит в эти секунды — о том, что видно на экране, или о своём?
+  Ошибка в обе стороны раздражает автора: «экран здесь ни к чему, лучше кадр по лицу» и «непонятно, что на экране».
+- Колонка чата ("chat") — только на несколько секунд, пока он читает конкретное сообщение; если чат просто бежит,
+  а он рассказывает/отвечает/смеётся — это "cam".
+- Пока смысл в экране — держи "split" ВСЁ это время. В конце клипа не уходи с экрана, если реакция всё ещё на него.
+- Стример ИГРАЕТ или СМОТРИТ ВИДЕО — "split" на весь клип. Реплики, смех, короткий комментарий к игре/видео — это
+  НЕ повод уходить на "cam" (автор: «ЗАЧЕМ ТЫ ПЕРЕКЛЮЧАЕШЬ НА ВЕБКУ, СТРИМЕР ИГРАЕТ В ИГРУ!!!»). На "cam" — только
+  если он надолго (15+ с) отвлёкся и рассказывает о своём, а экран для смысла уже не нужен.
+- Кадр меняется только когда меняется то, что важно; кадр не короче 6 с; обычно 1 кадр на клип, максимум 2. Не
+  переставляй кадр туда-сюда («вебка → экран → вебка») без явной причины.
+- zoom: true — только для короткого (4–10 с) ключевого момента, на котором держится клип и который на экране
+  мелкий (появилась надпись/деталь/персонаж, на котором шутка): этот кусок — отдельный кадр "split" с тем же what,
+  important — что приблизить; после него — снова обычный "split". Не больше 1–2 раз за клип, обычно ни разу.
 - Донат/всплывашка не по теме — не переключай кадр ради неё (лучше вырежи этот кусок).
 {notes}
 Ответ — только JSON."""
@@ -67,7 +88,7 @@ EDITOR_SYSTEM = """Ты — опытный монтажёр вертикальн
 EDITOR_JSON = """
 
 ФОРМАТ ОТВЕТА: строго один JSON-объект без пояснений и markdown:
-{"start":<с>,"end":<с>,"cuts":[[<с>,<с>]],"keep":[[<с>,<с>]],"shots":[{"from":<с>,"to":<с>,"layout":"split","what":"video","why":"…"},{"from":<с>,"to":<с>,"layout":"cam","why":"…"}],"note":"одной фразой, о чём клип и почему так смонтирован"}
+{"start":<с>,"end":<с>,"cuts":[[<с>,<с>]],"keep":[[<с>,<с>]],"shots":[{"from":<с>,"to":<с>,"layout":"split","what":"video","important":"…","why":"…"},{"from":<с>,"to":<с>,"layout":"cam","shows":"","why":"…"}],"note":"одной фразой, о чём клип и почему так смонтирован"}
 Вместо <с> — секунды по подписям кадров и таймкодам расшифровки."""
 
 EDITOR_TOOL = {
@@ -83,6 +104,7 @@ EDITOR_TOOL = {
                 "from": {"type": "number"}, "to": {"type": "number"},
                 "layout": {"type": "string", "enum": ["cam", "camwide", "split", "screen"]},
                 "what": {"type": "string", "enum": ["video", "game", "page", "chat", "donation", "other"]},
+                "important": {"type": "string"}, "zoom": {"type": "boolean"}, "shows": {"type": "string"},
                 "why": {"type": "string"}}, "required": ["from", "to", "layout"]}},
             "note": {"type": "string"},
         },
@@ -92,24 +114,29 @@ EDITOR_TOOL = {
 
 FRAMER_SYSTEM = """Тебе показаны крупные кадры Twitch-стрима с сеткой (линии через каждые 0.1 кадра, подписи — доли
 кадра по горизонтали x и вертикали y). Жёлтая рамка — вебка стримера (её не включай). Голубая рамка «A», если есть, —
-то, что нашла программа.
-Для каждого кадра обведи то, что нужно показать зрителю (указано под номером кадра): окно видео-плеера, окно игры,
-страницу/статью/картинку, колонку чата или плашку доната. Рамка — ТОЧНО по краям этого окна: верхний край окна,
-нижний край окна, левый и правый край, без полей браузера, вкладок, панели поиска, рамок и подписей вокруг.
-Подписи и текст, которые являются частью видео/картинки (мем-подпись, субтитры ролика), — ВНУТРИ рамки.
-Если голубая рамка «A» уже точно обводит нужное — верни "A". Если важное — весь экран (игра во весь экран) — [0,0,1,1].
+то, что нашла программа. Под номером кадра написано, что там главное.
+Для каждого кадра:
+1) rect — ОКНО, которое показываем: окно видео-плеера, окно игры, страница/статья/картинка, колонка чата или плашка
+   доната. ТОЧНО по краям окна (верхний, нижний, левый, правый край), без полей браузера, вкладок, панели поиска,
+   рамок вокруг. Подписи/субтитры, которые являются частью видео или картинки, — внутри. Игра или видео во весь
+   экран — [0,0,1,1]. Если голубая «A» уже точно обводит окно — "A".
+2) action — ПЛОТНЫЙ прямоугольник вокруг того, что зритель должен разглядеть (что написано под номером кадра), если
+   это лишь часть окна: ролик во всплывающем окне или в ленте (только сам ролик, без пустых панелей окна вокруг),
+   картинка на странице, нужная строка/блок, персонаж или событие сбоку экрана. Программа покажет крупно именно его
+   (по его высоте/ширине, с маленьким запасом), обрезав лишнее сверху, снизу и по бокам. Если важно всё окно целиком
+   (игра, видео во весь плеер) — null: тогда окно заполняет зону по центру.
 Меряй по сетке для каждого кадра отдельно."""
 
 FRAMER_JSON = """
 
-ФОРМАТ ОТВЕТА: строго один JSON-объект: {"rects":[{"n":1,"rect":[x,y,w,h]},{"n":2,"rect":"A"}]}
+ФОРМАТ ОТВЕТА: строго один JSON-объект: {"rects":[{"n":1,"rect":[x,y,w,h],"action":null},{"n":2,"rect":"A","action":[x,y,w,h]}]}
 x, y — левый верхний угол, w, h — ширина и высота, в долях кадра (0..1), измеренные по сетке."""
 
 FRAMER_TOOL = {
     "name": "submit_rects",
     "description": "Рамки окон",
     "input_schema": {"type": "object", "properties": {"rects": {"type": "array", "items": {"type": "object", "properties": {
-        "n": {"type": "integer"}, "rect": {}}, "required": ["n", "rect"]}}}, "required": ["rects"]},
+        "n": {"type": "integer"}, "rect": {}, "action": {}}, "required": ["n", "rect"]}}}, "required": ["rects"]},
 }
 
 
@@ -244,8 +271,15 @@ def _spans(raw, lo: float, hi: float, min_len: float = 0.6) -> list[list[float]]
     return merged
 
 
-def normalize_edit(data: dict, lo: float, hi: float, dur: float, fixed: bool = False, min_shot: float = 5.0) -> dict:
-    """Проверка ответа монтажёра: границы в пределах доступного видео, шоты без дыр, вырезки — не больше 55 %."""
+def on_screen(sh: dict) -> bool:
+    """Кадр, где смысл в игре или видео на экране (там не режем и не уходим надолго с экрана)."""
+    return sh.get("layout") in ("split", "screen") and sh.get("what") in ("video", "game")
+
+
+def normalize_edit(data: dict, lo: float, hi: float, dur: float, fixed: bool = False, min_shot: float = 5.0,
+                   min_cam: float = 15.0, cut_on_screen: bool = False) -> dict:
+    """Проверка ответа монтажёра: границы в пределах доступного видео, шоты без дыр, вырезки — не больше 55 %;
+    пока стример играет/смотрит видео — без вырезок внутри и без коротких уходов на вебку."""
     try:
         s, e = float(data.get("start", 0.0)), float(data.get("end", dur))
     except (TypeError, ValueError):
@@ -279,8 +313,16 @@ def normalize_edit(data: dict, lo: float, hi: float, dur: float, fixed: bool = F
         a, b = max(s, a), min(e, b)
         if b <= a:
             continue
+        if lay == "camwide":
+            lay = "cam"   # окно «только вебка» и так показывает руки/предмет
         what = sh.get("what") if lay in ("split", "screen") else None
+        # колонка чата крупно — только несколько секунд; дольше — это «он отвечает/смеётся», то есть лицо
+        if lay in ("split", "screen") and what == "chat" and b - a > 9.0:
+            lay, what = "cam", None
         shots.append({"t0": a, "t1": b, "layout": lay, "what": what or ("video" if lay in ("split", "screen") else None),
+                      "important": str(sh.get("important") or "")[:140] if lay in ("split", "screen") else "",
+                      "zoom": bool(sh.get("zoom")) and lay in ("split", "screen"),
+                      "shows": str(sh.get("shows") or "").strip()[:120] if lay == "cam" else "",
                       "why": str(sh.get("why") or "")[:140]})
     shots.sort(key=lambda x: x["t0"])
     if not shots:
@@ -297,7 +339,7 @@ def normalize_edit(data: dict, lo: float, hi: float, dur: float, fixed: bool = F
     while changed and len(shots) > 1:
         changed = False
         for i, sh in enumerate(shots):
-            if eff(sh) < min_shot:
+            if eff(sh) < (3.0 if (sh.get("zoom") or sh.get("shows")) else min_shot):
                 if i == 0:
                     j = 1
                 elif i == len(shots) - 1:
@@ -308,12 +350,32 @@ def normalize_edit(data: dict, lo: float, hi: float, dur: float, fixed: bool = F
                 shots.pop(i)
                 changed = True
                 break
-    merged = [shots[0]]
-    for sh in shots[1:]:
-        if sh["layout"] == merged[-1]["layout"] and sh.get("what") == merged[-1].get("what"):
-            merged[-1]["t1"] = sh["t1"]
-        else:
-            merged.append(sh)
+    def merge_same(lst):
+        out = [lst[0]]
+        for sh in lst[1:]:
+            if sh["layout"] == out[-1]["layout"] and sh.get("what") == out[-1].get("what") \
+                    and sh.get("zoom") == out[-1].get("zoom") and bool(sh.get("shows")) == bool(out[-1].get("shows")):
+                out[-1]["t1"] = sh["t1"]
+            else:
+                out.append(sh)
+        return out
+    merged = merge_same(shots)
+    # стример играет / смотрит видео: короткий уход «только на вебку» посреди этого — лишнее переключение
+    # (автор: «зачем переключаешь на вебку, стример играет в игру», «в конце нужно было вернуть вебка+экран»)
+    if any(on_screen(x) for x in merged) and len(merged) > 1:
+        for i, sh in enumerate(merged):
+            if sh["layout"] != "cam" or sh.get("shows") or eff(sh) >= min_cam:
+                continue
+            nb = [merged[j] for j in (i - 1, i + 1) if 0 <= j < len(merged) and on_screen(merged[j])]
+            if nb:
+                src_ = max(nb, key=eff)
+                sh.update(layout=src_["layout"], what=src_["what"], important=src_.get("important", ""),
+                          zoom=False, shows="")
+        merged = merge_same(merged)
+    if not cut_on_screen:
+        # пока на экране видео/игра — внутри не режем: там в любую секунду может быть важное
+        spans = [(x["t0"], x["t1"]) for x in merged if on_screen(x)]
+        cuts = [c for c in cuts if sum(max(0.0, min(c[1], b) - max(c[0], a)) for a, b in spans) < 0.5 * (c[1] - c[0])]
     return {"start": round(s, 2), "end": round(e, 2), "cuts": cuts, "keep": keep, "shots": merged,
             "note": str(data.get("note") or "")[:300]}
 
@@ -372,7 +434,8 @@ def edit_clip(src: Path, base_off: float, lo: float, hi: float, dur: float, c: d
     blocks = [_img(j) for j in sheets] + [{"type": "text", "text": text}]
     data = llm_vision(system, blocks, cfg, usage, workdir, EDITOR_TOOL, EDITOR_JSON,
                       cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
-    plan = normalize_edit(data, lo, hi, dur, fixed, float(rc.get("min_shot_seconds", 5.0)))
+    plan = normalize_edit(data, lo, hi, dur, fixed, float(rc.get("min_shot_seconds", 5.0)),
+                          float(rc.get("min_cam_on_screen_seconds", 15.0)), bool(rc.get("cut_on_screen", False)))
     try:
         frame_windows(plan, src, base_off, li, cfg, workdir, usage)
     except Exception as e:  # рамка окна не обязательна: без неё — экран целиком
@@ -391,7 +454,7 @@ def frame_windows(plan: dict, src: Path, base_off: float, li: dict, cfg: dict, w
     from .llm import llm_vision
     from .render import _sample_keyframes
     from . import screen
-    shots = [s for s in plan["shots"] if s["layout"] in ("split", "screen")]
+    shots = [s for s in plan["shots"] if s["layout"] in ("split", "screen") or (s["layout"] == "cam" and s.get("shows"))]
     if not shots:
         return
     sw, sh = li["src_w"], li["src_h"]
@@ -419,25 +482,45 @@ def frame_windows(plan: dict, src: Path, base_off: float, li: dict, cfg: dict, w
         jobs.append((s, inside, cand, pick))
     rc = cfg.get("editor") or {}
     rects: dict[int, object] = {}
+    actions: dict[int, object] = {}
     if cfg["llm"]["backend"] in ("api", "claude-cli") and rc.get("framer", True):
         what_ru = {"video": "окно видео", "game": "окно игры", "page": "страница/картинка/статья", "chat": "колонка чата",
                    "donation": "плашка доната/сообщения", "other": "то, на что реагирует стример"}
         blocks = []
+
+        def label(s):
+            if s["layout"] == "cam":
+                return f"показывает в камеру: {s.get('shows')}"
+            return what_ru.get(s.get("what") or "video") + (" — ПРИБЛИЗИТЬ" if s.get("zoom") else "")
         for n, (s, _, cand, pick) in enumerate(jobs, 1):
-            blocks.append(_img(_grid_frame(pick[1], cam, cand, f"#{n}: {what_ru.get(s.get('what') or 'video')}")))
-        blocks.append({"type": "text", "text": "Обведи для каждого кадра нужное окно: " + "; ".join(
-            f"#{n} — {what_ru.get(s.get('what') or 'video')} ({s.get('why') or ''})" for n, (s, *_r) in enumerate(jobs, 1))})
+            blocks.append(_img(_grid_frame(pick[1], cam, None if s["layout"] == "cam" else cand, f"#{n}: {label(s)}")))
+        blocks.append({"type": "text", "text": "Для каждого кадра — окно (rect) и, если нужно, главное (action): " + "; ".join(
+            (f"#{n} — стример показывает в камеру {s.get('shows')}: rect=[0,0,1,1], action — плотно вокруг того, что он "
+             f"показывает (телефон/фото/предмет целиком)" if s["layout"] == "cam" else
+             f"#{n} — {what_ru.get(s.get('what') or 'video')}; главное: {s.get('important') or s.get('why') or '—'}"
+             + ("; ПРИБЛИЗИТЬ этот момент" if s.get("zoom") else "")) for n, (s, *_r) in enumerate(jobs, 1))})
         try:
             data = llm_vision(FRAMER_SYSTEM, blocks, cfg, usage, workdir, FRAMER_TOOL, FRAMER_JSON,
                               cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
             for r in data.get("rects") or []:
                 try:
                     rects[int(r.get("n"))] = r.get("rect")
+                    actions[int(r.get("n"))] = r.get("action")
                 except (TypeError, ValueError):
                     continue
         except Exception as e:
             log.warning("Кадрировщик не ответил: %s", e)
     for n, (s, inside, cand, pick) in enumerate(jobs, 1):
+        if s["layout"] == "cam":
+            # что стример показывает в камеру — область в кадре; кадр по лицу сдвинется/отдалится к ней
+            obj = actions.get(n) if isinstance(actions.get(n), (list, tuple)) else rects.get(n)
+            try:
+                ox, oy, ow, oh = [float(v) for v in obj[:4]]
+                if 0.03 < ow <= 1.0 and 0.03 < oh <= 1.0 and not (ow > 0.97 and oh > 0.97):
+                    s["focus"] = [0.0, 0.0, 1.0, 1.0, 0, round(ox, 4), round(oy, 4), round(ow, 4), round(oh, 4)]
+            except (TypeError, ValueError, IndexError):
+                pass
+            continue
         raw = rects.get(n)
         rect = None
         if isinstance(raw, str) and raw.strip().upper().startswith("A") and cand:
@@ -462,5 +545,18 @@ def frame_windows(plan: dict, src: Path, base_off: float, li: dict, cfg: dict, w
         x, y, w, h = rect
         ix, iy = 0.004 * (w < 0.99), 0.006 * (h < 0.99)
         rect = [round(x + ix, 4), round(y + iy, 4), round(max(0.05, w - 2 * ix), 4), round(max(0.05, h - 2 * iy), 4)]
-        whole = (s.get("what") in ("chat", "donation", "page"))
-        s["focus"] = rect + ([1] if whole else [])
+        whole = s.get("what") in ("chat", "donation")
+        act = None
+        a_raw = actions.get(n)
+        if isinstance(a_raw, (list, tuple)) and len(a_raw) >= 4:
+            try:
+                ax, ay, aw, ah = [float(v) for v in a_raw[:4]]
+                # главное — внутри окна (обрезаем по окну), не крошечное
+                x0, y0 = max(ax, rect[0]), max(ay, rect[1])
+                x1, y1 = min(ax + aw, rect[0] + rect[2]), min(ay + ah, rect[1] + rect[3])
+                if x1 - x0 > 0.02 and y1 - y0 > 0.02:
+                    act = [round(x0, 4), round(y0, 4), round(x1 - x0, 4), round(y1 - y0, 4)]
+            except (TypeError, ValueError):
+                act = None
+        flag = 1 if whole else (2 if s.get("zoom") and act else 0)
+        s["focus"] = rect + [flag] + (act or [])

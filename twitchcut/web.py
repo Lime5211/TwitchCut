@@ -43,7 +43,10 @@ class Manager:
         self.port = 8765
         self.render_errors: dict[str, str] = {}
         self._cleanup_stale()
-        threading.Thread(target=self._relayout_outdated, daemon=True, name="relayout").start()
+        # автоматический перемонтаж старых клипов после обновления — только если явно включён в config.yaml
+        # (render.auto_relayout: true); по умолчанию клипы перемонтируются только по кнопке
+        if (load_config(self.config_path).get("render") or {}).get("auto_relayout", False):
+            threading.Thread(target=self._relayout_outdated, daemon=True, name="relayout").start()
         self.live_jobs: dict[str, tuple] = {}      # vod-job id -> (LiveJob, Thread)
         self.live_status: dict[str, dict] = {}     # login -> статус эфира
         threading.Thread(target=self._watcher, daemon=True).start()
@@ -189,7 +192,7 @@ class Manager:
                 posted = {c.get("n") for c in clips
                           if (fb.get(c.get("file")) or {}).get("status") in ("posted", "rejected")}
                 cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
-                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=d.name)
+                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=d.name, side=True)
 
                 def on_clip(c, _id=d.name):
                     for k in [k for k, v in self.rendering.items() if k.startswith(_id + "/") and v.get("relayout")]:
@@ -221,13 +224,17 @@ class Manager:
             try:
                 cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
                 # job_id — папка этой задачи (у эфира это live_<id>, а не vod_<id>)
-                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=job_id)
+                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=job_id, side=True)
                 with heavy(f"перемонтаж клипа {n}"):
                     self.rendering[key]["status"] = "shortening" if action == "shorten" else "rendering"
                     if action == "shorten":
                         job.shorten_clip(n, float(target or 30), speed, trim, layout)
                     elif action == "restore":
                         job.restore_clip(n, speed, trim, layout)
+                    elif action == "remontage":
+                        # тот же момент и те же границы, но кадр, раскладку и рамки решаем заново новой версией
+                        # монтажа (стрим заново не анализируется)
+                        job.rerender_clip(n, speed, trim, "auto", director_mode="fresh")
                     else:
                         job.rerender_clip(n, speed, trim, layout)
             except Exception as e:
@@ -255,7 +262,7 @@ class Manager:
             from .pipeline import Job, heavy
             try:
                 cfg = load_config(self.config_path, options_to_overrides(st.get("options") or {}))
-                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=job_id)
+                job = Job(st["ref"], cfg, options=st.get("options") or {}, job_id=job_id, side=True)
                 with heavy(f"монтаж момента {cid}"):
                     self.rendering[key]["status"] = "rendering"
                     job.render_candidate(cid)
@@ -950,7 +957,7 @@ def make_handler(mgr: Manager):
                 if m:
                     mgr.render_moment(m.group(1), m.group(2))
                     return self._json({"ok": True})
-                m = re.match(r"^/api/jobs/([\w.-]+)/clips/(\d+)/(render|shorten|restore)$", path)
+                m = re.match(r"^/api/jobs/([\w.-]+)/clips/(\d+)/(render|shorten|restore|remontage)$", path)
                 if m:
                     sp = float(data.get("speed") or 1.0)
                     lay = data.get("layout") if data.get("layout") in ("auto", "split", "cam", "screen", "crop", "blur") else None

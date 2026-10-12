@@ -30,6 +30,19 @@ class Stopped(Exception):
     pass
 
 
+class ClaudeDown(TwitchCutError):
+    """Claude не оценил ни одного момента куска (не авторизован, лимит, сеть) — кусок повторим позже."""
+
+
+RETRY_MAX = 3            # повторов куска с обычной ошибкой
+RETRY_MAX_CLAUDE = 24    # Claude недоступен: повторяем дольше (24 × 5 мин ≈ 2 ч) — успеть перелогиниться
+RETRY_WAIT_CLAUDE = 300
+
+
+def _retry_open(r: list) -> bool:
+    return r[2] < (RETRY_MAX_CLAUDE if len(r) > 3 and r[3] else RETRY_MAX)
+
+
 class LiveJob(Job):
     def __init__(self, vod_id: str, login: str, cfg: dict, on_update: Optional[Callable[[dict], None]] = None,
                  options: Optional[dict] = None):
@@ -90,7 +103,7 @@ class LiveJob(Job):
             length = vs["length"]
             edge = length - 30 if recording else length
             self.update(duration=length, live_recording=recording)
-            redo = next((r for r in retry if r[2] < 3), None)
+            redo = next((r for r in retry if _retry_open(r)), None)
             if redo is None and recording and edge - processed < min_chunk:
                 wait = max(30, min_chunk - (edge - processed))
                 self.update(stage="signals", status="live",
@@ -108,15 +121,22 @@ class LiveJob(Job):
             def waiting(owner: str):
                 self.update(message=f"Новый кусок эфира готов, жду очереди: сейчас идёт {owner}")
             with heavy(f"эфир {self.login}", waiting):
-                failed = False
+                failed = claude_down = False
                 try:
                     self.cycle(meta, a, b, final=not recording or redo is not None)
                 except Stopped:
                     break
                 except Exception as e:  # не роняем наблюдение из-за одного куска
                     failed = True
-                    log.exception("Эфир: кусок %s–%s не обработан", fmt_time(a), fmt_time(b))
-                    self.update(warning=f"Кусок {fmt_time(a)}–{fmt_time(b)}: {e} — попробую ещё раз")
+                    claude_down = isinstance(e, ClaudeDown)
+                    if claude_down:
+                        log.warning("Эфир: кусок %s–%s не оценён Claude (%s) — повторю через %d мин",
+                                    fmt_time(a), fmt_time(b), e, RETRY_WAIT_CLAUDE // 60)
+                        self.update(warning=f"Кусок {fmt_time(a)}–{fmt_time(b)}: Claude не оценил моменты ({e}). "
+                                            f"Повторю через {RETRY_WAIT_CLAUDE // 60} мин")
+                    else:
+                        log.exception("Эфир: кусок %s–%s не обработан", fmt_time(a), fmt_time(b))
+                        self.update(warning=f"Кусок {fmt_time(a)}–{fmt_time(b)}: {e} — попробую ещё раз")
                     hist = read_json(self.dir / "live_rankings.json") or []
                     hist = [h for h in hist if round(h["a"]) != round(a) or not h.get("error")]
                     hist.append({"a": a, "b": b, "candidates": 0, "best": 0, "chosen": 0, "error": str(e)[:200]})
@@ -127,18 +147,22 @@ class LiveJob(Job):
             if redo is not None:
                 if failed:
                     redo[2] += 1
+                    if claude_down:
+                        redo[3:] = [True]  # Claude недоступен — повторяем дольше
                 else:
                     retry.remove(redo)
                 self.update(live_retry=retry)
                 if failed:
-                    self.stop_event.wait(60)
+                    self.stop_event.wait(RETRY_WAIT_CLAUDE if claude_down else 60)
                 continue
             if failed:
-                retry.append([a, b, 1])
+                retry.append([a, b, 1, claude_down])
                 self.update(live_retry=retry)
             processed = b
             self.update(processed_until=processed)
-            if not recording and edge - processed < 20 and not any(r[2] < 3 for r in retry):
+            if failed and claude_down:
+                self.stop_event.wait(RETRY_WAIT_CLAUDE)
+            if not recording and edge - processed < 20 and not any(_retry_open(r) for r in retry):
                 break
         if self.stop_event.is_set():
             clips = read_json(self.dir / "clips.json") or []
@@ -289,16 +313,30 @@ class LiveJob(Job):
         self._check_stop()
         # 7. оценка и монтаж сильных моментов
         ranking, u2 = rank_candidates(meta_now, cands, tr["words"], self.cfg, self.dir, self.progress)
+        claude_down = (self.cfg["llm"]["backend"] in ("api", "claude-cli") and bool(ranking)
+                       and all(v.get("heuristic") for v in ranking.values()))
         # все оценённые моменты — чтобы в интерфейсе было видно и то, что не прошло порог, и можно было
         # смонтировать любой из них без нового анализа
         keep_keys = ("id", "start", "end", "peak", "source", "topic", "kind", "why", "pre_score", "signal",
                      "signal_norm", "chat_ratio", "reaction", "viewer_clips")
-        allc = [x for x in (read_json(self.dir / "live_candidates.json") or []) if x.get("id") not in {c["id"] for c in cands}]
+        allr = read_json(self.dir / "live_ranking.json") or {}
+        new_ids = {c["id"] for c in cands}
+        # моменты этого же куска с прошлой попытки, которые Claude тогда не оценил, — заменяются новыми
+        stale = set() if claude_down else {
+            x.get("id") for x in (read_json(self.dir / "live_candidates.json") or [])
+            if (allr.get(x.get("id")) or {}).get("heuristic") and a - 60 <= float(x.get("start") or 0) < b}
+        allc = [x for x in (read_json(self.dir / "live_candidates.json") or [])
+                if x.get("id") not in new_ids and x.get("id") not in stale]
         allc += [{k: c[k] for k in keep_keys if k in c} for c in cands]
         write_json(self.dir / "live_candidates.json", sorted(allc, key=lambda x: x["start"]))
-        allr = read_json(self.dir / "live_ranking.json") or {}
+        for k in stale:
+            allr.pop(k, None)
         allr.update(ranking)
         write_json(self.dir / "live_ranking.json", allr)
+        if claude_down:
+            # моменты видны в «Все найденные моменты» (с пометкой «без оценки Claude»), но кусок повторим:
+            # без Claude непонятно, что это за моменты, а монтировать вслепую в эфире нельзя
+            raise ClaudeDown(u2.get("warning") or "ни одной оценки")
         from .llm import USAGE_KEYS
         for k in USAGE_KEYS:
             usage[k] = usage.get(k, 0) + u2.get(k, 0)

@@ -472,12 +472,13 @@ def apply_plan(li: dict, plan: dict) -> dict:
         lay = s["layout"]
         if lay in ("cam", "camwide", "split") and not li.get("cam"):
             lay = "screen"
-        if lay == "camwide" and not li.get("camwide_rect") and not li.get("cam_small"):
+        if lay == "camwide" and not li.get("camwide_rect"):
             lay = "cam"  # вебка и так показывается целиком
         if lay == "cam" and not li.get("camcrop"):
             lay = "split"
-        segs.append({"t0": s["t0"], "t1": s["t1"], "layout": lay,
-                     "focus": s.get("focus") if lay in ("split", "screen") else None})
+        foc = s.get("focus")
+        keep_focus = lay in ("split", "screen") or (lay == "cam" and foc and len(foc) >= 9)  # «показывает в камеру»
+        segs.append({"t0": s["t0"], "t1": s["t1"], "layout": lay, "focus": foc if keep_focus else None})
     if segs:
         li["segments"] = segs
         li["layout"] = max(segs, key=lambda x: x["t1"] - x["t0"])["layout"]
