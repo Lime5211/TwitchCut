@@ -238,7 +238,7 @@ def scan_stream(meta: dict, tr: dict, chat: list, cfg: dict, job_dir: Path, usag
                 for attempt in range(2):
                     try:
                         data = llm_call(system, user, cfg, usage, job_dir, tool=SCAN_TOOL,
-                                        json_instruction=SCAN_JSON, cli_model=model)
+                                        json_instruction=SCAN_JSON, cli_model=model, stage="scan")
                         break
                     except TwitchCutError as ex:
                         msg = str(ex)

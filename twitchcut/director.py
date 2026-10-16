@@ -386,7 +386,7 @@ def plan_clip(src: Path, offset: float, dur: float, words_rel: list[dict], keep:
             f"слева направо, сверху вниз).\n\nРасшифровка:\n" + ("\n".join(lines) or "(речи нет)"))
     blocks = [_img_block(j) for j in imgs] + [{"type": "text", "text": text}]
     data = llm_vision(system, blocks, cfg, usage, workdir, DIRECTOR_TOOL, DIRECTOR_JSON,
-                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
+                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"), stage="director")
     plan = normalize_plan(data, dur, float(rc.get("min_shot_seconds", 4.0)))
     if not plan["shots"]:
         return None
@@ -529,7 +529,7 @@ def verify_cam(frames: list, box: list[float], cfg: dict, workdir: Path, usage: 
     blocks = [_img_block(j) for j in tiles(shown)] + [{"type": "text", "text": "Проверь жёлтую рамку вебки на этих кадрах."}]
     rc = cfg.get("director") or {}
     data = llm_vision(CAMCHECK_SYSTEM, blocks, cfg, usage, workdir, CAMCHECK_TOOL, CAMCHECK_JSON,
-                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
+                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"), stage="camcheck")
     if data.get("ok"):
         return {"ok": True, "box": None}
     nb = _valid_rect(data.get("box"))
@@ -635,7 +635,7 @@ def verify_scene(frames: list, scene: dict, cfg: dict, workdir: Path, usage: dic
             blocks.append(_img_block(z))
     blocks.append({"type": "text", "text": "Проверь рамку вебки стримера и голубые рамки."})
     data = llm_vision(system, blocks, cfg, usage, workdir, SCENE_TOOL, SCENE_JSON,
-                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
+                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"), stage="scene")
     out = dict(scene)
     if not data.get("ok"):
         nb = _valid_rect(data.get("box"))

@@ -408,7 +408,7 @@ def learn_profile(login: str, cfg: dict, workdir, force: bool = False) -> dict |
     user = (f"Канал: {st.get('name') or login}.\nОписание стримера: {(st.get('description') or '')[:800]}\n\n"
             f"Отметки автора (новые сверху):\n" + "\n".join(rows))
     usage: dict = {}
-    data = llm_call(LEARN_SYSTEM, user, cfg, usage, Path(workdir), tool=LEARN_TOOL, json_instruction=LEARN_JSON)
+    data = llm_call(LEARN_SYSTEM, user, cfg, usage, Path(workdir), tool=LEARN_TOOL, json_instruction=LEARN_JSON, stage="learn")
     taste = str(data.get("taste") or "").strip()[:1800]
     edit = str(data.get("edit") or "").strip()[:1200]
     if not taste:

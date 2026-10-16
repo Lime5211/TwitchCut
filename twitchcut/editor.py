@@ -22,7 +22,7 @@ import numpy as np
 from .util import log, read_json, write_json
 
 VERSION = 4  # 4 — «показывает в камеру»; 3 — кадр по главному (action) крупно; 2 — экран заполняет зону, «главное» и «приблизить момент», чат только коротко
-TW, TH = 426, 240          # плитка обзорного листа (3×3 на картинке)
+TW, TH = 384, 216          # плитка обзорного листа (3×3 на картинке; лист 1152×648 ≈ 1 тыс. токенов)
 BW, BH = 960, 540          # крупный кадр для кадрировщика
 
 EDITOR_SYSTEM = """Ты — опытный монтажёр вертикальных роликов TikTok из Twitch-стримов. Тебе показан фрагмент стрима
@@ -183,7 +183,7 @@ def _sheet_tiles(frames: list, cam_box: list | None, inside: tuple[float, float]
         for k in (1, 2):
             cv2.line(grid, (k * TW, 0), (k * TW, 3 * TH), (40, 40, 40), 2)
             cv2.line(grid, (0, k * TH), (3 * TW, k * TH), (40, 40, 40), 2)
-        ok, buf = cv2.imencode(".jpg", grid, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        ok, buf = cv2.imencode(".jpg", grid, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if ok:
             out.append(buf.tobytes())
     return out
@@ -412,7 +412,11 @@ def edit_clip(src: Path, base_off: float, lo: float, hi: float, dur: float, c: d
     sw, sh = li["src_w"], li["src_h"]
     frames = _sample_keyframes(src, base_off + lo, hi - lo, sw, sh, out_w=TW)
     frames = [(round(t + lo, 2), f) for t, f in frames]
-    max_n = int(rc.get("max_frames", 63))
+    # не чаще кадра в 3 с; рассказ при стоящем экране — ещё меньше (смотреть там нечего)
+    max_n = int(rc.get("max_frames", 36))
+    if c.get("visual") == "talk" and float(li.get("screen_active", 1.0)) <= 0.1:
+        max_n = min(max_n, int(rc.get("max_frames_talk", 18)))
+    max_n = max(9, min(max_n, int(np.ceil((hi - lo) / 3.0))))
     if len(frames) > max_n:
         idx = np.linspace(0, len(frames) - 1, max_n).round().astype(int)
         frames = [frames[i] for i in sorted(set(idx))]
@@ -433,7 +437,7 @@ def edit_clip(src: Path, base_off: float, lo: float, hi: float, dur: float, c: d
     system = EDITOR_SYSTEM.format(notes=_streamer_notes(cfg, notes))
     blocks = [_img(j) for j in sheets] + [{"type": "text", "text": text}]
     data = llm_vision(system, blocks, cfg, usage, workdir, EDITOR_TOOL, EDITOR_JSON,
-                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
+                      cli_model=rc.get("model") or cfg["llm"].get("cli_model"), stage="editor")
     plan = normalize_edit(data, lo, hi, dur, fixed, float(rc.get("min_shot_seconds", 5.0)),
                           float(rc.get("min_cam_on_screen_seconds", 15.0)), bool(rc.get("cut_on_screen", False)))
     try:
@@ -487,27 +491,34 @@ def frame_windows(plan: dict, src: Path, base_off: float, li: dict, cfg: dict, w
         what_ru = {"video": "окно видео", "game": "окно игры", "page": "страница/картинка/статья", "chat": "колонка чата",
                    "donation": "плашка доната/сообщения", "other": "то, на что реагирует стример"}
         blocks = []
+        # чат/донат показываются целиком: если программа нашла окно, Claude для них не нужен
+        ask = [(n, j) for n, j in enumerate(jobs, 1)
+               if not (j[0]["layout"] != "cam" and j[0].get("what") in ("chat", "donation") and j[2])]
 
         def label(s):
             if s["layout"] == "cam":
                 return f"показывает в камеру: {s.get('shows')}"
             return what_ru.get(s.get("what") or "video") + (" — ПРИБЛИЗИТЬ" if s.get("zoom") else "")
-        for n, (s, _, cand, pick) in enumerate(jobs, 1):
+        for n, (s, _, cand, pick) in ask:
             blocks.append(_img(_grid_frame(pick[1], cam, None if s["layout"] == "cam" else cand, f"#{n}: {label(s)}")))
         blocks.append({"type": "text", "text": "Для каждого кадра — окно (rect) и, если нужно, главное (action): " + "; ".join(
             (f"#{n} — стример показывает в камеру {s.get('shows')}: rect=[0,0,1,1], action — плотно вокруг того, что он "
              f"показывает (телефон/фото/предмет целиком)" if s["layout"] == "cam" else
              f"#{n} — {what_ru.get(s.get('what') or 'video')}; главное: {s.get('important') or s.get('why') or '—'}"
-             + ("; ПРИБЛИЗИТЬ этот момент" if s.get("zoom") else "")) for n, (s, *_r) in enumerate(jobs, 1))})
+             + ("; ПРИБЛИЗИТЬ этот момент" if s.get("zoom") else "")) for n, (s, *_r) in ask)})
         try:
+            if not ask:
+                raise LookupError("все окна найдены программой")
             data = llm_vision(FRAMER_SYSTEM, blocks, cfg, usage, workdir, FRAMER_TOOL, FRAMER_JSON,
-                              cli_model=rc.get("model") or cfg["llm"].get("cli_model"))
+                              cli_model=rc.get("model") or cfg["llm"].get("cli_model"), stage="framer")
             for r in data.get("rects") or []:
                 try:
                     rects[int(r.get("n"))] = r.get("rect")
                     actions[int(r.get("n"))] = r.get("action")
                 except (TypeError, ValueError):
                     continue
+        except LookupError:
+            pass
         except Exception as e:
             log.warning("Кадрировщик не ответил: %s", e)
     for n, (s, inside, cand, pick) in enumerate(jobs, 1):

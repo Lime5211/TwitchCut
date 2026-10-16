@@ -312,9 +312,13 @@ class LiveJob(Job):
 
         self._check_stop()
         # 7. оценка и монтаж сильных моментов
-        ranking, u2 = rank_candidates(meta_now, cands, tr["words"], self.cfg, self.dir, self.progress)
-        claude_down = (self.cfg["llm"]["backend"] in ("api", "claude-cli") and bool(ranking)
-                       and all(v.get("heuristic") for v in ranking.values()))
+        from .llm import merge_usage, rank_keep_n
+        ranking, u2 = rank_candidates(meta_now, cands, tr["words"], self.cfg, self.dir, self.progress,
+                                      keep_n=rank_keep_n(self.cfg, int(lc["max_per_cycle"])))
+        # Claude недоступен — если не оценён ни один из отправленных ему (отсеянные заранее не в счёт)
+        sent = [v for v in ranking.values() if not v.get("prefiltered")]
+        claude_down = (self.cfg["llm"]["backend"] in ("api", "claude-cli") and bool(sent)
+                       and all(v.get("heuristic") for v in sent))
         # все оценённые моменты — чтобы в интерфейсе было видно и то, что не прошло порог, и можно было
         # смонтировать любой из них без нового анализа
         keep_keys = ("id", "start", "end", "peak", "source", "topic", "kind", "why", "pre_score", "signal",
@@ -337,12 +341,8 @@ class LiveJob(Job):
             # моменты видны в «Все найденные моменты» (с пометкой «без оценки Claude»), но кусок повторим:
             # без Claude непонятно, что это за моменты, а монтировать вслепую в эфире нельзя
             raise ClaudeDown(u2.get("warning") or "ни одной оценки")
-        from .llm import USAGE_KEYS
-        for k in USAGE_KEYS:
-            usage[k] = usage.get(k, 0) + u2.get(k, 0)
-        tot = self.state.get("llm_usage") or {"backend": self.cfg["llm"]["backend"]}
-        for k in USAGE_KEYS:
-            tot[k] = tot.get(k, 0) + usage.get(k, 0)
+        merge_usage(usage, u2)
+        tot = merge_usage(self.state.get("llm_usage") or {"backend": self.cfg["llm"]["backend"]}, usage)
         tot["model"] = self.cfg["llm"].get("cli_model")
         if u2.get("warning"):
             self.update(warning=u2["warning"])

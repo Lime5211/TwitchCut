@@ -347,11 +347,11 @@ class Job:
                 self.wait_manual(prompt_path, resp_path)
                 self.update(status="running")
 
-            ranking, usage = rank_candidates(meta, cands, tr["words"], self.cfg, self.dir, self.progress, wait)
+            from .llm import merge_usage, rank_keep_n
+            ranking, usage = rank_candidates(meta, cands, tr["words"], self.cfg, self.dir, self.progress, wait,
+                                             keep_n=rank_keep_n(self.cfg, int(self.cfg["clips"]["max_clips"])))
             scan_u = read_json(self.dir / "scan_usage.json") or {}
-            from .llm import USAGE_KEYS
-            for k in USAGE_KEYS:
-                usage[k] = usage.get(k, 0) + scan_u.get(k, 0)
+            merge_usage(usage, scan_u)
             if scan_u.get("cost_usd") or usage.get("cost_usd") is not None:
                 usage["cost_usd"] = round((usage.get("cost_usd") or 0) + (scan_u.get("cost_usd") or 0), 4)
             data = {"ranking": ranking, "usage": usage}
@@ -1086,19 +1086,6 @@ class Job:
         if failed:
             self.update(render_failed=failed,
                         warning=f"Не удалось смонтировать {len(failed)} клип(ов) — подробности в журнале (data/logs).")
-        # лучшие короткие фразы новых клипов — в архив для подборок «Лучшее» (не удаляется автоочисткой)
-        new = [x for x in clips if x.get("candidate") in {c["cand"] for c in todo}]
-        if new:
-            try:
-                from . import highlights
-                if highlights.enabled(self.cfg):
-                    self.progress("render", 0.99, "Claude выбирает лучшие короткие фразы для подборок")
-                    usage = self.state.get("director_usage") or {}
-                    highlights.extract(self.dir, new, self.cfg, usage,
-                                       streamer=self.cfg["llm"].get("streamer_login") or self.state.get("streamer") or "")
-                    self.update(director_usage=usage)
-            except Exception as e:
-                log.warning("Лучшие фразы не выбраны: %s", e)
         return clips
 
     def _prepare_stream_cam(self, chosen: list, srcs: dict) -> None:

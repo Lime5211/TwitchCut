@@ -300,49 +300,6 @@ class Manager:
                 self.compiling[job_id] = {"status": "error", "error": str(e)}
         threading.Thread(target=work, daemon=True).start()
 
-    def best_build(self, data: dict) -> None:
-        """Подборка «Лучшее» из архива моментов — в фоне."""
-        if (self.compiling.get("__best__") or {}).get("status") == "running":
-            raise TwitchCutError("Подборка уже собирается")
-        self.compiling["__best__"] = {"status": "running"}
-
-        def work():
-            from . import highlights
-            from .pipeline import heavy
-            try:
-                cfg = load_config(self.config_path)
-                with heavy("подборка «Лучшее»"):
-                    highlights.build(cfg, data.get("streamer") or None, float(data["days"]) if data.get("days") else None,
-                                     int(data.get("n") or 5), float(data.get("max_total") or 60), data.get("ids") or None)
-                self.compiling.pop("__best__", None)
-            except Exception as e:
-                log.error("Подборка «Лучшее»: %s", e)
-                self.compiling["__best__"] = {"status": "error", "error": str(e)}
-        threading.Thread(target=work, daemon=True).start()
-
-    def best_extract(self, job_id: str) -> None:
-        """Выбрать лучшие фразы из уже готовых клипов задачи (для старых задач) — в фоне."""
-        d = self.ws / job_id
-        clips = [c for c in (read_json(d / "clips.json") or []) if (d / c["file"]).exists()]
-        if not clips:
-            raise TwitchCutError("У задачи нет готовых клипов (возможно, удалены автоочисткой)")
-        st = read_json(d / "job.json") or {}
-        key = "__extract__" + job_id
-        self.compiling[key] = {"status": "running"}
-
-        def work():
-            from . import highlights
-            from .pipeline import heavy
-            try:
-                cfg = load_config(self.config_path)
-                with heavy("поиск лучших фраз"):
-                    added = highlights.extract(d, clips, cfg, {}, streamer=st.get("streamer") or "")
-                self.compiling[key] = {"status": "done", "added": len(added)}
-            except Exception as e:
-                log.error("Лучшие фразы %s: %s", job_id, e)
-                self.compiling[key] = {"status": "error", "error": str(e)}
-        threading.Thread(target=work, daemon=True).start()
-
     def send_to_tiktok(self, job_id: str, n: int | None = None, file: str | None = None,
                        account: str | None = None) -> dict:
         """Загрузить клип (или склейку) во «Входящие» TikTok как черновик."""
@@ -409,11 +366,9 @@ class Manager:
                         x["tiktok_draft"] = {**x["tiktok_draft"], "url": url}
                 write_json(self.ws / job / "clips.json", clips)
             return
-        if kind == "compilation":
-            path = self.ws / job / "compilations.json"
-        else:
-            from . import highlights
-            path = highlights.ARCHIVE / "compilations.json"
+        if kind != "compilation":
+            return
+        path = self.ws / job / "compilations.json"
         comps = read_json(path)
         if comps:
             for x in comps:
@@ -485,7 +440,7 @@ class Manager:
             moments.append({"id": c["id"], "start": round(c["start"] + float(r.get("rel_start") or 0), 1),
                             "end": round(c["start"] + float(r.get("rel_end") or 0), 1), "score": r.get("score"),
                             "title": r.get("title") or c.get("topic") or "", "category": r.get("category"),
-                            "reason": r.get("reason") or "", "source": c.get("source"), "heuristic": bool(r.get("heuristic")),
+                            "reason": r.get("reason") or "", "source": c.get("source"), "heuristic": bool(r.get("heuristic")), "prefiltered": bool(r.get("prefiltered")),
                             "clip": by_cand.get(c["id"])})
         st["moments"] = sorted(moments, key=lambda m: m["start"])
         cands = read_json(d / "all_candidates.json") or read_json(d / "candidates.json") or []
@@ -805,22 +760,6 @@ def make_handler(mgr: Manager):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                if path == "/api/highlights":
-                    from urllib.parse import parse_qs
-                    from . import highlights
-                    q = parse_qs(urlparse(self.path).query)
-                    who, days = q.get("streamer", [""])[0], float(q.get("days", ["0"])[0] or 0)
-                    items = highlights.rank(highlights.load())
-                    if who:
-                        items = [m for m in items if m.get("streamer") == who]
-                    if days:
-                        items = [m for m in items if time.time() - m.get("created", 0) <= days * 86400]
-                    comps = [c for c in (read_json(highlights.ARCHIVE / "compilations.json") or [])
-                             if (ROOT_DIR / c["file"]).exists()]
-                    extracting = {k[len("__extract__"):]: v for k, v in mgr.compiling.items() if k.startswith("__extract__")}
-                    return self._json({"items": items[:300], "total": len(items), "size": highlights.size_bytes(),
-                                       "compilations": comps[::-1], "building": mgr.compiling.get("__best__"),
-                                       "extracting": extracting})
                 if path == "/api/status":
                     return self._json(mgr.status())
                 if path == "/api/feedback":
@@ -873,12 +812,6 @@ def make_handler(mgr: Manager):
             if m:
                 st = mgr.get(m.group(1))
                 return self._json(st) if st else self._json({"error": "not found"}, 404)
-            if path.startswith("/archive/"):
-                from .highlights import ARCHIVE
-                target = (ARCHIVE / path[len("/archive/"):]).resolve()
-                if ARCHIVE.resolve() not in target.parents:
-                    return self._json({"error": "forbidden"}, 403)
-                return self._file(target)
             m = re.match(r"^/files/([\w.-]+)/(.+)$", path)
             if m:
                 base = (mgr.ws / m.group(1)).resolve()
@@ -969,36 +902,6 @@ def make_handler(mgr: Manager):
                     mgr.rerender_clip(m.group(1), int(m.group(2)), sp, bool(data.get("trim", True)), lay,
                                       action=m.group(3), target=tgt)
                     return self._json({"ok": True})
-                if path == "/api/highlights/build":
-                    mgr.best_build(data)
-                    return self._json({"ok": True})
-                if path == "/api/highlights/extract":
-                    mgr.best_extract(data.get("job") or "")
-                    return self._json({"ok": True})
-                if path == "/api/highlights/delete":
-                    from . import highlights
-                    highlights.delete(data.get("id") or "")
-                    return self._json({"ok": True})
-                if path == "/api/highlights/compilation/delete":
-                    from . import highlights
-                    comps = read_json(highlights.ARCHIVE / "compilations.json") or []
-                    for c in [c for c in comps if c["file"] == data.get("file")]:
-                        (ROOT_DIR / c["file"]).unlink(missing_ok=True)
-                        (ROOT_DIR / c["thumb"]).unlink(missing_ok=True)
-                    write_json(highlights.ARCHIVE / "compilations.json", [c for c in comps if c["file"] != data.get("file")])
-                    return self._json({"ok": True})
-                if path == "/api/highlights/compilation/tiktok":
-                    from . import highlights, tiktok_upload
-                    comps = read_json(highlights.ARCHIVE / "compilations.json") or []
-                    c = next((x for x in comps if x["file"] == data.get("file")), None)
-                    if not c:
-                        raise TwitchCutError("Подборка не найдена")
-                    acc = data.get("open_id") or tiktok_upload.account_for(c.get("streamer") or None)
-                    res = tiktok_upload.upload_draft(ROOT_DIR / c["file"], acc)
-                    tiktok_upload.register(res, acc, "best", "", c["file"], c.get("duration"), c.get("streamer"))
-                    c["tiktok_draft"] = res
-                    write_json(highlights.ARCHIVE / "compilations.json", comps)
-                    return self._json(res)
                 if path == "/api/tiktok/app":
                     from . import tiktok_upload
                     tiktok_upload.save_app(data.get("client_key"), data.get("client_secret"),

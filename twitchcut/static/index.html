@@ -262,7 +262,6 @@ function route(){
   else if (h==="status") { S.view="status"; renderStatus(); }
   else if (h==="stats") { S.view="stats"; renderStats(); }
   else if (h==="payouts") { S.view="payouts"; renderPayouts(); }
-  else if (h==="best") { S.view="best"; renderBest(); }
   else if (h==="jobs") { S.view="jobs"; renderJobs(); }
   else { S.view="new"; renderNew(); }
   renderNav();
@@ -273,7 +272,6 @@ function renderNav(){
   const st = S.status, ok = st && st.ffmpeg && st.whisper && st.ytdlp && (st.llm_backend!=="claude-cli" || (st.claude?.installed && st.claude?.logged_in));
   const items = [["new","scissors","Новая нарезка",""],["jobs","list-video","Задачи",`<span class="cnt">${S.jobs.length||""}</span>`],
     ["streamers","users","Стримеры",`<span class="cnt">${S.streamers.length||""}</span>`],
-    ["best","flame","Лучшее",""],
     ["stats","chart-column-increasing","Статистика",""],
     ["payouts","wallet","Выплаты",S.payDue?`<span class="cnt" style="color:var(--ok);font-weight:650">${S.payDue}</span>`:""],
     ["status","activity","Статус",`<span class="dot ${st? (ok?"ok":"bad") : ""}"></span>`]];
@@ -403,11 +401,20 @@ async function renderJob(){
   if (!active) { clearInterval(S.timer); refreshLists(); }
   const si = st.stages.findIndex(s => s.key === st.stage);
   const u = st.llm_usage || {};
+  // разбивка токенов по этапам (видно, что съедает лимиты)
+  function stageTokens(st){
+    const N = {scan:"просмотр", rank:"оценка", editor:"монтажёр", framer:"кадры", director:"режиссёр", camcheck:"вебка", scene:"сцены", shorten:"ужать", learn:"вкус"};
+    const acc = {};
+    for (const src of [st.llm_usage, st.director_usage]) for (const [k,v] of Object.entries(src?.by_stage||{})) acc[k] = (acc[k]||0) + (v.input_tokens||0) + (v.output_tokens||0);
+    const parts = Object.entries(acc).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${N[k]||k} ${Math.round(v/1000)}k`);
+    return parts.length ? "по этапам: " + parts.join(", ") : "";
+  }
   const meta = [st.channel, st.duration?fmt(st.duration):"", st.chat_messages!=null?`чат: ${st.chat_messages.toLocaleString("ru-RU")} сообщ.`:"",
     st.candidates?.length?`кандидатов: ${st.candidates.length}`:"",
     u.backend==="claude-cli" && !u.fallback ? `Claude ${(u.model||"").replace(/^./,c=>c.toUpperCase())}: ${((u.input_tokens||0)+(u.output_tokens||0)).toLocaleString("ru-RU")} токенов${u.cache_read_tokens?` (из кэша ${u.cache_read_tokens.toLocaleString("ru-RU")})`:""}` : "",
     u.cost_usd!=null?`API: $${u.cost_usd}`:"",
     st.director_usage?.input_tokens?`режиссёр: ${((st.director_usage.input_tokens||0)+(st.director_usage.output_tokens||0)).toLocaleString("ru-RU")} токенов${st.director_usage.cache_read_tokens?` (из кэша ${st.director_usage.cache_read_tokens.toLocaleString("ru-RU")})`:""}`:"",
+    stageTokens(st),
     st.quality?`качество: ${st.quality}`:""].filter(Boolean).map(esc).join(" · ");
   let h = `<div class="page"><div class="card">
     <div class="row" style="align-items:flex-start">${ava(st.streamer_avatar,"lg")}
@@ -539,8 +546,7 @@ function compCard(st){
   return `<div class="card mt"><div class="row"><h3 style="margin:0">${icon("list-video")} Склейка «Топ за стрим» для YouTube Shorts</h3><span class="sp"></span>
     <select style="width:auto" onchange="S.compN=+this.value">${[3,5,7].map(v=>`<option value="${v}" ${v===sel?"selected":""}>Топ-${v}</option>`).join("")}</select>
     <button class="btn sm" onclick="makeComp(this)" ${cp.status==="running"?"disabled":""}>${icon(cp.status==="running"?"loader-circle":"clapperboard","sm"+(cp.status==="running"?" spin":""))} ${cp.status==="running"?"Собираю…":"Собрать"}</button></div>
-    <div class="hint">Лучшие клипы по оценке (без отклонённых) одним роликом до 3 минут, обратный отсчёт от последнего места к первому, на каждом — плашка «#N».
-      Короткие лучшие фразы из клипов попадают в архив <a href="#/best">«Лучшее»</a> сами после нарезки; для старых задач — <a href="#" onclick="bestExtract(this);return false">найти лучшие фразы</a>.</div>
+    <div class="hint">Лучшие клипы по оценке (без отклонённых) одним роликом до 3 минут, обратный отсчёт от последнего места к первому, на каждом — плашка «#N».</div>
     ${cp.status==="error"?`<div class="alert err" style="margin:8px 0 0">${esc(cp.error)}</div>`:""}
     ${comps.map(x=>{ const f = `/files/${encodeURIComponent(S.jobId)}/${encodeURI(x.file)}?v=${x.v||0}`;
       return `<div class="row mt" style="align-items:flex-start;gap:14px"><video controls preload="metadata" playsinline style="width:200px;border-radius:10px;background:#000" poster="/files/${encodeURIComponent(S.jobId)}/${encodeURI(x.thumb)}?v=${x.v||0}" src="${f}"></video>
@@ -576,7 +582,7 @@ function momentsCard(st){
     ${list.map(m=>{ const b = busy["m:"+m.id], e = errs["m:"+m.id];
       return `<tr><td style="white-space:nowrap">${fmt(m.start)}<div class="dim">${Math.round(m.end-m.start)} с</div></td>
         <td><b style="color:${col(m.score)}">${m.score??"—"}</b></td>
-        <td><div>${esc(m.title||"")} <span class="chip c" style="font-size:11px">${CAT[m.category]||m.category||""}</span>${m.heuristic?` <span class="dim" title="Claude не оценил — оценка по чату и звуку">без оценки Claude</span>`:""}</div>
+        <td><div>${esc(m.title||"")} <span class="chip c" style="font-size:11px">${CAT[m.category]||m.category||""}</span>${m.prefiltered?` <span class="dim" title="Ради экономии лимитов Claude оценивал только самых сильных кандидатов — этот был слабее по чату, звуку и смысловому просмотру">не оценивался</span>`:m.heuristic?` <span class="dim" title="Claude не оценил — оценка по чату и звуку">без оценки Claude</span>`:""}</div>
           <div class="dim" style="font-size:12px">${esc(m.reason||"")}</div>${e?`<div style="color:var(--err);font-size:12px">${esc(e)}</div>`:""}</td>
         <td style="white-space:nowrap">${m.clip!=null?`<a href="#clip-${m.clip}" onclick="document.getElementById('clip-${m.clip}')?.scrollIntoView({behavior:'smooth'});return false">клип ${m.clip}</a>`
           : b?`<span class="dim">${icon("loader-circle","sm spin")} монтирую…</span>`
@@ -887,69 +893,6 @@ async function fbSave(n, status){
   catch(e){ toast(e.message,"err"); }
 }
 
-/* ---------------------------------------------------------------- best (архив моментов) */
-S.best = S.best || {streamer:"", days:30, n:5, max:60, sel:[]};
-async function renderBest(){
-  await refreshLists();
-  const b = S.best;
-  let d; try{ d = await api(`/api/highlights?streamer=${encodeURIComponent(b.streamer)}&days=${b.days||0}`); }catch(e){ d = {items:[],compilations:[]}; }
-  const bld = d.building || {};
-  if (bld.status==="running" && !S.bestTimer) S.bestTimer = setInterval(()=>{ if (S.view==="best") renderBest(); else { clearInterval(S.bestTimer); S.bestTimer=null; } }, 3000);
-  if (bld.status!=="running" && S.bestTimer){ clearInterval(S.bestTimer); S.bestTimer=null; }
-  const comps = (d.compilations||[]).filter(c => !b.streamer || c.streamer===b.streamer);
-  const sel = new Set(b.sel);
-  $("#main").innerHTML = `<div class="page">
-    <div class="ph"><div><h1>Лучшее</h1><p>Короткие сильные моменты из всех клипов всех стримов — для подборок «Топ моментов»</p></div></div>
-    <div class="card"><div class="row" style="gap:10px;flex-wrap:wrap">
-      <select style="width:auto" onchange="S.best.streamer=this.value;S.best.sel=[];renderBest()"><option value="">Все стримеры</option>
-        ${S.streamers.map(s=>`<option value="${esc(s.login)}" ${b.streamer===s.login?"selected":""}>${esc(s.name||s.login)}</option>`).join("")}</select>
-      <select style="width:auto" onchange="S.best.days=+this.value;renderBest()">${[[7,"за неделю"],[30,"за месяц"],[0,"за всё время"]].map(([v,t])=>`<option value="${v}" ${b.days===v?"selected":""}>${t}</option>`).join("")}</select>
-      <select style="width:auto" onchange="S.best.n=+this.value">${[3,5,7,10].map(v=>`<option value="${v}" ${b.n===v?"selected":""}>Топ-${v}</option>`).join("")}</select>
-      <select style="width:auto" onchange="S.best.max=+this.value" title="Предел длины подборки">${[[30,"до 30 с"],[60,"до 60 с"],[90,"до 90 с"],[178,"до 3 мин"]].map(([v,t])=>`<option value="${v}" ${b.max===v?"selected":""}>${t}</option>`).join("")}</select>
-      <button class="btn" onclick="bestBuild(false)" ${bld.status==="running"?"disabled":""}>${icon(bld.status==="running"?"loader-circle":"clapperboard","sm"+(bld.status==="running"?" spin":""))} ${bld.status==="running"?"Собираю…":"Собрать лучшие автоматически"}</button>
-      ${sel.size>=2?`<button class="btn ghost" onclick="bestBuild(true)" ${bld.status==="running"?"disabled":""}>Собрать из отмеченных (${sel.size})</button>`:""}
-      <span class="sp"></span><span class="dim" style="font-size:12px">${d.total||0} моментов · архив ${((d.size||0)/1e9).toFixed(2)} ГБ</span></div>
-      <div class="hint">Порядок: сначала моменты из клипов, которые набрали больше просмотров в TikTok (относительно обычного уровня канала), затем — оценка Claude. Не больше одного момента из одного клипа. В подборке обратный отсчёт с плашками «#N», лучший — последним. Моменты добавляются сами после каждой нарезки.</div>
-      ${bld.status==="error"?`<div class="alert err" style="margin:8px 0 0">${esc(bld.error)}</div>`:""}</div>
-    ${comps.length?`<div class="card mt"><h3>${icon("list-video")} Готовые подборки</h3>${comps.map(c=>`<div class="row mt" style="align-items:flex-start;gap:14px">
-        <video controls preload="metadata" playsinline style="width:180px;border-radius:10px;background:#000" poster="/${esc(c.thumb.replace(/^data\//,""))}" src="/${esc(c.file.replace(/^data\//,""))}"></video>
-        <div style="flex:1"><b>Топ-${c.n}</b> <span class="dim">· ${c.duration} с · ${esc(c.streamer||"все стримеры")} · ${new Date(c.created*1000).toLocaleDateString("ru")}</span>
-        <ol class="muted" style="font-size:13px;margin:6px 0 10px 18px;padding:0">${c.moments.map(m=>`<li>#${m.place} — «${esc(m.quote)}»</li>`).join("")}</ol>
-        <div class="row" style="gap:8px"><a class="btn sm" href="/${esc(c.file.replace(/^data\//,""))}?download=1">${icon("download","sm")} Скачать</a>
-        <button class="btn ghost sm" onclick='bestTikTok(${JSON.stringify(c.file)}, this)'>${icon("send","sm")} В TikTok</button>
-        <button class="btn ghost sm icon danger" title="Удалить подборку" onclick='bestDelComp(${JSON.stringify(c.file)})'>${icon("trash","sm")}</button>
-        ${c.tiktok_draft?(c.tiktok_draft.url?`<a class="dim" style="font-size:12px" href="${esc(c.tiktok_draft.url)}" target="_blank">${icon("circle-check","sm")} опубликовано</a>`:`<span class="dim" style="font-size:12px">${icon("circle-check","sm")} в черновиках TikTok · ждём публикации</span>`):""}</div></div></div>`).join("")}</div>`:""}
-    <div class="card mt"><h3>${icon("flame")} Моменты</h3>
-      ${(d.items||[]).length?`<div class="bestgrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px">${d.items.map(m=>`<div style="border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel2)">
-          <video controls preload="none" playsinline style="width:100%;aspect-ratio:9/16;object-fit:cover;background:#000" poster="/${esc(m.file.replace(/^data\//,"").replace(/\.mp4$/,".jpg"))}" src="/${esc(m.file.replace(/^data\//,""))}"></video>
-          <div style="padding:8px 10px;font-size:13px"><div style="font-weight:600;margin-bottom:4px">«${esc(m.quote)}»</div>
-          <div class="dim" style="font-size:12px">${esc(m.streamer||"")} · ${m.dur} с · оценка ${m.score}${m.views!=null?` · клип: ${fmtViews(m.views)} просм.${m.rel_views?` (×${m.rel_views})`:""}`:""}</div>
-          <div class="row" style="gap:6px;margin-top:6px"><label class="check" style="font-size:12px"><input type="checkbox" ${sel.has(m.id)?"checked":""} onchange="bestSel('${m.id}',this.checked)"> в подборку</label><span class="sp"></span>
-          <a href="#/job/${encodeURIComponent(m.job)}" class="dim" style="font-size:12px" title="${esc(m.clip_title||"")}">клип</a>
-          <a href="#" onclick="bestDel('${m.id}');return false" title="Удалить из архива">${icon("trash","sm")}</a></div></div></div>`).join("")}</div>`
-      :`<div class="dim">Пока пусто. Моменты появятся после следующей нарезки. Для уже готовых задач откройте задачу и нажмите «Найти лучшие фразы».</div>`}</div>
-  </div>`;
-}
-function bestSel(id, on){ const s = new Set(S.best.sel); on ? s.add(id) : s.delete(id); S.best.sel = [...s]; renderBest(); }
-async function bestBuild(useSel){
-  const b = S.best;
-  try{ await api("/api/highlights/build", {streamer:b.streamer, days:b.days||null, n:b.n, max_total:b.max, ids: useSel ? b.sel : null});
-    toast("Собираю подборку — пара минут"); renderBest(); }
-  catch(e){ toast(e.message,"err"); }
-}
-async function bestDel(id){ if(!confirm("Удалить момент из архива?")) return; await api("/api/highlights/delete", {id}); S.best.sel = S.best.sel.filter(x=>x!==id); renderBest(); }
-async function bestDelComp(file){ if(!confirm("Удалить подборку?")) return; await api("/api/highlights/compilation/delete", {file}); renderBest(); }
-async function bestTikTok(file, btn){
-  if (!await tiktokReady()) return;
-  btn.disabled = true; const old = btn.innerHTML; btn.innerHTML = `${icon("loader-circle","sm spin")} Загружаю…`;
-  try{ const r = await api("/api/highlights/compilation/tiktok", {file}); toast(`Подборка отправлена во «Входящие» TikTok (${r.account})`); renderBest(); }
-  catch(e){ toast(e.message,"err"); btn.disabled = false; btn.innerHTML = old; }
-}
-async function bestExtract(btn){
-  btn.disabled = true;
-  try{ await api("/api/highlights/extract", {job:S.jobId}); toast("Claude ищет лучшие короткие фразы — они появятся на странице «Лучшее»"); }
-  catch(e){ toast(e.message,"err"); btn.disabled = false; }
-}
 
 /* ---------------------------------------------------------------- stats */
 async function renderStats(){
